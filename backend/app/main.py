@@ -60,8 +60,30 @@ def _ensure_new_columns_sync(sync_conn) -> None:
                 logger.info(f"Added missing column {table}.{column_name}")
 
 
+def _validate_column_migration_metadata() -> None:
+    """Guard against drift between _COLUMNS_TO_ADD and the ORM models.
+
+    The startup ALTER TABLE list is a second schema truth next to models.py;
+    warn loudly if it references a table/column the models no longer define,
+    so a rename in models.py never leaves a silently stale migration entry.
+    """
+    for table_name, columns in _COLUMNS_TO_ADD.items():
+        table = Base.metadata.tables.get(table_name)
+        if table is None:
+            logger.warning(
+                f"_COLUMNS_TO_ADD references table '{table_name}' which is missing from models.py — stale migration entry"
+            )
+            continue
+        for column_name, _ in columns:
+            if column_name not in table.columns:
+                logger.warning(
+                    f"_COLUMNS_TO_ADD references column {table_name}.{column_name} which is missing from models.py — stale migration entry"
+                )
+
+
 @app.on_event("startup")
 async def startup():
+    _validate_column_migration_metadata()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))

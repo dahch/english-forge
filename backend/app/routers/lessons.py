@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -183,16 +183,25 @@ async def complete_generated_lesson(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    old_completed = lesson.completed
-    lesson.completed = body.completed
-    lesson.completed_at = datetime.now(timezone.utc) if body.completed else None
+    # Atomic state transition — the WHERE clause rejects rows already in the
+    # requested state, so concurrent/double-clicked requests can't double-count.
+    transition = await db.execute(
+        update(GeneratedLesson)
+        .where(
+            GeneratedLesson.id == lesson_id,
+            GeneratedLesson.completed == (not body.completed),
+        )
+        .values(
+            completed=body.completed,
+            completed_at=datetime.now(timezone.utc) if body.completed else None,
+        )
+    )
 
-    if body.completed and not old_completed:
-        await bump_daily_lessons(db, current_user.id, +1)
-    elif not body.completed and old_completed:
-        await bump_daily_lessons(db, current_user.id, -1)
+    if transition.rowcount:
+        await bump_daily_lessons(db, current_user.id, +1 if body.completed else -1)
 
     await db.flush()
+    db.expire(lesson)
 
     return {
         "id": lesson.id,
@@ -257,12 +266,18 @@ async def generate_lesson(
 
     # Normalize LLM output — it can return strings/dicts where lists are
     # expected, which would break listing and the frontend later.
-    examples = lesson_data.get("examples", [])
-    if not isinstance(examples, list):
-        examples = [str(examples)] if examples else []
-    exercises = lesson_data.get("exercises", [])
-    if not isinstance(exercises, list):
-        exercises = []
+    def _as_list(value) -> list:
+        # The LLM sometimes double-encodes lists as JSON strings.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = [value] if value else []
+        return value if isinstance(value, list) else [value] if value else []
+
+    examples = _as_list(lesson_data.get("examples", []))
+    examples = [str(ex) for ex in examples]
+    exercises = _as_list(lesson_data.get("exercises", []))
     exercises = [ex for ex in exercises if isinstance(ex, dict)]
 
     # Persist the generated lesson so it survives navigation/reloads

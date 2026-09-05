@@ -2,34 +2,44 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import case, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import ProgressDaily, TutorProfile
 
 
 async def bump_daily_lessons(db: AsyncSession, user_id: str, delta: int = 1) -> None:
-    """Increment (or decrement) today's ProgressDaily lesson counter for a user."""
+    """Increment (or decrement) today's ProgressDaily lesson counter for a user.
+
+    The counter is updated atomically in SQL so concurrent lesson completions
+    don't clobber each other via read-modify-write.
+    """
     if delta == 0:
         return
 
     today = date.today()
+    new_value = ProgressDaily.lessons_completed + delta
     result = await db.execute(
-        select(ProgressDaily).where(
-            ProgressDaily.user_id == user_id,
-            ProgressDaily.date == today,
-        )
+        update(ProgressDaily)
+        .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+        .values(lessons_completed=case((new_value < 0, 0), else_=new_value))
     )
-    progress = result.scalar_one_or_none()
-    if progress:
-        progress.lessons_completed = max(0, progress.lessons_completed + delta)
-    elif delta > 0:
-        progress = ProgressDaily(
-            user_id=user_id,
-            date=today,
-            lessons_completed=delta,
+    if result.rowcount or delta < 0:
+        return
+
+    # No row for today yet — insert one. A concurrent request may insert the
+    # same row first; the unique constraint makes that safe, so fall back to
+    # retrying the atomic update.
+    try:
+        async with db.begin_nested():
+            db.add(ProgressDaily(user_id=user_id, date=today, lessons_completed=delta))
+    except IntegrityError:
+        await db.execute(
+            update(ProgressDaily)
+            .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+            .values(lessons_completed=case((new_value < 0, 0), else_=new_value))
         )
-        db.add(progress)
 
 
 async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:

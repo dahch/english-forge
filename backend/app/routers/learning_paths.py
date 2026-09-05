@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -137,6 +138,18 @@ async def _deactivate_current_paths(db: AsyncSession, user_id: str) -> None:
         path.is_active = False
 
 
+# Serializable responses touch the `path_lessons` relationship — it must be
+# eagerly loaded, otherwise Pydantic triggers a lazy load outside the
+# greenlet context (MissingGreenlet) during response validation.
+async def _get_path_with_lessons(db: AsyncSession, path_id: str) -> LearningPath:
+    result = await db.execute(
+        select(LearningPath)
+        .where(LearningPath.id == path_id)
+        .options(selectinload(LearningPath.path_lessons))
+    )
+    return result.scalar_one()
+
+
 @router.get("/current", response_model=FullLearningPathResponse)
 async def get_current_path(
     current_user: User = Depends(get_current_user),
@@ -146,6 +159,7 @@ async def get_current_path(
         select(LearningPath)
         .where(LearningPath.user_id == current_user.id, LearningPath.is_active == True)
         .order_by(LearningPath.created_at.desc())
+        .options(selectinload(LearningPath.path_lessons))
     )
     path = result.scalar_one_or_none()
     if not path:
@@ -247,15 +261,15 @@ async def generate_path(
         db.add(path_lesson)
 
     await db.flush()
-    await db.refresh(path)
-    return path
+
+    return await _get_path_with_lessons(db, path.id)
 
 
 @router.patch("/{path_id}/lessons/{lesson_id}/complete", response_model=FullLearningPathResponse)
 async def complete_lesson(
     path_id: str,
     lesson_id: str,
-    body: CompleteLessonRequest,
+    body: CompleteLessonRequest | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -273,20 +287,36 @@ async def complete_lesson(
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    if body.completed and not lesson.completed:
-        lesson.completed = True
-        lesson.completed_at = datetime.now(timezone.utc)
-        path.lessons_completed += 1
-        await bump_daily_lessons(db, current_user.id, +1)
-    elif not body.completed and lesson.completed:
-        lesson.completed = False
-        lesson.completed_at = None
-        path.lessons_completed = max(0, path.lessons_completed - 1)
-        await bump_daily_lessons(db, current_user.id, -1)
+    completed = body.completed if body is not None else True
+
+    # Atomic state transition — the WHERE clause rejects rows already in the
+    # requested state, so concurrent/double-clicked requests can't double-count.
+    transition = await db.execute(
+        update(PathLesson)
+        .where(PathLesson.id == lesson_id, PathLesson.completed == (not completed))
+        .values(
+            completed=completed,
+            completed_at=datetime.now(timezone.utc) if completed else None,
+        )
+    )
+
+    if transition.rowcount:
+        delta = 1 if completed else -1
+        await db.execute(
+            update(LearningPath)
+            .where(LearningPath.id == path_id)
+            .values(lessons_completed=LearningPath.lessons_completed + delta)
+        )
+        await bump_daily_lessons(db, current_user.id, delta)
 
     await db.flush()
-    await db.refresh(path)
-    return path
+
+    # Core updates bypass the ORM identity map — expire so the re-select
+    # below returns fresh counters and lesson states.
+    db.expire(path)
+    db.expire(lesson)
+
+    return await _get_path_with_lessons(db, path.id)
 
 
 @router.post("/{path_id}/advance", response_model=FullLearningPathResponse)
@@ -308,13 +338,21 @@ async def advance_level(
             detail=f"Complete {path.lessons_required - path.lessons_completed} more lessons before advancing"
         )
 
-    path.completed_at = datetime.now(timezone.utc)
-    path.is_active = False
+    # Atomic claim — the WHERE clause ensures only one of several concurrent
+    # (double-clicked) requests advances the path and generates the next one.
+    claim = await db.execute(
+        update(LearningPath)
+        .where(LearningPath.id == path_id, LearningPath.completed_at.is_(None))
+        .values(completed_at=datetime.now(timezone.utc), is_active=False)
+    )
+    if not claim.rowcount:
+        raise HTTPException(status_code=409, detail="This path has already been advanced")
 
     # Advance user level
     current_user.current_level = path.target_level
 
     await db.flush()
+    db.expire(path)
 
     # Generate next path automatically
     return await generate_path(GeneratePathRequest(), current_user, db)

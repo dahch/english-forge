@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -22,8 +23,17 @@ router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 
 MAX_ASSESSMENT_EXCHANGES = 10
 
-# Word-boundary match so "weekend"/"friend" don't trigger an early finish.
-_END_REQUEST_RE = re.compile(r"\b(finish|end|stop|terminar|done)\b", re.IGNORECASE)
+_CEFR_LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
+
+# End requests are only honored in short, standalone utterances ("I'm done",
+# "let's finish"). A bare substring match would force-finish the session when
+# the student merely mentions these words ("I'm done with work for today").
+_END_WORDS_RE = re.compile(r"\b(finish|end|stop|terminar|basta|done)\b", re.IGNORECASE)
+
+
+def _wants_to_finish(text: str) -> bool:
+    stripped = text.strip().strip(".!?,;:¡¿")
+    return len(stripped.split()) <= 4 and bool(_END_WORDS_RE.search(stripped))
 
 
 ASSESSMENT_SYSTEM_PROMPT = """You are an expert English teacher and certified CEFR assessor. You are conducting a friendly placement conversation to gauge the student's English proficiency.
@@ -36,7 +46,7 @@ Your persona:
 
 Rules for the conversation:
 1. Greet the student warmly and ask the first simple question (e.g., about their name, where they are from, or what they do).
-2. Ask up to 10 questions in total. Count only your own questions (not the greeting).
+2. Ask up to 10 questions in total. The question embedded in your first greeting message counts as question 1 — every question you ask, including that one, counts toward the total.
 3. Each question should be slightly more complex than the previous one when the student answers well.
 4. If the student makes many errors, ask easier, more concrete questions to keep them comfortable.
 5. Keep each reply concise (1-3 sentences). The goal is to hear the student speak, not to lecture.
@@ -127,6 +137,18 @@ class AssessmentResult(BaseModel):
     summary: str
 
 
+# Serializable responses touch the `messages` relationship — it must be
+# eagerly loaded, otherwise Pydantic triggers a lazy load outside the
+# greenlet context (MissingGreenlet) during response validation.
+async def _get_assessment_with_messages(db: AsyncSession, assessment_id: str) -> Assessment:
+    result = await db.execute(
+        select(Assessment)
+        .where(Assessment.id == assessment_id)
+        .options(selectinload(Assessment.messages))
+    )
+    return result.scalar_one()
+
+
 @router.get("/current", response_model=AssessmentResponse)
 async def get_current_assessment(
     current_user: User = Depends(get_current_user),
@@ -136,6 +158,7 @@ async def get_current_assessment(
         select(Assessment)
         .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
         .order_by(Assessment.started_at.desc())
+        .options(selectinload(Assessment.messages))
         .limit(1)
     )
     assessment = result.scalar_one_or_none()
@@ -155,6 +178,7 @@ async def start_assessment(
         select(Assessment)
         .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
         .order_by(Assessment.started_at.desc())
+        .options(selectinload(Assessment.messages))
         .limit(1)
     )
     existing = existing_result.scalar_one_or_none()
@@ -193,8 +217,7 @@ async def start_assessment(
     db.add(assistant_msg)
     await db.flush()
 
-    await db.refresh(assessment)
-    return assessment
+    return await _get_assessment_with_messages(db, assessment.id)
 
 
 @router.post("/{assessment_id}/message", response_model=AssessmentResponse)
@@ -227,18 +250,20 @@ async def assessment_message(
 
     messages_for_llm = [{"role": m.role, "content": m.text} for m in messages]
 
-    # Count assistant questions so far
-    assistant_count = sum(1 for m in messages if m.role == "assistant")
-    is_complete = assistant_count >= MAX_ASSESSMENT_EXCHANGES
+    # Assistant messages map 1:1 to questions asked — the greeting message
+    # embeds question 1 (see ASSESSMENT_SYSTEM_PROMPT rules 1-2), so the
+    # count below is exact and the 10-question cap is enforced server-side.
+    questions_asked = sum(1 for m in messages if m.role == "assistant")
+    is_complete = questions_asked >= MAX_ASSESSMENT_EXCHANGES
 
     # Check if user wants to finish early
-    if _END_REQUEST_RE.search(body.text):
+    if _wants_to_finish(body.text):
         is_complete = True
 
     tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
     persona = f"You are {tutor_profile['name']}, an expert English teacher."
 
-    prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {assistant_count} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
+    prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
 
     llm = LLMRouter(db, current_user.id)
     try:
@@ -253,7 +278,7 @@ async def assessment_message(
     except Exception as e:
         logger.error(f"Assessment message failed: {e}")
         is_complete = True
-        parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": assistant_count, "is_complete": True}
+        parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": questions_asked, "is_complete": True}
 
     if parsed.get("is_complete") or is_complete:
         parsed["is_complete"] = True
@@ -267,7 +292,7 @@ async def assessment_message(
     db.add(assistant_msg)
     await db.flush()
 
-    await db.refresh(assessment)
+    assessment = await _get_assessment_with_messages(db, assessment.id)
     response = AssessmentResponse.model_validate(assessment)
     response.is_complete = bool(parsed.get("is_complete")) or is_complete
     return response
@@ -315,8 +340,20 @@ async def complete_assessment(
         raise HTTPException(status_code=503, detail=f"Failed to analyze assessment: {e}")
 
     assessment.completed_at = datetime.now(timezone.utc)
-    assessment.estimated_level = parsed.get("estimated_level", "A1")
-    assessment.confidence = parsed.get("confidence", 0.5)
+    raw_level = str(parsed.get("estimated_level") or "").strip().upper()
+    if raw_level not in _CEFR_LEVELS:
+        # LLM returned null/garbage — keep the user's existing level instead of
+        # crashing on the NOT NULL VARCHAR(2) column or demoting them to A1.
+        raw_level = (
+            current_user.current_level
+            if current_user.current_level in _CEFR_LEVELS
+            else "A1"
+        )
+    assessment.estimated_level = raw_level
+    try:
+        assessment.confidence = float(parsed.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        assessment.confidence = 0.5
     assessment.strengths = json.dumps(parsed.get("strengths", []))
     assessment.weaknesses = json.dumps(parsed.get("weaknesses", []))
     assessment.recommendations = json.dumps(parsed.get("recommendations", []))
@@ -327,6 +364,5 @@ async def complete_assessment(
     current_user.assessment_completed = True
 
     await db.flush()
-    await db.refresh(assessment)
 
-    return assessment
+    return await _get_assessment_with_messages(db, assessment.id)
