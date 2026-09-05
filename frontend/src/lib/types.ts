@@ -172,6 +172,7 @@ export interface Assessment {
   recommendations: string[] | null
   summary: string | null
   messages: Message[]
+  is_complete?: boolean
 }
 
 export interface LearningPath {
