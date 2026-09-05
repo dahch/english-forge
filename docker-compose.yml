@@ -3,7 +3,9 @@ services:
     build: ./backend
     ports:
       - "8230:8230"
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - backend_data:/app/data
     networks:
