@@ -9,12 +9,21 @@ import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import type { ProviderConfig } from "@/lib/types"
-import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle } from "lucide-react"
+import type { ProviderConfig, TutorProfile } from "@/lib/types"
+import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle } from "lucide-react"
 
 export default function SettingsPage() {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
+  const [tutorProfile, setTutorProfile] = useState<TutorProfile | null>(null)
+  const [tutorForm, setTutorForm] = useState<Partial<Omit<TutorProfile, "id" | "user_id">>>({
+    name: "",
+    age: null,
+    gender: "",
+    personality: "",
+    voice: "",
+  })
+  const [tutorSaved, setTutorSaved] = useState(false)
   const [error, setError] = useState("")
   const [showAddProvider, setShowAddProvider] = useState(false)
   const [newProvider, setNewProvider] = useState({
@@ -33,6 +42,16 @@ export default function SettingsPage() {
       const map: Record<string, string> = {}
       data.forEach((s) => { map[s.key] = s.value })
       setSettings(map)
+    }).catch(console.error)
+    api.tutorProfile.get().then((p) => {
+      setTutorProfile(p)
+      setTutorForm({
+        name: p.name || "",
+        age: p.age,
+        gender: p.gender || "",
+        personality: p.personality || "",
+        voice: p.voice || "",
+      })
     }).catch(console.error)
   }, [])
 
@@ -63,6 +82,21 @@ export default function SettingsPage() {
       await api.settings.update(settings)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to save preferences")
+    }
+  }
+
+  const saveTutorProfile = async () => {
+    try {
+      const payload = {
+        ...tutorForm,
+        age: tutorForm.age ? Number(tutorForm.age) : null,
+      }
+      const updated = await api.tutorProfile.update(payload)
+      setTutorProfile(updated)
+      setTutorSaved(true)
+      setTimeout(() => setTutorSaved(false), 2000)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to save tutor profile")
     }
   }
 
@@ -185,6 +219,73 @@ export default function SettingsPage() {
               Add Provider
             </Button>
           )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <UserCircle className="h-5 w-5" />
+            Tutor Profile
+          </CardTitle>
+          <CardDescription>Personalize the tutor that chats, teaches, and assesses you.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label>Name</Label>
+              <Input
+                value={tutorForm.name}
+                onChange={(e) => setTutorForm({ ...tutorForm, name: e.target.value })}
+                placeholder="e.g. Sarah"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label>Age</Label>
+              <Input
+                type="number"
+                value={tutorForm.age ?? ""}
+                onChange={(e) => setTutorForm({ ...tutorForm, age: e.target.value ? Number(e.target.value) : null })}
+                placeholder="30"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label>Gender</Label>
+              <Select value={tutorForm.gender || "unspecified"} onValueChange={(v) => setTutorForm({ ...tutorForm, gender: v === "unspecified" ? "" : v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="unspecified">Unspecified</SelectItem>
+                  <SelectItem value="female">Female</SelectItem>
+                  <SelectItem value="male">Male</SelectItem>
+                  <SelectItem value="non-binary">Non-binary</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>TTS Voice</Label>
+              <Input
+                value={tutorForm.voice || ""}
+                onChange={(e) => setTutorForm({ ...tutorForm, voice: e.target.value })}
+                placeholder="e.g. alba"
+              />
+              <p className="text-xs text-muted-foreground">Voice ID used when the tutor speaks.</p>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label>Personality</Label>
+            <Input
+              value={tutorForm.personality || ""}
+              onChange={(e) => setTutorForm({ ...tutorForm, personality: e.target.value })}
+              placeholder="Friendly, encouraging, patient, witty..."
+            />
+            <p className="text-xs text-muted-foreground">A short description guides the tutor's tone in conversations, lessons, and assessment.</p>
+          </div>
+          <Button onClick={saveTutorProfile} disabled={tutorSaved}>
+            <Save className="h-4 w-4 mr-1" />
+            {tutorSaved ? "Saved!" : "Save Tutor Profile"}
+          </Button>
         </CardContent>
       </Card>
 
