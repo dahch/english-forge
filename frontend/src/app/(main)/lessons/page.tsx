@@ -95,6 +95,20 @@ export default function LessonsPage() {
   const isGeneratedLesson = (lesson: LibraryLesson | GeneratedLesson): lesson is GeneratedLesson =>
     "completed" in lesson
 
+  // Library list items lack exercise data — fetch the full detail on open.
+  const openLibraryLesson = async (lesson: LibraryLesson) => {
+    setActiveLesson(lesson)
+    setExerciseAnswers({})
+    setExerciseResults({})
+    try {
+      const detail = await api.lessons.get(lesson.id)
+      setActiveLesson((prev) => (prev && prev.id === lesson.id ? detail : prev))
+    } catch (err: unknown) {
+      setLoadError(err instanceof Error ? err.message : "Failed to load lesson")
+      setActiveLesson(null)
+    }
+  }
+
   if (activeLesson) {
     return (
       <div className="max-w-2xl mx-auto p-6 space-y-6">
@@ -134,7 +148,7 @@ export default function LessonsPage() {
 
         <div className="space-y-4">
           <h2 className="text-xl font-semibold">Exercises</h2>
-          {"exercises" in activeLesson && activeLesson.exercises ? (
+          {activeLesson.exercises ? (
             activeLesson.exercises.map((ex, i) => {
               const result = exerciseResults[i]
               return (
@@ -168,8 +182,10 @@ export default function LessonsPage() {
                 </Card>
               )
             })
-          ) : (
+          ) : isGeneratedLesson(activeLesson) ? (
             <p className="text-sm text-muted-foreground">This lesson has no exercises.</p>
+          ) : (
+            <Skeleton className="h-10 w-full" />
           )}
         </div>
       </div>
@@ -231,7 +247,7 @@ export default function LessonsPage() {
         <TabsContent value="library" className="mt-4">
           <div className="grid gap-4 md:grid-cols-2">
             {libraryLessons.map((lesson) => (
-              <Card key={lesson.id} className="cursor-pointer hover:border-primary/50 transition-colors" onClick={() => { setActiveLesson(lesson); setExerciseAnswers({}); setExerciseResults({}) }}>
+              <Card key={lesson.id} className="cursor-pointer hover:border-primary/50 transition-colors" onClick={() => openLibraryLesson(lesson)}>
                 <CardHeader>
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-lg">{lesson.title}</CardTitle>
