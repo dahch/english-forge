@@ -101,6 +101,9 @@ class AssessmentResponse(BaseModel):
     recommendations: list[str] | None
     summary: str | None
     messages: list[AssessmentMessageResponse]
+    # Transient signal: the conversation phase is over and the client should
+    # call /complete. Defaults to False for endpoints that don't compute it.
+    is_complete: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -265,7 +268,9 @@ async def assessment_message(
     await db.flush()
 
     await db.refresh(assessment)
-    return assessment
+    response = AssessmentResponse.model_validate(assessment)
+    response.is_complete = bool(parsed.get("is_complete")) or is_complete
+    return response
 
 
 @router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
