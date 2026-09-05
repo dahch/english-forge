@@ -37,6 +37,8 @@ cp .env.example .env
 nano .env
 
 # 4. Start everything
+# NOTE: For Coolify deployments, env_file is optional — the .env file
+# will be provided by Coolify's environment configuration if deploying there.
 docker compose up -d
 
 # 5. Open the app
@@ -156,8 +158,10 @@ See `.env.example` for the full list. Required:
 | `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing |
 | `DATABASE_URL` | Yes (Docker sets it) | PostgreSQL connection string |
 | At least one `*_API_KEY` | **Yes** | LLM provider key |
-| `PERSONAL_API_URL` | No | TTS/STT via personal-api |
+| `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
+
+**Note on `.env` for Coolify**: The `docker-compose.yml` has `env_file:.env` marked as `required: false`. When deploying to Coolify, the `.env` file may be provided by the platform's environment configuration, so it's not strictly required in the compose file itself.
 
 ## License
 
