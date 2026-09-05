@@ -14,12 +14,16 @@ import {
   Settings,
   LogOut,
   Sparkles,
+  ClipboardCheck,
+  Map,
 } from "lucide-react"
 
 const navItems = [
   { href: "/conversation", label: "Conversation", icon: MessageSquare },
   { href: "/vocab", label: "Vocabulary", icon: BookOpen },
   { href: "/lessons", label: "Lessons", icon: GraduationCap },
+  { href: "/assessment", label: "Assessment", icon: ClipboardCheck },
+  { href: "/learning-path", label: "Path", icon: Map },
   { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
   { href: "/settings", label: "Settings", icon: Settings },
 ]
