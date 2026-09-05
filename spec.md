@@ -199,16 +199,55 @@ Recomendación por defecto para una app de **conversación en tiempo real**: **W
 
 ---
 
-## 7. Modelo de datos (simplificado)
+## 7. Modelo de datos
+
+The data model has evolved beyond the initial simplified SQL. The following is the **current full model** (SQLAlchemy ORM definitions in `backend/app/models/models.py`):
 
 ```sql
-sessions(id, scenario_id, started_at, ended_at, cefr_level, provider_used)
+-- users table (extended columns added via startup migration)
+users(id, email, hashed_password, display_name, current_level, assessment_completed, created_at)
+
+-- sessions table
+sessions(id, user_id, scenario_id, started_at, ended_at, cefr_level, provider_used)
+
+-- messages table
 messages(id, session_id, role, text, audio_url, created_at)
+
+-- corrections table
 corrections(id, message_id, error_type, original_fragment, correction, explanation)
-vocab_items(id, word, definition, example, ipa, ease_factor, interval_days, next_review_at, source_message_id)
-scenarios(id, name, system_prompt, cefr_level, is_custom)
-progress_daily(date, minutes_spoken, new_words, reviews_done, streak_count)
-settings(key, value)   -- claves API, proveedor por defecto, voz TTS, modo STT, etc.
+
+-- vocab_items table
+vocab_items(id, word, definition, example, ipa, ease_factor, interval_days, next_review_at, last_reviewed_at, source_message_id, created_at)
+
+-- scenarios table
+scenarios(id, user_id, name, system_prompt, cefr_level, is_custom, created_at)
+
+-- progress_daily table
+progress_daily(date, user_id, minutes_spoken, new_words, reviews_done, streak_count, lessons_completed, PRIMARY KEY (date, user_id))
+
+-- settings table
+settings(id, user_id, key, value, PRIMARY KEY (key, user_id))
+
+-- tutor_profiles table
+tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, updated_at)
+
+-- assessments table
+assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, created_at)
+
+-- assessment_messages table
+assessment_messages(id, assessment_id, role, text, created_at)
+
+-- generated_lessons table
+generated_lessons(id, user_id, title, topic, level, explanation, examples, exercises, based_on_errors, completed, completed_at, created_at)
+
+-- learning_paths table
+learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
+
+-- path_lessons table
+path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at, created_at)
+
+-- provider_configs table
+provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
 ```
 
 ---
@@ -252,14 +291,33 @@ english-forge/
 ├── .env.example
 ├── frontend/                # Next.js PWA
 │   ├── app/
-│   │   ├── conversation/
-│   │   ├── vocab/
-│   │   ├── lessons/
-│   │   ├── dashboard/
-│   │   └── settings/
-│   ├── lib/stt/             # web-speech.ts, whisper-wasm.ts
-│   ├── lib/audio-player.ts
-│   └── public/whisper-wasm/ # modelo + binario
+│   │   ├── (auth)/          # login, register
+│   │   ├── (main)/
+│   │   │   ├── assessment/
+│   │   │   ├── conversation/
+│   │   │   ├── dashboard/
+│   │   │   ├── lessons/
+│   │   │   ├── learning-path/
+│   │   │   └── settings/
+│   │   ├── lib/
+│   │   │   ├── api.ts
+│   │   │   ├── stt/
+│   │   │   └── types.ts
+│   │   └── components/
+│   │       ├── layout/
+│   │       │   └── sidebar.tsx
+│   │       ├── ui/
+│   │       │   ├── badge.tsx
+│   │       │   ├── progress.tsx
+│   │       │   ├── skeleton.tsx
+│   │       │   └── ...
+│   │       └── conversation/
+│   │       ├── dashboard/
+│   │       ├── lessons/
+│   │       ├── settings/
+│   │       └── vocab/
+│   ├── public/
+│   └── next-env.d.ts
 ├── backend/
 │   ├── app/
 │   │   ├── main.py
@@ -272,37 +330,39 @@ english-forge/
 │   │   │   ├── tts_personal_api.py    # POST /v1/speak + poll /v1/jobs/{id} contra tu personal-api
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
 │   │   │   └── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
-│   │   ├── srs/sm2.py
 │   │   ├── models/                  # SQLAlchemy
-│   │   ├── routers/                 # sessions, vocab, lessons, settings
+│   │   │   ├── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
+│   │   ├── routers/                 # sessions, vocab, lessons, messages, assessment, ws, settings, tutor_profile, scenarios, dashboard, learning_paths
 │   │   └── prompts/                 # templates de system prompts por persona/escenario
 │   └── requirements.txt
 └── README.md
 ```
 
----
-
 ## 10. Plan de fases
 
-**Fase 1 — MVP funcional**
-- Conversación por texto (sin voz aún) con 1 escenario, 1 proveedor LLM, corrección básica.
+**Phase 1 — MVP funcional** ✅
+- Conversación por texto con 1 escenario, 1 proveedor LLM, corrección básica.
 - CRUD de vocabulario manual + SRS.
 
-**Fase 2 — Voz completa**
-- Integrar STT (Web Speech API) y TTS (Pocket).
+**Phase 2 — Voz completa** ✅
+- STT (Web Speech API por defecto, Moonshine vía personal-api como alternativa).
+- TTS (Pocket TTS vía personal-api con colas RQ).
 - Resumen de sesión con corrections/new_vocab automáticos.
 
-**Fase 3 — Multi-proveedor + ajustes**
-- Pantalla de settings BYOK con los 5 proveedores, fallback, selección de modelo por tarea.
-- Modo whisper server-side y whisper-wasm como alternativas de STT.
+**Phase 3 — Multi-proveedor + ajustes** ✅
+- Pantalla de settings BYOK con 5 proveedores configurables (OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass/Custom), fallback, selección de modelo por tarea.
 
-**Fase 4 — Progreso y lecciones**
-- Dashboard, streaks, estimación CEFR.
-- Generación de mini-lecciones basadas en errores recurrentes.
+**Phase 4 — Progreso y lecciones** ✅
+- Dashboard, streaks, estimación CEFR heurística.
+- Generación de mini-lecciones basadas en errores recurrentes (CRUD de lecciones generadas, endpoint `/api/lessons/generate`).
+- Learning paths con progression automática.
+- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005).
 
-**Fase 5 (opcional, futura)**
+**Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).
 - Scoring de pronunciación más fino.
+- Migración a PostgreSQL para persistencia a largo plazo.
+- Aplicación móvil real (Capacitor/Expo) para usar STT nativo.
 
 ---
 
