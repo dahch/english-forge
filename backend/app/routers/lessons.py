@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import Correction, Message, Session, User
+from app.llm.router import parse_llm_json
+from app.models.models import Correction, GeneratedLesson, Message, Session, User
+from app.utils import bump_daily_lessons
 
 router = APIRouter(prefix="/api/lessons", tags=["lessons"])
 
@@ -96,6 +98,109 @@ async def check_exercise(
     }
 
 
+@router.get("/generated")
+async def list_generated_lessons(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(GeneratedLesson)
+        .where(GeneratedLesson.user_id == current_user.id)
+        .order_by(GeneratedLesson.created_at.desc())
+    )
+    lessons = result.scalars().all()
+    return [
+        {
+            "id": l.id,
+            "title": l.title,
+            "topic": l.topic,
+            "level": l.level,
+            "explanation": l.explanation,
+            "examples": json.loads(l.examples) if l.examples else [],
+            # Answers stripped — grading happens via the exercise endpoint.
+            "exercises": [
+                {k: v for k, v in ex.items() if k != "answer"}
+                for ex in (json.loads(l.exercises) if l.exercises else [])
+            ],
+            "based_on_errors": l.based_on_errors,
+            "completed": l.completed,
+            "completed_at": l.completed_at.isoformat() if l.completed_at else None,
+            "created_at": l.created_at.isoformat() if l.created_at else None,
+        }
+        for l in lessons
+    ]
+
+
+class GeneratedLessonComplete(BaseModel):
+    completed: bool = True
+
+
+@router.post("/generated/{lesson_id}/exercise")
+async def check_generated_exercise(
+    lesson_id: str,
+    body: ExerciseSubmission,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(GeneratedLesson).where(
+            GeneratedLesson.id == lesson_id, GeneratedLesson.user_id == current_user.id
+        )
+    )
+    lesson = result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    exercises = json.loads(lesson.exercises) if lesson.exercises else []
+    if body.exercise_index < 0 or body.exercise_index >= len(exercises):
+        raise HTTPException(status_code=400, detail="Invalid exercise index")
+
+    exercise = exercises[body.exercise_index]
+    correct_answer = str(exercise.get("answer", ""))
+    is_correct = body.answer.strip().lower() == correct_answer.strip().lower()
+
+    return {
+        "correct": is_correct,
+        "correct_answer": correct_answer,
+        "explanation": exercise.get("explanation", ""),
+    }
+
+
+@router.patch("/generated/{lesson_id}")
+async def complete_generated_lesson(
+    lesson_id: str,
+    body: GeneratedLessonComplete,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from datetime import datetime, timezone
+
+    result = await db.execute(
+        select(GeneratedLesson)
+        .where(GeneratedLesson.id == lesson_id, GeneratedLesson.user_id == current_user.id)
+    )
+    lesson = result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    old_completed = lesson.completed
+    lesson.completed = body.completed
+    lesson.completed_at = datetime.now(timezone.utc) if body.completed else None
+
+    if body.completed and not old_completed:
+        await bump_daily_lessons(db, current_user.id, +1)
+    elif not body.completed and old_completed:
+        await bump_daily_lessons(db, current_user.id, -1)
+
+    await db.flush()
+
+    return {
+        "id": lesson.id,
+        "completed": lesson.completed,
+        "completed_at": lesson.completed_at.isoformat() if lesson.completed_at else None,
+    }
+
+
 @router.post("/generate")
 async def generate_lesson(
     current_user: User = Depends(get_current_user),
@@ -128,17 +233,44 @@ async def generate_lesson(
         f"Include 3-5 exercises. Respond with ONLY valid JSON."
     )
 
-    result = await llm.complete_with_fallback(
-        messages=[{"role": "user", "content": prompt}],
-        system_prompt="You are an English language teacher. Create focused, practical lessons. Respond in valid JSON only.",
-        task="lesson",
-        temperature=0.5,
-        max_tokens=1500,
-    )
+    try:
+        result = await llm.complete_with_fallback(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are an English language teacher. Create focused, practical lessons. Respond in valid JSON only.",
+            task="lesson",
+            temperature=0.5,
+            max_tokens=1500,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to generate lesson: {e}")
 
-    from app.llm.router import parse_llm_json
-    lesson_data = parse_llm_json(result["content"])
+    try:
+        lesson_data = parse_llm_json(result["content"])
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"LLM returned malformed lesson JSON: {e}")
+
     lesson_data["generated"] = True
     lesson_data["based_on_errors"] = error_summary
+
+    def _as_str(value) -> str | None:
+        return str(value) if value else None
+
+    # Persist the generated lesson so it survives navigation/reloads
+    stored = GeneratedLesson(
+        user_id=current_user.id,
+        title=_as_str(lesson_data.get("title")) or "Personalized Lesson",
+        topic=_as_str(lesson_data.get("topic")),
+        level=_as_str(lesson_data.get("level")),
+        explanation=str(lesson_data.get("explanation", "")),
+        examples=json.dumps(lesson_data.get("examples", [])),
+        exercises=json.dumps(lesson_data.get("exercises", [])),
+        based_on_errors=error_summary,
+    )
+    db.add(stored)
+    await db.flush()
+    await db.refresh(stored)
+
+    lesson_data["id"] = stored.id
+    lesson_data["created_at"] = stored.created_at.isoformat() if stored.created_at else None
 
     return lesson_data
