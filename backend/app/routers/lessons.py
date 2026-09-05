@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,11 +31,24 @@ def _load_static_lessons() -> list[dict]:
     return lessons
 
 
+def _strip_answers(lesson: dict) -> dict:
+    """Answers never leave the server — grading happens via the check endpoint."""
+    sanitized = {k: v for k, v in lesson.items() if k != "exercises"}
+    sanitized["exercises"] = [
+        {k: v for k, v in ex.items() if k != "answer"}
+        for ex in lesson.get("exercises", [])
+    ]
+    return sanitized
+
+
 @router.get("/library")
 async def list_library(
     current_user: User = Depends(get_current_user),
 ):
-    return _load_static_lessons()
+    return [
+        _strip_answers(lesson) | {"exercise_count": len(lesson.get("exercises", []))}
+        for lesson in _load_static_lessons()
+    ]
 
 
 @router.get("/library/{lesson_id}")
@@ -45,15 +58,19 @@ async def get_lesson(
 ):
     for lesson in _load_static_lessons():
         if lesson["id"] == lesson_id:
-            return lesson
+            return _strip_answers(lesson)
     raise HTTPException(status_code=404, detail="Lesson not found")
+
+
+class ExerciseSubmission(BaseModel):
+    exercise_index: int
+    answer: str
 
 
 @router.post("/library/{lesson_id}/exercise")
 async def check_exercise(
     lesson_id: str,
-    exercise_index: int,
-    answer: str,
+    body: ExerciseSubmission,
     current_user: User = Depends(get_current_user),
 ):
     lesson = None
@@ -65,12 +82,12 @@ async def check_exercise(
         raise HTTPException(status_code=404, detail="Lesson not found")
 
     exercises = lesson.get("exercises", [])
-    if exercise_index < 0 or exercise_index >= len(exercises):
+    if body.exercise_index < 0 or body.exercise_index >= len(exercises):
         raise HTTPException(status_code=400, detail="Invalid exercise index")
 
-    exercise = exercises[exercise_index]
+    exercise = exercises[body.exercise_index]
     correct_answer = exercise.get("answer", "")
-    is_correct = answer.strip().lower() == correct_answer.strip().lower()
+    is_correct = body.answer.strip().lower() == correct_answer.strip().lower()
 
     return {
         "correct": is_correct,
