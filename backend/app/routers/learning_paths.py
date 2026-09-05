@@ -214,6 +214,10 @@ async def generate_path(
     if not lessons_data:
         raise HTTPException(status_code=500, detail="Generated learning path has no lessons")
 
+    # The LLM may return fewer lessons than requested — derive the target from
+    # what we actually stored, otherwise the path can never be advanced.
+    lessons_required = min(lessons_required, len(lessons_data))
+
     await _deactivate_current_paths(db, current_user.id)
 
     path = LearningPath(
