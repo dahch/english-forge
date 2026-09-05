@@ -44,10 +44,38 @@ SCENARIO_PROMPTS = {
 }
 
 
+def build_tutor_persona(tutor_profile: dict | None = None) -> str:
+    if not tutor_profile:
+        return "You are an English language tutor named Sarah, friendly and encouraging."
+
+    name = tutor_profile.get("name", "Sarah")
+    age = tutor_profile.get("age")
+    gender = tutor_profile.get("gender")
+    personality = tutor_profile.get("personality", "friendly")
+
+    age_clause = f" You are {age} years old." if age else ""
+    gender_clause = f" You identify as {gender}." if gender else ""
+
+    personas = {
+        "strict": "strict, demanding, and focused on accuracy. You correct errors firmly but constructively.",
+        "friendly": "warm, encouraging, and patient. You make the student feel comfortable while gently correcting mistakes.",
+        "professional": "professional and business-like. You focus on practical, real-world communication skills.",
+        "casual": "relaxed and casual, like a friend. You use everyday language and keep the mood light.",
+    }
+    if personality in personas:
+        persona_text = personas[personality]
+    else:
+        # Free-text personality from the Settings page — use it verbatim.
+        persona_text = f"{personality}. Let this shape how you speak and correct the student"
+
+    return f"You are an English language tutor named {name}.{age_clause}{gender_clause} Your personality is {persona_text}"
+
+
 def build_system_prompt(
     scenario_key: str | None = None,
     scenario_custom_prompt: str | None = None,
     cefr_level: str = "B1",
+    tutor_profile: dict | None = None,
 ) -> str:
     level_info = CEFR_LEVELS.get(cefr_level, CEFR_LEVELS["B1"])
 
@@ -58,7 +86,9 @@ def build_system_prompt(
     else:
         scenario_text = SCENARIO_PROMPTS["free_talk"]
 
-    return f"""You are an English language tutor helping a student practice conversation.
+    tutor_persona = build_tutor_persona(tutor_profile)
+
+    return f"""{tutor_persona}
 
 ## Your Role in This Scenario
 {scenario_text}
