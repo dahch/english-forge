@@ -15,11 +15,14 @@ services:
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        BACKEND_INTERNAL_URL: ${BACKEND_INTERNAL_URL:-http://backend:8230}
     ports:
       - "3590:3590"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://backend:8230
+    networks:
+      - app
     depends_on:
       - backend
     restart: unless-stopped
@@ -32,6 +35,8 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-englishforge}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - app
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-englishforge}"]
       interval: 5s

@@ -1,0 +1,231 @@
+import type {
+  CEFRResult,
+  ConversationTurn,
+  DashboardStats,
+  Message,
+  ProviderConfig,
+  QuizQuestion,
+  QuizResult,
+  Scenario,
+  Session,
+  SessionSummary,
+  VocabItem,
+} from "./types"
+
+// Same-origin by default: Next.js rewrites proxy /api/* to the backend
+// service inside the docker network. Override only for special setups.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || ""
+
+function getToken(): string | null {
+  if (typeof window === "undefined") return null
+  return localStorage.getItem("ef_token")
+}
+
+export function setToken(token: string) {
+  localStorage.setItem("ef_token", token)
+}
+
+export function clearToken() {
+  localStorage.removeItem("ef_token")
+}
+
+export function isAuthenticated(): boolean {
+  return !!getToken()
+}
+
+let redirecting = false
+
+function handleUnauthorized(): never {
+  clearToken()
+  if (typeof window !== "undefined" && !redirecting) {
+    redirecting = true
+    window.location.href = "/login"
+  }
+  throw new Error("Unauthorized")
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = getToken()
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((options.headers as Record<string, string>) || {}),
+  }
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+  })
+
+  if (res.status === 401) {
+    return handleUnauthorized()
+  }
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || "Request failed")
+  }
+
+  if (res.status === 204) return undefined as T
+  return res.json()
+}
+
+export interface LessonExercise {
+  question: string
+  type: string
+  explanation: string
+}
+
+export interface LibraryLesson {
+  id: string
+  title: string
+  topic: string
+  level: string
+  explanation: string
+  examples: string[]
+  exercises: LessonExercise[]
+  exercise_count: number
+}
+
+export interface ExerciseCheckResult {
+  correct: boolean
+  correct_answer: string
+  explanation: string
+}
+
+export interface GeneratedLesson {
+  title?: string
+  topic?: string
+  explanation?: string
+  examples?: string[]
+  exercises?: { question: string; type: string; answer: string; explanation?: string }[]
+  based_on_errors?: string
+  [key: string]: unknown
+}
+
+export const api = {
+  auth: {
+    register: (email: string, password: string, display_name: string) =>
+      request<{ id: string; email: string; display_name: string }>("/api/auth/register", {
+        method: "POST",
+        body: JSON.stringify({ email, password, display_name }),
+      }),
+    login: (email: string, password: string) =>
+      request<{ access_token: string }>("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      }),
+    me: () => request<{ id: string; email: string; display_name: string }>("/api/auth/me"),
+  },
+
+  scenarios: {
+    list: () => request<Scenario[]>("/api/scenarios"),
+    create: (name: string, description: string, cefr_level: string) =>
+      request<Scenario>("/api/scenarios", {
+        method: "POST",
+        body: JSON.stringify({ name, description, cefr_level }),
+      }),
+  },
+
+  sessions: {
+    create: (scenario_id: string | null, cefr_level: string) =>
+      request<Session>("/api/sessions", {
+        method: "POST",
+        body: JSON.stringify({ scenario_id, cefr_level }),
+      }),
+    list: () => request<Session[]>("/api/sessions"),
+    get: (id: string) => request<Session>(`/api/sessions/${id}`),
+    end: (id: string) =>
+      request<SessionSummary>(`/api/sessions/${id}/end`, { method: "PATCH" }),
+    messages: (id: string) => request<Message[]>(`/api/sessions/${id}/messages`),
+  },
+
+  messages: {
+    send: (sessionId: string, text: string) =>
+      request<ConversationTurn>(`/api/sessions/${sessionId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      }),
+  },
+
+  vocab: {
+    list: (filter: string = "all") => request<VocabItem[]>(`/api/vocab?filter=${filter}`),
+    create: (data: { word: string; definition: string; example: string }) =>
+      request<VocabItem>("/api/vocab", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, data: Partial<{ word: string; definition: string; example: string }>) =>
+      request<VocabItem>(`/api/vocab/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string) => request<void>(`/api/vocab/${id}`, { method: "DELETE" }),
+    review: (id: string, quality: number) =>
+      request<VocabItem>(`/api/vocab/${id}/review`, {
+        method: "POST",
+        body: JSON.stringify({ quality }),
+      }),
+    due: (limit: number = 20) =>
+      request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
+    generateQuiz: (count: number = 5) =>
+      request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
+    checkQuiz: (vocab_item_id: string, answer: string) =>
+      request<QuizResult>("/api/vocab/quiz/check", {
+        method: "POST",
+        body: JSON.stringify({ vocab_item_id, answer }),
+      }),
+  },
+
+  lessons: {
+    library: () => request<LibraryLesson[]>("/api/lessons/library"),
+    get: (id: string) => request<GeneratedLesson>(`/api/lessons/library/${id}`),
+    checkExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
+      request<ExerciseCheckResult>(`/api/lessons/library/${lessonId}/exercise`, {
+        method: "POST",
+        body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
+      }),
+    generate: () => request<GeneratedLesson>("/api/lessons/generate", { method: "POST" }),
+  },
+
+  dashboard: {
+    stats: () => request<DashboardStats>("/api/dashboard/stats"),
+    weekly: (weeks: number = 4) =>
+      request<{ week: string; minutes: number; new_words: number; reviews: number }[]>(
+        `/api/dashboard/weekly?weeks=${weeks}`
+      ),
+    cefr: () => request<CEFRResult>("/api/dashboard/cefr"),
+  },
+
+  settings: {
+    getProviders: () => request<ProviderConfig[]>("/api/settings/providers"),
+    createProvider: (data: {
+      provider_name: string
+      api_key: string
+      base_url: string
+      model: string
+      protocol: string
+      priority: number
+      task_routing: string
+    }) =>
+      request<ProviderConfig>("/api/settings/providers", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    updateProvider: (id: string, data: Record<string, unknown>) =>
+      request<ProviderConfig>(`/api/settings/providers/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }),
+    deleteProvider: (id: string) =>
+      request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
+    get: () => request<{ key: string; value: string }[]>("/api/settings"),
+    update: (data: Record<string, unknown>) =>
+      request<{ key: string; value: string }[]>("/api/settings", {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }),
+  },
+}
