@@ -95,7 +95,7 @@ SQLite       (tu homelab)    (OpenAI, Anthropic, (opcional,
 ```
 
 - **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket.
-- **Un solo usuario**: no hay sistema de auth complejo, solo un PIN/password local opcional para proteger el acceso desde fuera de la LAN.
+- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. El despliegue puede ser single-user o multi-user según necesidad.
 - **PWA**: instalar en el móvil como app (icono, offline shell) sin pasar por app stores.
 
 ---
