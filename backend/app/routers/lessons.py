@@ -255,6 +255,16 @@ async def generate_lesson(
     def _as_str(value) -> str | None:
         return str(value) if value else None
 
+    # Normalize LLM output — it can return strings/dicts where lists are
+    # expected, which would break listing and the frontend later.
+    examples = lesson_data.get("examples", [])
+    if not isinstance(examples, list):
+        examples = [str(examples)] if examples else []
+    exercises = lesson_data.get("exercises", [])
+    if not isinstance(exercises, list):
+        exercises = []
+    exercises = [ex for ex in exercises if isinstance(ex, dict)]
+
     # Persist the generated lesson so it survives navigation/reloads
     stored = GeneratedLesson(
         user_id=current_user.id,
@@ -262,15 +272,19 @@ async def generate_lesson(
         topic=_as_str(lesson_data.get("topic")),
         level=_as_str(lesson_data.get("level")),
         explanation=str(lesson_data.get("explanation", "")),
-        examples=json.dumps(lesson_data.get("examples", [])),
-        exercises=json.dumps(lesson_data.get("exercises", [])),
+        examples=json.dumps(examples),
+        exercises=json.dumps(exercises),
         based_on_errors=error_summary,
     )
     db.add(stored)
     await db.flush()
     await db.refresh(stored)
 
+    # Same contract as the list endpoint — answers never leave the server
+    # (ADR-003/005); grading happens via the exercise check endpoint.
     lesson_data["id"] = stored.id
     lesson_data["created_at"] = stored.created_at.isoformat() if stored.created_at else None
+    lesson_data["examples"] = examples
+    lesson_data["exercises"] = [{k: v for k, v in ex.items() if k != "answer"} for ex in exercises]
 
     return lesson_data
