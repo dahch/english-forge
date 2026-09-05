@@ -110,7 +110,8 @@ export interface LibraryLesson {
   level: string
   explanation: string
   examples: string[]
-  exercises: LessonExercise[]
+  // Present in the detail response only — the list returns exercise_count.
+  exercises?: LessonExercise[]
   exercise_count: number
 }
 
