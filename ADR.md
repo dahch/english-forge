@@ -47,3 +47,12 @@
 - **Consequences**:
   - Pros: Lessons survive navigation/reloads; answers remain server-side only; consistent with ADR-003 pattern.
   - Cons: Database storage required for each generated lesson; need for cleanup/ttl policy.
+
+## ADR-006: Database Column Migration Sync on Startup
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The backend uses SQLAlchemy model definitions that may reference columns not yet present in existing databases (e.g., `current_level`, `assessment_completed` on `users`, `lessons_completed` on `progress_daily`). SQLAlchemy's `create_all` only creates missing tables — it never alters existing ones. Without explicit migration, the app would fail at runtime with column-not-found errors.
+- **Decision**: Added a `_COLUMNS_TO_ADD` dict in `backend/app/main.py` mapping table names to `(column_name, column_def)` tuples. A startup event `_ensure_new_columns_sync` inspects the live schema and `ALTER TABLE`-s any missing columns with their declared defaults. This is safe to run on every startup since each column is only added if absent (guarded by inspector check).
+- **Consequences**:
+  - Pros: Zero-downtime schema upgrades; migrations run automatically on app restart; no manual Alembic revision needed for trivial column additions; safe to run in production.
+  - Cons: Does not handle data migration or schema renames; only adds columns with defaults (no complex ALTER logic); if a column definition changes, the sync must be re-evaluated.

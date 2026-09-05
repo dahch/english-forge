@@ -160,6 +160,7 @@ class Assessment(Base):
     messages: Mapped[list["AssessmentMessage"]] = relationship(
         back_populates="assessment", cascade="all, delete-orphan", order_by="AssessmentMessage.created_at"
     )
+    learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="assessment")
 
 
 class AssessmentMessage(Base):
