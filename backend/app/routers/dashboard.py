@@ -75,6 +75,7 @@ async def get_stats(
         select(Assessment)
         .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_not(None))
         .order_by(Assessment.completed_at.desc())
+        .limit(1)
     )
     assessment = latest_assessment.scalar_one_or_none()
 
@@ -82,6 +83,7 @@ async def get_stats(
         select(LearningPath)
         .where(LearningPath.user_id == current_user.id, LearningPath.is_active == True)
         .order_by(LearningPath.created_at.desc())
+        .limit(1)
     )
     path = active_path.scalar_one_or_none()
 
