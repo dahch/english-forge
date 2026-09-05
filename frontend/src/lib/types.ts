@@ -2,7 +2,19 @@ export interface User {
   id: string
   email: string
   display_name: string
-  created_at: string
+  current_level: string
+  assessment_completed: boolean
+  created_at?: string
+}
+
+export interface TutorProfile {
+  id: string
+  user_id: string
+  name: string
+  age: number | null
+  gender: string | null
+  personality: string
+  voice: string | null
 }
 
 export interface TokenResponse {
@@ -48,6 +60,7 @@ export interface Message {
 }
 
 export interface ConversationTurn {
+  user_message: Message
   assistant_message: Message
   corrections: Correction[]
   new_vocab: { word: string; definition: string; example: string }[]
@@ -78,6 +91,20 @@ export interface VocabItem {
   created_at: string
 }
 
+export interface GeneratedLesson {
+  id: string
+  title: string
+  topic: string | null
+  level: string | null
+  explanation: string
+  examples: string[]
+  exercises: { question: string; type: string; answer: string; options?: string[]; explanation?: string }[]
+  based_on_errors: string | null
+  completed: boolean
+  completed_at: string | null
+  created_at: string
+}
+
 export interface ProviderConfig {
   id: string
   provider_name: string
@@ -97,6 +124,21 @@ export interface DashboardStats {
   total_reviews: number
   current_streak: number
   due_for_review: number
+  current_level: string
+  assessment_completed: boolean
+  last_assessment: {
+    estimated_level: string
+    confidence: number
+    completed_at: string
+  } | null
+  learning_path: {
+    id: string
+    current_level: string
+    target_level: string
+    lessons_completed: number
+    lessons_required: number
+    percent: number
+  } | null
 }
 
 export interface CEFRResult {
@@ -117,6 +159,43 @@ export interface QuizResult {
   correct: boolean
   correct_answer: string
   explanation: string
+}
+
+export interface Assessment {
+  id: string
+  started_at: string
+  completed_at: string | null
+  estimated_level: string | null
+  confidence: number | null
+  strengths: string[] | null
+  weaknesses: string[] | null
+  recommendations: string[] | null
+  summary: string | null
+  messages: Message[]
+}
+
+export interface LearningPath {
+  id: string
+  current_level: string
+  target_level: string
+  lessons_required: number
+  lessons_completed: number
+  created_at: string
+  completed_at: string | null
+  is_active: boolean
+  path_lessons: PathLesson[]
+}
+
+export interface PathLesson {
+  id: string
+  path_id: string
+  lesson_type: string
+  topic: string
+  description: string
+  content: string | null
+  order: number
+  completed: boolean
+  completed_at: string | null
 }
 
 export type CEFRLevel = "A1" | "A2" | "B1" | "B2" | "C1" | "C2"
