@@ -234,8 +234,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify(assessmentId ? { assessment_id: assessmentId } : {}),
       }),
-    completeLesson: (pathId: string, lessonId: string) =>
-      request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, { method: "PATCH" }),
+    completeLesson: (pathId: string, lessonId: string, completed: boolean = true) =>
+      request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      }),
     advance: (pathId: string) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/advance`, { method: "POST" }),
   },

@@ -98,7 +98,7 @@ export interface GeneratedLesson {
   level: string | null
   explanation: string
   examples: string[]
-  exercises: { question: string; type: string; answer: string; options?: string[]; explanation?: string }[]
+  exercises: { question: string; type: string; options?: string[]; explanation?: string }[]
   based_on_errors: string | null
   completed: boolean
   completed_at: string | null

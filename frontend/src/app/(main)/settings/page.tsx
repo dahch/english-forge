@@ -12,6 +12,19 @@ import { api } from "@/lib/api"
 import type { ProviderConfig, TutorProfile } from "@/lib/types"
 import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle } from "lucide-react"
 
+const PERSONALITY_PRESETS = [
+  "friendly",
+  "professional",
+  "strict",
+  "humorous",
+  "encouraging",
+  "patient",
+  "witty",
+  "academic",
+  "casual",
+  "motivating",
+]
+
 export default function SettingsPage() {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
@@ -24,6 +37,7 @@ export default function SettingsPage() {
     voice: "",
   })
   const [tutorSaved, setTutorSaved] = useState(false)
+  const [customPersonality, setCustomPersonality] = useState(false)
   const [error, setError] = useState("")
   const [showAddProvider, setShowAddProvider] = useState(false)
   const [newProvider, setNewProvider] = useState({
@@ -52,6 +66,9 @@ export default function SettingsPage() {
         personality: p.personality || "",
         voice: p.voice || "",
       })
+      setCustomPersonality(
+        !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
+      )
     }).catch(console.error)
   }, [])
 
@@ -128,22 +145,22 @@ export default function SettingsPage() {
             <p className="text-sm text-muted-foreground">No providers configured. Add one to get started.</p>
           )}
           {providers.map((p) => (
-            <div key={p.id} className="flex items-center justify-between p-3 rounded-lg bg-secondary">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
+            <div key={p.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-lg bg-secondary">
+              <div className="space-y-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">{p.provider_name}</span>
                   <Badge variant="secondary">{p.protocol}</Badge>
-                  <Badge>{p.model}</Badge>
+                  <Badge className="max-w-full break-all whitespace-normal">{p.model}</Badge>
                   {p.is_active ? (
                     <Badge className="bg-green-600">Active</Badge>
                   ) : (
                     <Badge variant="outline">Inactive</Badge>
                   )}
                 </div>
-                <p className="text-xs text-muted-foreground">{p.base_url}</p>
+                <p className="text-xs text-muted-foreground break-all">{p.base_url}</p>
                 <p className="text-xs text-muted-foreground">Tasks: {p.task_routing}</p>
               </div>
-              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)}>
+              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)} className="self-end sm:self-center shrink-0">
                 <Trash2 className="h-4 w-4 text-destructive" />
               </Button>
             </div>
@@ -275,12 +292,50 @@ export default function SettingsPage() {
           </div>
           <div className="space-y-1">
             <Label>Personality</Label>
-            <Input
-              value={tutorForm.personality || ""}
-              onChange={(e) => setTutorForm({ ...tutorForm, personality: e.target.value })}
-              placeholder="Friendly, encouraging, patient, witty..."
-            />
-            <p className="text-xs text-muted-foreground">A short description guides the tutor's tone in conversations, lessons, and assessment.</p>
+            {customPersonality ? (
+              <>
+                <Input
+                  value={tutorForm.personality || ""}
+                  onChange={(e) => setTutorForm({ ...tutorForm, personality: e.target.value })}
+                  placeholder="Describe the personality, e.g. friendly and witty..."
+                />
+                <button
+                  type="button"
+                  className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  onClick={() => {
+                    setCustomPersonality(false)
+                    setTutorForm((f) => ({ ...f, personality: "" }))
+                  }}
+                >
+                  Choose from presets
+                </button>
+              </>
+            ) : (
+              <Select
+                value={tutorForm.personality || undefined}
+                onValueChange={(v) => {
+                  if (v === "__custom__") {
+                    setCustomPersonality(true)
+                    setTutorForm((f) => ({ ...f, personality: "" }))
+                  } else {
+                    setTutorForm((f) => ({ ...f, personality: v }))
+                  }
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a personality" />
+                </SelectTrigger>
+                <SelectContent>
+                  {PERSONALITY_PRESETS.map((preset) => (
+                    <SelectItem key={preset} value={preset} className="capitalize">
+                      {preset}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="__custom__">Custom...</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
+            <p className="text-xs text-muted-foreground">Pick a preset or write your own to guide the tutor&apos;s tone in conversations, lessons, and assessment.</p>
           </div>
           <Button onClick={saveTutorProfile} disabled={tutorSaved}>
             <Save className="h-4 w-4 mr-1" />

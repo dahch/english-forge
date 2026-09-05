@@ -111,8 +111,8 @@ export default function LessonsPage() {
 
   if (activeLesson) {
     return (
-      <div className="max-w-2xl mx-auto p-6 space-y-6">
-        <div className="flex items-center justify-between">
+      <div className="max-w-2xl mx-auto p-4 sm:p-6 space-y-6">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
           <Button variant="ghost" onClick={() => setActiveLesson(null)}>
             ← Back to Lessons
           </Button>
@@ -194,7 +194,7 @@ export default function LessonsPage() {
 
   if (loading) {
     return (
-      <div className="max-w-4xl mx-auto p-6 space-y-6">
+      <div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
         <div className="flex items-center justify-between">
           <Skeleton className="h-8 w-40" />
           <Skeleton className="h-10 w-48" />
@@ -215,16 +215,16 @@ export default function LessonsPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto p-6 space-y-6">
-      <div className="flex items-center justify-between">
+    <div className="max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <h1 className="text-2xl font-bold flex items-center gap-2">
           <GraduationCap className="h-6 w-6 text-primary" />
           Lessons
         </h1>
-        <Button onClick={generateLesson} disabled={generating}>
+        <Button onClick={generateLesson} disabled={generating} className="w-full sm:w-auto shrink-0">
           <Sparkles className="h-4 w-4 mr-1" />
           {generating ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
-          {generating ? "Generating..." : "Generate Personalized Lesson"}
+          {generating ? "Generating..." : "Generate Lesson"}
         </Button>
       </div>
 
