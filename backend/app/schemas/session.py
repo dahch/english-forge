@@ -86,6 +86,7 @@ class MessageResponse(BaseModel):
 
 
 class ConversationTurnResponse(BaseModel):
+    user_message: MessageResponse
     assistant_message: MessageResponse
     corrections: list[CorrectionResponse]
     new_vocab: list[dict]
