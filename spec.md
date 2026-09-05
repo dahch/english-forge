@@ -17,7 +17,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 - **STT**: Whisper embebido (whisper.cpp/whisper-wasm) o Web Speech API / STT nativo del móvil, configurable.
 - Sin backend de terceros, sin suscripción, sin telemetría — todo corre en tu infraestructura.
 
-No se busca un producto multiusuario ni monetizable: es una herramienta personal, así que se prioriza simplicidad de despliegue (Docker Compose, un solo usuario) sobre escalabilidad.
+**Multi-usuario**: El sistema soporta múltiples usuarios con JWT auth, registro, y login. Cada usuario tiene sus propios ajustes, historial de conversaciones, vocabulario y progreso. El despliegue puede ser single-user o multi-user según necesidad — la arquitectura está diseñada para ambos.
 
 ---
 
@@ -67,35 +67,36 @@ No se busca un producto multiusuario ni monetizable: es una herramienta personal
 ## 3. Arquitectura técnica
 
 ```
-┌─────────────────────────────┐
+├─────────────────────────────┐
 │   Frontend (Next.js PWA)    │  ← funciona en navegador desktop y móvil (instalable como PWA)
 │  - UI conversación/voz      │
 │  - Dashboard, SRS, lecciones│
 │  - STT: Web Speech API /    │
 │    whisper-wasm en cliente  │
 └──────────────┬──────────────┘
-               │ REST + WebSocket
+               │ REST + WebSocket (JWT)
 ┌──────────────▼──────────────┐
 │   Backend (FastAPI, Python) │
 │  - Orquestación LLM (BYOK)  │
 │  - Motor de corrección      │
 │  - SRS engine               │
 │  - Progreso / analítica     │
+│  - JWT auth, multi-user     │
 │  - Proxy hacia Pocket (TTS) │
 │  - (Opcional) STT server-side│
 │    con faster-whisper       │
 └──────────────┬──────────────┘
                │
-   ┌───────────┼─────────────────┬───────────────┐
-   ▼           ▼                 ▼               ▼
-Postgres/    Pocket TTS      Proveedores LLM   Whisper local
-SQLite       (tu homelab)    (OpenAI, Anthropic, (opcional,
-(progreso,                    DeepSeek, Fireworks, faster-whisper
- vocab, hist.)                 endpoint custom)    en backend)
+    ┌───────────┼─────────────────┬───────────────┐
+    ▼           ▼                 ▼               ▼
+ Postgres/    Pocket TTS      Proveedores LLM   Whisper local
+ SQLite       (tu homelab)    (OpenAI, Anthropic, (opcional,
+  (progreso,                    DeepSeek, Fireworks, faster-whisper
+  vocab, hist.)                 endpoint custom)    en backend)
 ```
 
-- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket.
-- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. El despliegue puede ser single-user o multi-user según necesidad.
+- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
+- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. Soporta modo single-user o multi-user según necesidad — la arquitectura está preparada para ambos.
 - **PWA**: instalar en el móvil como app (icono, offline shell) sin pasar por app stores.
 
 ---
