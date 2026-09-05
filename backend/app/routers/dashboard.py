@@ -8,7 +8,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import Correction, Message, ProgressDaily, Session, User, VocabItem
+from app.models.models import (
+    Assessment,
+    Correction,
+    LearningPath,
+    Message,
+    ProgressDaily,
+    Session,
+    User,
+    VocabItem,
+)
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -62,6 +71,31 @@ async def get_stats(
     )
     due_count = due_today.scalar() or 0
 
+    latest_assessment = await db.execute(
+        select(Assessment)
+        .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_not(None))
+        .order_by(Assessment.completed_at.desc())
+    )
+    assessment = latest_assessment.scalar_one_or_none()
+
+    active_path = await db.execute(
+        select(LearningPath)
+        .where(LearningPath.user_id == current_user.id, LearningPath.is_active == True)
+        .order_by(LearningPath.created_at.desc())
+    )
+    path = active_path.scalar_one_or_none()
+
+    path_progress = None
+    if path:
+        path_progress = {
+            "id": path.id,
+            "current_level": path.current_level,
+            "target_level": path.target_level,
+            "lessons_completed": path.lessons_completed,
+            "lessons_required": path.lessons_required,
+            "percent": round(path.lessons_completed / max(path.lessons_required, 1) * 100, 1),
+        }
+
     return {
         "total_sessions": total_sessions_count,
         "total_minutes": total_minutes_val,
@@ -69,6 +103,14 @@ async def get_stats(
         "total_reviews": total_reviews_count,
         "current_streak": streak,
         "due_for_review": due_count,
+        "current_level": current_user.current_level,
+        "assessment_completed": current_user.assessment_completed,
+        "last_assessment": {
+            "estimated_level": assessment.estimated_level,
+            "confidence": assessment.confidence,
+            "completed_at": assessment.completed_at.isoformat() if assessment.completed_at else None,
+        } if assessment else None,
+        "learning_path": path_progress,
     }
 
 
@@ -96,10 +138,11 @@ async def get_weekly(
         week_start = entry.date - timedelta(days=entry.date.weekday())
         key = week_start.isoformat()
         if key not in by_week:
-            by_week[key] = {"week": key, "minutes": 0, "new_words": 0, "reviews": 0}
+            by_week[key] = {"week": key, "minutes": 0, "new_words": 0, "reviews": 0, "lessons": 0}
         by_week[key]["minutes"] += entry.minutes_spoken
         by_week[key]["new_words"] += entry.new_words
         by_week[key]["reviews"] += entry.reviews_done
+        by_week[key]["lessons"] += entry.lessons_completed
 
     return list(by_week.values())
 
