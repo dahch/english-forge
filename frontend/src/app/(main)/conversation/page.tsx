@@ -7,9 +7,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { api } from "@/lib/api"
+import { Skeleton } from "@/components/ui/skeleton"
+import { api, setActiveSessionId, getActiveSessionId } from "@/lib/api"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
-import type { Scenario, Message, Session, SessionSummary, CEFRLevel } from "@/lib/types"
+import type { Scenario, Message, Session, SessionSummary, CEFRLevel, User } from "@/lib/types"
 import { CEFR_LEVELS } from "@/lib/types"
 import {
   Mic,
@@ -21,9 +22,12 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronUp,
+  History,
+  Loader2,
 } from "lucide-react"
 
 export default function ConversationPage() {
+  const [user, setUser] = useState<User | null>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [selectedScenario, setSelectedScenario] = useState<string>("")
   const [cefrLevel, setCefrLevel] = useState<CEFRLevel>("B1")
@@ -35,25 +39,73 @@ export default function ConversationPage() {
   const [isListening, setIsListening] = useState(false)
   const [summary, setSummary] = useState<SessionSummary | null>(null)
   const [expandedCorrections, setExpandedCorrections] = useState<Set<string>>(new Set())
+  const [recentSessions, setRecentSessions] = useState<Session[]>([])
+  const [showHistory, setShowHistory] = useState(false)
+  const [pageLoading, setPageLoading] = useState(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sttRef = useRef<WebSpeechSTT | null>(null)
 
-  // Stop recognition when leaving the page — never leave the mic hot
+  // Stop recognition when leaving the page
   useEffect(() => {
     return () => {
       sttRef.current?.stop()
     }
   }, [])
 
+  // Initial load: user profile, scenarios, and active/recent session
   useEffect(() => {
-    api.scenarios.list().then(setScenarios).catch((err: unknown) => {
-      setError(err instanceof Error ? err.message : "Failed to load scenarios")
-    })
+    let cancelled = false
+    async function load() {
+      try {
+        const [u, sc] = await Promise.all([api.auth.me(), api.scenarios.list()])
+        if (cancelled) return
+        setUser(u)
+        setCefrLevel((u.current_level as CEFRLevel) || "B1")
+        setScenarios(sc)
+
+        const sessions = await api.sessions.list()
+        if (cancelled) return
+        setRecentSessions(sessions)
+
+        const activeId = getActiveSessionId()
+        if (activeId) {
+          const active = sessions.find((s) => s.id === activeId && !s.ended_at)
+          if (active) {
+            await loadSession(active.id)
+          } else {
+            setActiveSessionId(null)
+          }
+        }
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load")
+      } finally {
+        if (!cancelled) setPageLoading(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
   }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  const loadSession = async (sessionId: string) => {
+    setLoading(true)
+    try {
+      const [s, msgs] = await Promise.all([api.sessions.get(sessionId), api.sessions.messages(sessionId)])
+      setSession(s)
+      setMessages(msgs)
+      setCefrLevel((s.cefr_level as CEFRLevel) || "B1")
+      setSummary(null)
+      setActiveSessionId(s.id)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to load session")
+      setActiveSessionId(null)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const startSession = async () => {
     setError("")
@@ -62,6 +114,8 @@ export default function ConversationPage() {
       setSession(s)
       setMessages([])
       setSummary(null)
+      setActiveSessionId(s.id)
+      setRecentSessions((prev) => [s, ...prev])
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start session")
     }
@@ -70,12 +124,18 @@ export default function ConversationPage() {
   const endSession = async () => {
     if (!session) return
     setError("")
+    setLoading(true)
     try {
       const s = await api.sessions.end(session.id)
       setSummary(s)
       setSession(null)
+      setActiveSessionId(null)
+      const sessions = await api.sessions.list()
+      setRecentSessions(sessions)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to end session")
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -84,7 +144,6 @@ export default function ConversationPage() {
     const text = inputText.trim()
     const tempId = `temp-${Date.now()}`
 
-    // Optimistic append — rolled back on failure
     const userMsg: Message = {
       id: tempId,
       session_id: session.id,
@@ -102,9 +161,8 @@ export default function ConversationPage() {
     try {
       const turn = await api.messages.send(session.id, text)
       setMessages((prev) => {
-        // Replace the optimistic entry and append the assistant reply
         const withoutTemp = prev.filter((m) => m.id !== tempId)
-        return [...withoutTemp, turn.assistant_message]
+        return [...withoutTemp, turn.user_message, turn.assistant_message]
       })
       if (turn.audio_url) {
         playAudio(turn.audio_url)
@@ -159,6 +217,28 @@ export default function ConversationPage() {
     })
   }
 
+  const newSession = () => {
+    setSession(null)
+    setMessages([])
+    setSummary(null)
+    setActiveSessionId(null)
+  }
+
+  if (pageLoading) {
+    return (
+      <div className="max-w-2xl mx-auto p-6 space-y-4">
+        <Skeleton className="h-8 w-48" />
+        <Card>
+          <CardContent className="p-6 space-y-4">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-32" />
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
   if (summary) {
     return (
       <div className="max-w-2xl mx-auto p-6 space-y-6">
@@ -210,7 +290,7 @@ export default function ConversationPage() {
             )}
           </CardContent>
         </Card>
-        <Button onClick={() => { setSummary(null); setMessages([]) }} className="w-full">
+        <Button onClick={newSession} className="w-full">
           Start New Session
         </Button>
       </div>
@@ -219,16 +299,54 @@ export default function ConversationPage() {
 
   if (!session) {
     return (
-      <div className="max-w-lg mx-auto p-6 space-y-6">
-        <h1 className="text-2xl font-bold flex items-center gap-2">
-          <Sparkles className="h-6 w-6 text-primary" />
-          New Conversation
-        </h1>
+      <div className="max-w-2xl mx-auto p-6 space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold flex items-center gap-2">
+            <Sparkles className="h-6 w-6 text-primary" />
+            New Conversation
+          </h1>
+          <Button variant="ghost" size="sm" onClick={() => setShowHistory(!showHistory)} className="gap-1">
+            <History className="h-4 w-4" />
+            {showHistory ? "Hide" : "Recent"}
+          </Button>
+        </div>
         {error && (
           <div className="flex items-center gap-2 p-3 rounded-md bg-destructive/10 text-destructive text-sm">
             <AlertCircle className="h-4 w-4" />
             {error}
           </div>
+        )}
+        {showHistory && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Recent Sessions</CardTitle>
+            </CardHeader>
+            <CardContent className="p-4 space-y-2">
+              {recentSessions.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No sessions yet.</p>
+              ) : (
+                recentSessions.slice(0, 10).map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => loadSession(s.id)}
+                    className="w-full text-left flex items-center justify-between p-3 rounded-lg bg-secondary hover:bg-secondary/80 transition-colors"
+                  >
+                    <div>
+                      <p className="text-sm font-medium">{s.scenario_name || "Free Talk"}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {new Date(s.started_at).toLocaleString()} · {s.message_count} messages · {s.cefr_level}
+                      </p>
+                    </div>
+                    {s.ended_at ? (
+                      <Badge variant="outline" className="text-xs">Ended</Badge>
+                    ) : (
+                      <Badge className="text-xs">Active</Badge>
+                    )}
+                  </button>
+                ))
+              )}
+            </CardContent>
+          </Card>
         )}
         <Card>
           <CardHeader>
@@ -262,6 +380,11 @@ export default function ConversationPage() {
                   ))}
                 </SelectContent>
               </Select>
+              {user && (
+                <p className="text-xs text-muted-foreground">
+                  Your current level is <strong>{user.current_level}</strong>. You can still pick a different level to challenge yourself.
+                </p>
+              )}
             </div>
             <Button onClick={startSession} className="w-full" size="lg">
               Start Conversation
@@ -281,10 +404,15 @@ export default function ConversationPage() {
             {messages.length} messages
           </span>
         </div>
-        <Button variant="destructive" size="sm" onClick={endSession}>
-          <StopCircle className="h-4 w-4 mr-1" />
-          End Session
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={newSession}>
+            New
+          </Button>
+          <Button variant="destructive" size="sm" onClick={endSession} disabled={loading}>
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <StopCircle className="h-4 w-4 mr-1" />}
+            End Session
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -390,7 +518,7 @@ export default function ConversationPage() {
             className="flex-1"
           />
           <Button onClick={sendMessage} disabled={loading || !inputText.trim()} size="icon">
-            <Send className="h-4 w-4" />
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
           </Button>
         </div>
       </div>
