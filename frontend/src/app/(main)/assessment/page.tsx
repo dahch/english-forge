@@ -75,8 +75,7 @@ export default function AssessmentPage() {
     try {
       const a = await api.assessment.send(assessment.id, text)
       setMessages(a.messages)
-      const last = a.messages[a.messages.length - 1]
-      if (last?.text.toLowerCase().includes("we'll look at your results")) {
+      if (a.is_complete) {
         await completeAssessment(a.id)
       }
     } catch (err: unknown) {
