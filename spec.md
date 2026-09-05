@@ -243,6 +243,10 @@ generated_lessons(id, user_id, title, topic, level, explanation, examples, exerc
 -- learning_paths table
 learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
 
+  - **lessons_required** is capped to the actual number of lessons returned by the LLM
+    (per ADR-005 and commit 5f860ef), so the path can advance even if the LLM
+    returns fewer lessons than requested.
+
 -- path_lessons table
 path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at, created_at)
 
@@ -261,6 +265,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
+8. **Señal `is_complete`**: tras el último mensaje del usuario, si el LLM incluye `is_complete: true` en la respuesta JSON, el cliente asume que la fase de evaluación terminó y debe llamar a `POST /api/assessment/{id}/complete`. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computes) y se propaga desde la respuesta del LLM (commit 005d371, 5c12cf2).
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
