@@ -1,12 +1,50 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
 
 from app.config import get_settings
 from app.llm.base import ChatProvider
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_content(data: dict, provider_label: str) -> tuple[str | None, str | None]:
+    """Extract (content, finish_reason) from a chat-completions response.
+
+    Reasoning models (e.g. DeepSeek served on Fireworks) return the thinking
+    process in `message.reasoning_content` and the final answer in
+    `message.content` — but when the token budget is consumed by thinking,
+    `content` comes back null/empty with finish_reason="length". Some of those
+    models emit the answer inside reasoning_content, so it is used as a
+    fallback before declaring the response empty. The raw shape is logged
+    either way so failures are diagnosable.
+    """
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content")
+    finish_reason = choice.get("finish_reason")
+    usage = data.get("usage", {})
+
+    if not content:
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            logger.warning(
+                f"Provider {provider_label} returned empty content but has reasoning_content "
+                f"(finish_reason={finish_reason}, completion_tokens={usage.get('completion_tokens')}) "
+                f"— falling back to reasoning_content"
+            )
+            content = reasoning
+        else:
+            logger.warning(
+                f"Provider {provider_label} returned empty content "
+                f"(finish_reason={finish_reason}, message_keys={sorted(message.keys())}, "
+                f"usage={usage})"
+            )
+    return content, finish_reason
 
 
 class OpenAICompatibleProvider(ChatProvider):
@@ -57,10 +95,11 @@ class OpenAICompatibleProvider(ChatProvider):
             resp.raise_for_status()
             data = resp.json()
 
-        content = data["choices"][0]["message"].get("content")
+        content, finish_reason = _extract_content(data, self._label)
 
         return {
             "content": content,
+            "finish_reason": finish_reason,
             "usage": data.get("usage", {}),
             "model": data.get("model", self._model),
         }
