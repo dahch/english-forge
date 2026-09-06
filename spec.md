@@ -97,14 +97,13 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
     ┌───────────┼─────────────────┬───────────────┐
     ▼           ▼                 ▼               ▼
  SQLite     Pocket TTS      Proveedores LLM   Whisper local
- (default;  (tu homelab)    (OpenAI, Anthropic, (opcional,
- PostgreSQL                      DeepSeek, Fireworks, faster-whisper
- soportado)                      endpoint custom)    en backend)
-   (progreso,
-    vocab, hist.)
+ (única;    (tu homelab)    (OpenAI, Anthropic, (opcional,
+  datos:                        DeepSeek, Fireworks, faster-whisper
+  progreso,                     endpoint custom)    en backend)
+  vocab, hist.)
 ```
 
-- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
+- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend` — no hay servicio `db`; SQLite vive en el volumen `backend_data` montado en `/app/data`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
 - **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. Soporta modo single-user o multi-user según necesidad — la arquitectura está preparada para ambos.
 - **PWA**: instalar en el móvil como app (icono, offline shell) sin pasar por app stores.
 
@@ -279,6 +278,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
 8. **Señal `is_complete`**: tras cada mensaje del usuario, el backend marca la evaluación como completa si (a) el **servidor** detecta el fin — se alcanzó el tope de 10 preguntas (`MAX_ASSESSMENT_EXCHANGES`) o `_wants_to_finish()` reconoce una petición de cierre en un enunciado corto — o (b) el LLM incluye `is_complete: true` en su respuesta JSON. Cuando `is_complete` llega `true` en la respuesta, el cliente debe llamar a `POST /api/assessment/{id}/complete`, que ejecuta el análisis final con reintento de hasta 3 intentos del LLM. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computan).
+9. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen — útil si el análisis original guardó resultados vacíos o degradados). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire) y devuelve HTTP 503 si la salida del LLM no tiene la forma esperada de un análisis (la forma conversacional de fallback se rechaza en vez de persistir tarjetas vacías).
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -385,7 +385,7 @@ english-forge/
 **Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).
 - Scoring de pronunciación más fino.
-- Migración a PostgreSQL para persistencia a largo plazo.
+- Migración a PostgreSQL para persistencia a largo plazo (actualmente SQLite en WAL).
 - Aplicación móvil real (Capacitor/Expo) para usar STT nativo.
 
 ---
@@ -396,4 +396,4 @@ english-forge/
 - Sobre **"ClinePass"** como proveedor LLM sigue sin resolverse — lo mantengo modelado como endpoint OpenAI-compatible genérico configurable por URL/clave/modelo.
 - Detalle de networking importante que añadí: `personal-api` publica `127.0.0.1:8003:8000` (solo accesible desde el host), así que el backend de EnglishForge tiene que unirse a la red externa `coolify` y hablarle por el nombre de servicio interno (`http://personal-api:8000`), no por ese puerto publicado.
 - Mencionas que hoy usas el TTS "mediante un MCP que mira Hermes, y este MCP a su vez interactúa con personal-api". Para el **backend de la app** (no para mí como agente/asistente) lo natural es que EnglishForge le hable **directo por HTTP a `personal-api`** (como hice arriba) en vez de pasar por ese MCP — el MCP tiene sentido cuando quien consume la herramienta soy yo (un LLM en una conversación), no cuando es tu propio backend de aplicación llamando a otro servicio. Dime si en tu caso es distinto (ej. si personal-api solo es alcanzable a través del MCP por algún motivo de red/auth) y lo ajusto.
-- Si luego quieres migrar a Postgres, empaquetar como app móvil real (Capacitor/Expo) para usar STT nativo, o añadir un avatar animado, la arquitectura ya deja los puntos de extensión preparados (interfaces `ChatProvider`, `TTSProvider`, componente de avatar placeholder).
+- Si luego quieres empaquetar como app móvil real (Capacitor/Expo) para usar STT nativo, o añadir un avatar animado, la arquitectura ya deja los puntos de extensión preparados (interfaces `ChatProvider`, `TTSProvider`, componente de avatar placeholder).

@@ -14,7 +14,7 @@ graph TB
         LLMR["LLM Router (BYOK)<br/>fallback chain"]
         SRS["SRS engine (SM-2)"]
     end
-    DB[("SQLite (default)<br/>or PostgreSQL")]
+    DB[("SQLite<br/>/app/data/englishforge.db")]
     PA["personal-api<br/>Pocket TTS · Moonshine STT<br/>(RQ queues)"]
     LLM["LLM APIs<br/>OpenAI · Anthropic · DeepSeek ·<br/>Fireworks · ClinePass · custom"]
 
@@ -26,7 +26,7 @@ graph TB
     API -- "POST /v1/speak, /v1/transcribe<br/>poll /v1/jobs/{id}" --> PA
 ```
 
-- **Deployment**: single Docker Compose stack (`frontend`, `backend`, `db`). The compose file currently ships a `postgres:16-alpine` `db` service; the backend's code default is SQLite (`sqlite+aiosqlite:///./data/englishforge.db`, persisted on the `backend_data` volume). Both dialects are supported — the backend joins the external `coolify` network to reach `personal-api` by service name.
+- **Deployment**: single Docker Compose stack (`frontend`, `backend`). Data persists in SQLite (`sqlite+aiosqlite:///./data/englishforge.db`) on the `backend_data` volume (`/app/data`), with WAL mode + busy_timeout applied at startup for concurrent access. The backend joins the external `coolify` network to reach `personal-api` by service name.
 - **Ports**: frontend 3590, backend 8230.
 
 ## Backend Layers
@@ -38,7 +38,7 @@ graph TB
 | Integrations | `backend/app/integrations/` | `tts_personal_api.py` and `stt_personal_api.py` (async job submission + polling against personal-api), `stt_whisper_server.py` (faster-whisper in-process, optional dependency), `crypto.py` (Fernet encryption of provider API keys — key from `SETTINGS_ENCRYPTION_KEY` or derived from `JWT_SECRET_KEY`). |
 | Domain | `backend/app/lessons/`, `backend/app/srs/` | Static lesson library (no LLM needed) and the SM-2 spaced-repetition implementation. |
 | Data | `backend/app/models/`, `backend/app/schemas/` | SQLAlchemy 2.0 async ORM (15 tables) and Pydantic response schemas. |
-| App | `backend/app/main.py` | Lifespan: `create_all` → `_ensure_new_columns_sync` (`_COLUMNS_TO_ADD` + savepoint guards) → `_ensure_indexes_sync` (`_INDEXES_TO_ADD` partial unique indexes) → drift validation against the ORM metadata. Global 500 handler. |
+| App | `backend/app/main.py` | Lifespan: drift validation of `_COLUMNS_TO_ADD` against the ORM metadata → `create_all` → `_ensure_new_columns_sync` (`_COLUMNS_TO_ADD` + savepoint guards) → `_ensure_indexes_sync` (`_INDEXES_TO_ADD` partial unique indexes). Global 500 handler. |
 
 ### Startup schema sync
 
@@ -80,7 +80,8 @@ The conversation and assessment pages always run Web Speech API in the browser; 
 
 1. `POST /api/assessment/start` — guarded by the partial unique index `uq_assessments_user_in_progress` (one in-progress assessment per user; duplicate starts fail atomically, not via SELECT-then-INSERT).
 2. Message loop — max 10 exchanges (`MAX_ASSESSMENT_EXCHANGES`). Completion is detected **server-side first**: question cap reached or `_wants_to_finish()` matches a short end-request utterance (≤4 words after punctuation stripping); the LLM's own `is_complete` flag is honored too. Each LLM call retries up to 3 times with raw-response logging (ADR-010).
-3. `POST /api/assessment/{id}/complete` — sends `ASSESSMENT_ANALYSIS_PROMPT` with the full transcript, 3 attempts, parses estimated level/strengths/weaknesses/recommendations, updates the user's `current_level` and `assessment_completed`.
+3. `POST /api/assessment/{id}/complete` — sends `ASSESSMENT_ANALYSIS_PROMPT` with the full transcript, 3 attempts, parses estimated level/strengths/weaknesses/recommendations, updates the user's `current_level` and `assessment_completed`. The parsed payload must actually look like an analysis (`estimated_level` or `summary` present) — the conversational fallback shape is rejected with HTTP 503 instead of being persisted as empty result cards. An unrecognized CEFR level falls back to the user's `default_cefr` setting, then the existing `current_level`, then `A1`.
+4. `POST /api/assessment/{id}/reanalyze` — re-runs the same analysis over the stored conversation (e.g. to recover from a degraded earlier result), updating the stored fields in place. Guarded by a per-process 30 s cooldown per assessment (HTTP 429 on repeat); requires a completed assessment (HTTP 400 otherwise).
 
 ### Learning path generation
 

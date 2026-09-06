@@ -126,10 +126,7 @@ Change mode in Settings → Preferences → STT Mode.
     ┌──────────┼──────────────┬──────────────┐
     ▼          ▼              ▼              ▼
  SQLite      personal-api   LLM APIs    faster-whisper
- (default)    (TTS/STT)     (OpenAI...)  (optional)
-    │
-    └─ PostgreSQL also supported (the bundled compose
-       stack ships a postgres:16 db service)
+ (only)      (TTS/STT)     (OpenAI...)  (optional)
 ```
 
 ## Development
@@ -156,14 +153,26 @@ npm run dev
 
 ```bash
 cd backend
+pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
 Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
 
+### Maintenance
+
+Reset a user's data (sessions, messages, corrections, vocab, scenarios, assessments, generated lessons, learning paths, progress, settings) while preserving the account and its LLM provider configs — useful for testing:
+
+```bash
+python scripts/clear_user_data.py --email user@example.com --dry-run   # preview
+python scripts/clear_user_data.py --email user@example.com
+```
+
+The script also resets the user's level to B1 and clears `assessment_completed`.
+
 ### Database
 
-SQLite is the default database (`sqlite+aiosqlite:///./data/englishforge.db`, set in `backend/app/config.py`). In Docker the file lives on the `backend_data` volume (`/app/data`). PostgreSQL is also supported via `DATABASE_URL` — note that `docker-compose.yml` currently still ships a `postgres:16-alpine` `db` service and `.env.example` points `DATABASE_URL` at it. **TBD:** the compose stack and the "SQLite default" haven't been fully reconciled yet — if you want SQLite in Docker, remove the `db` service and the `DATABASE_URL` from your `.env`; if you want PostgreSQL, keep them.
+SQLite is the only supported database (`sqlite+aiosqlite:///./data/englishforge.db`, set in `backend/app/config.py`). In Docker the file lives on the `backend_data` volume (`/app/data`). WAL mode + busy_timeout are applied automatically at startup so concurrent reads/writes don't hit "database is locked". The backend refuses to start if `DATABASE_URL` points anywhere else — deployments upgrading from the removed PostgreSQL stack must migrate their data to SQLite manually.
 
 Schema handling (no manual migrations needed for routine changes):
 
@@ -185,10 +194,11 @@ See `.env.example` for the full list. Required:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing (also derives the Fernet key for API-key encryption when `SETTINGS_ENCRYPTION_KEY` is empty) |
-| `DATABASE_URL` | No (default: `sqlite+aiosqlite:///./data/englishforge.db`) | SQLAlchemy async URL. Use `postgresql+asyncpg://...` for PostgreSQL (the bundled compose stack's `.env.example` sets this). |
+| `DATABASE_URL` | No (default: `sqlite+aiosqlite:///./data/englishforge.db`) | SQLAlchemy async URL. Only SQLite is supported — override the file path if needed. |
 | `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
+| `LLM_TIMEOUT_SECONDS` | No (default: `300`) | Per-request timeout for LLM providers. Reasoning models can take a while before producing output — keep generous, or unset to disable the timeout entirely. |
 
 LLM API keys are configured in the app's Settings UI (encrypted in the DB) — see the note under [LLM Providers](#llm-providers).
 
