@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -163,37 +164,24 @@ async def _get_path_with_lessons(db: AsyncSession, path_id: str) -> LearningPath
     return result.scalar_one()
 
 
-@router.get("/current", response_model=FullLearningPathResponse)
-async def get_current_path(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
+async def _get_active_path(db: AsyncSession, user_id: str) -> LearningPath | None:
     result = await db.execute(
         select(LearningPath)
-        .where(LearningPath.user_id == current_user.id, LearningPath.is_active == True)
+        .where(LearningPath.user_id == user_id, LearningPath.is_active == True)
         .order_by(LearningPath.created_at.desc())
         .options(selectinload(LearningPath.path_lessons))
+        .limit(1)
     )
-    path = result.scalar_one_or_none()
-    if not path:
-        raise HTTPException(status_code=404, detail="No active learning path. Complete the assessment or generate one manually.")
-
-    return path
+    return result.scalar_one_or_none()
 
 
-@router.post("/generate", response_model=FullLearningPathResponse, status_code=201)
-async def generate_path(
-    body: GeneratePathRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    assessment: Assessment | None = None
-    if body.assessment_id:
-        result = await db.execute(
-            select(Assessment).where(Assessment.id == body.assessment_id, Assessment.user_id == current_user.id)
-        )
-        assessment = result.scalar_one_or_none()
-
+# Core generation logic shared by POST /generate, POST /advance, and the
+# frontend's manual "generate from current level" — route handlers stay thin.
+async def _generate_path_for_user(
+    db: AsyncSession,
+    current_user: User,
+    assessment: Assessment | None = None,
+) -> LearningPath:
     current_level = current_user.current_level or "A1"
     target_level = NEXT_LEVEL.get(current_level)
     if not target_level:
@@ -235,15 +223,18 @@ async def generate_path(
         parsed = parse_llm_json(result["content"])
     except Exception as e:
         logger.error(f"Learning path generation failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Failed to generate learning path: {e}")
+        # Generic detail — raw exception text can leak provider URLs/keys.
+        raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
 
     lessons_data = parsed.get("lessons", [])
     if not lessons_data:
         raise HTTPException(status_code=500, detail="Generated learning path has no lessons")
 
-    # The LLM may return fewer lessons than requested — derive the target from
-    # what we actually stored, otherwise the path can never be advanced.
-    lessons_required = min(lessons_required, len(lessons_data))
+    # Keep counters and stored lessons consistent in both directions:
+    # fewer returned than requested → shrink lessons_required so the path can
+    # still advance; more returned → slice so progress can never exceed 100%.
+    lessons_data = lessons_data[:lessons_required]
+    lessons_required = len(lessons_data)
 
     await _deactivate_current_paths(db, current_user.id)
 
@@ -256,11 +247,19 @@ async def generate_path(
         lessons_completed=0,
         is_active=True,
     )
-    db.add(path)
-    await db.flush()
+    # The partial unique index (uq_learning_paths_user_active, created at
+    # startup) allows only one active path per user — a concurrent /generate
+    # that passed the deactivate step can't create a second active row.
+    # The loser rolls back and re-selects the winner's path.
+    try:
+        async with db.begin_nested():
+            db.add(path)
+    except IntegrityError:
+        existing = await _get_active_path(db, current_user.id)
+        if existing:
+            return existing
+        raise
 
-    # lessons_required was capped above to len(lessons_data), so every
-    # returned lesson is stored — no slicing needed.
     for i, lesson_data in enumerate(lessons_data):
         path_lesson = PathLesson(
             path_id=path.id,
@@ -278,6 +277,39 @@ async def generate_path(
     await db.flush()
 
     return await _get_path_with_lessons(db, path.id)
+
+
+@router.get("/current", response_model=FullLearningPathResponse)
+async def get_current_path(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    path = await _get_active_path(db, current_user.id)
+    if not path:
+        raise HTTPException(status_code=404, detail="No active learning path. Complete the assessment or generate one manually.")
+
+    return path
+
+
+@router.post("/generate", response_model=FullLearningPathResponse, status_code=201)
+async def generate_path(
+    body: GeneratePathRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    assessment: Assessment | None = None
+    if body.assessment_id:
+        result = await db.execute(
+            select(Assessment).where(Assessment.id == body.assessment_id, Assessment.user_id == current_user.id)
+        )
+        assessment = result.scalar_one_or_none()
+        if not assessment:
+            # Don't silently generate a generic path when the client thinks
+            # it's assessment-informed — say so.
+            raise HTTPException(status_code=404, detail="Assessment not found")
+
+    path = await _generate_path_for_user(db, current_user, assessment)
+    return path
 
 
 @router.patch("/{path_id}/lessons/{lesson_id}/complete", response_model=FullLearningPathResponse)
@@ -369,5 +401,6 @@ async def advance_level(
     await db.flush()
     db.expire(path)
 
-    # Generate next path automatically
-    return await generate_path(GeneratePathRequest(), current_user, db)
+    # Generate the next path automatically — same shared service as
+    # POST /generate, without assessment context (the old path is done).
+    return await _generate_path_for_user(db, current_user)

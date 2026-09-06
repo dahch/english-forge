@@ -236,7 +236,7 @@ async def _process_turn(
     audio_url = None
     try:
         tts = TTSPersonalAPI()
-        voice = await resolve_tts_voice(db, user_id)
+        voice = await resolve_tts_voice(db, user_id, profile_dict)
         audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
             import base64

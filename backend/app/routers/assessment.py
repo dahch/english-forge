@@ -5,7 +5,7 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.llm.prompts import build_tutor_persona
 from app.llm.router import LLMRouter, parse_llm_json
 from app.models.models import Assessment, AssessmentMessage, User
 from app.utils import get_tutor_profile_dict
@@ -89,7 +90,8 @@ Strengths, weaknesses, and recommendations should be concrete and actionable. Wr
 
 
 class AssessmentMessageCreate(BaseModel):
-    text: str = Field(..., min_length=1)
+    # max_length keeps a single turn from writing unbounded text to the DB.
+    text: str = Field(..., min_length=1, max_length=2000)
 
 
 class AssessmentMessageResponse(BaseModel):
@@ -170,11 +172,13 @@ async def get_current_assessment(
 
 @router.post("/start", response_model=AssessmentResponse, status_code=201)
 async def start_assessment(
+    response: Response,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     # Return the in-progress assessment instead of creating a duplicate
     # (double-click on "Start Assessment" would otherwise fork the chat).
+    # An idempotent hit is 200, not 201 — nothing was created.
     existing_result = await db.execute(
         select(Assessment)
         .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
@@ -184,6 +188,7 @@ async def start_assessment(
     )
     existing = existing_result.scalar_one_or_none()
     if existing:
+        response.status_code = 200
         return existing
 
     # The partial unique index (uq_assessments_user_in_progress, created at
@@ -204,12 +209,13 @@ async def start_assessment(
         )
         existing = existing_result.scalar_one_or_none()
         if existing:
+            response.status_code = 200
             return existing
         raise
     await db.refresh(assessment)
 
     tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-    persona = f"You are {tutor_profile['name']}, an expert English teacher."
+    persona = build_tutor_persona(tutor_profile)
 
     prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nThis is the start of the assessment. Greet the student and ask your first question. Return question_count=1 and is_complete=false."
 
@@ -258,11 +264,13 @@ async def assessment_message(
     db.add(user_msg)
     await db.flush()
 
-    # Load previous messages
+    # Load previous messages — id as a tiebreaker because created_at uses
+    # func.now() (the transaction timestamp), so the user message and the
+    # assistant reply inserted in the same request can share a timestamp.
     msg_result = await db.execute(
         select(AssessmentMessage)
         .where(AssessmentMessage.assessment_id == assessment_id)
-        .order_by(AssessmentMessage.created_at)
+        .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
     )
     messages = msg_result.scalars().all()
 
@@ -279,22 +287,31 @@ async def assessment_message(
         is_complete = True
 
     tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-    persona = f"You are {tutor_profile['name']}, an expert English teacher."
+    persona = build_tutor_persona(tutor_profile)
 
     prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
 
     llm = LLMRouter(db, current_user.id)
-    try:
-        result = await llm.complete_with_fallback(
-            messages=messages_for_llm,
-            system_prompt=prompt,
-            task="assessment",
-            temperature=0.7,
-            max_tokens=500,
-        )
-        parsed = parse_llm_json(result["content"])
-    except Exception as e:
-        logger.error(f"Assessment message failed: {e}")
+    parsed = None
+    for attempt in range(3):
+        try:
+            result = await llm.complete_with_fallback(
+                messages=messages_for_llm,
+                system_prompt=prompt,
+                task="assessment",
+                temperature=0.7,
+                max_tokens=500,
+            )
+            parsed = parse_llm_json(result["content"])
+            if parsed.get("reply", "").strip():
+                break
+            logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
+            parsed = None
+        except Exception as e:
+            logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
+            parsed = None
+
+    if not parsed:
         is_complete = True
         parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": questions_asked, "is_complete": True}
 
@@ -329,12 +346,15 @@ async def complete_assessment(
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
     if assessment.completed_at:
-        return assessment
+        # Idempotent re-complete: return the stored result. Must re-select with
+        # eager loading — serializing the bare ORM object would lazy-load
+        # `messages` outside the greenlet (MissingGreenlet → 500).
+        return await _get_assessment_with_messages(db, assessment.id)
 
     msg_result = await db.execute(
         select(AssessmentMessage)
         .where(AssessmentMessage.assessment_id == assessment_id)
-        .order_by(AssessmentMessage.created_at)
+        .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
     )
     messages = msg_result.scalars().all()
 
@@ -355,7 +375,8 @@ async def complete_assessment(
         parsed = parse_llm_json(analysis_result["content"])
     except Exception as e:
         logger.error(f"Assessment analysis failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Failed to analyze assessment: {e}")
+        # Generic detail — raw exception text can leak provider URLs/keys.
+        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
 
     assessment.completed_at = datetime.now(timezone.utc)
     raw_level = str(parsed.get("estimated_level") or "").strip().upper()

@@ -89,13 +89,16 @@ async def get_stats(
 
     path_progress = None
     if path:
+        # Clamp — paths created before the lesson-cap fix could have more
+        # stored lessons than lessons_required.
+        percent = min(100.0, round(path.lessons_completed / max(path.lessons_required, 1) * 100, 1))
         path_progress = {
             "id": path.id,
             "current_level": path.current_level,
             "target_level": path.target_level,
             "lessons_completed": path.lessons_completed,
             "lessons_required": path.lessons_required,
-            "percent": round(path.lessons_completed / max(path.lessons_required, 1) * 100, 1),
+            "percent": percent,
         }
 
     return {

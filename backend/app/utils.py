@@ -57,16 +57,17 @@ async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:
     }
 
 
-async def resolve_tts_voice(db: AsyncSession, user_id: str) -> str | None:
+async def resolve_tts_voice(db: AsyncSession, user_id: str, profile: dict | None = None) -> str | None:
     """Resolve the voice used when the tutor speaks.
 
     Priority: tutor profile voice > settings tts_voice > None (the TTS engine
-    then falls back to TTS_DEFAULT_VOICE from the environment).
+    then falls back to TTS_DEFAULT_VOICE from the environment). Pass an
+    already-loaded profile dict (see get_tutor_profile_dict) to avoid
+    re-querying TutorProfile in the same request.
     """
-    result = await db.execute(select(TutorProfile).where(TutorProfile.user_id == user_id))
-    profile = result.scalar_one_or_none()
-    if profile and profile.voice:
-        return profile.voice
+    voice = (profile or {}).get("voice")
+    if voice:
+        return voice
 
     result = await db.execute(
         select(Setting).where(Setting.user_id == user_id, Setting.key == "tts_voice")

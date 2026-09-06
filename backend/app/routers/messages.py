@@ -157,7 +157,7 @@ async def send_message(
     audio_url = None
     try:
         tts = TTSPersonalAPI()
-        voice = await resolve_tts_voice(db, current_user.id)
+        voice = await resolve_tts_voice(db, current_user.id, profile_dict)
         audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
             import base64

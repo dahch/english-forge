@@ -68,13 +68,17 @@ async def update_profile(
 
     # model_fields_set distinguishes "field absent" from "field explicitly
     # sent as null", so the Settings page can clear age/gender/voice.
+    # Nullable columns store NULL, never "" — the frontend sends "" from
+    # untouched inputs, so coerce empty strings to None for those fields.
     # name/personality are NOT NULL columns — ignore explicit nulls AND empty
-    # strings for them (the frontend can send "" from an untouched input).
+    # strings for them.
     nullable_fields = {"age", "gender", "voice"}
     for field in body.model_fields_set:
         value = getattr(body, field)
         if not value and field not in nullable_fields:
             continue
+        if field in nullable_fields and value == "":
+            value = None
         setattr(profile, field, value)
 
     await db.flush()
