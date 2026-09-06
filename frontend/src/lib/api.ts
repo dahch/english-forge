@@ -40,10 +40,6 @@ function getToken(): string | null {
   return localStorage.getItem("ef_token")
 }
 
-// Exported for components that need authenticated non-JSON fetches (e.g. the
-// assessment audio player, which streams audio blobs).
-export { getToken }
-
 export function setToken(token: string) {
   localStorage.setItem("ef_token", token)
 }
@@ -108,6 +104,25 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (res.status === 204) return undefined as T
   return res.json()
+}
+
+// Fetch a non-JSON resource (e.g. an audio blob) with the same auth header,
+// API base prefix and 401 handling as `request`. Used by the assessment audio
+// player, which needs the raw bytes rather than a parsed JSON body.
+export async function fetchBlob(path: string): Promise<Blob> {
+  const token = getToken()
+  const headers: Record<string, string> = {}
+  if (token) headers["Authorization"] = `Bearer ${token}`
+
+  const res = await fetch(`${API_BASE}${path}`, { headers })
+
+  if (res.status === 401) {
+    return handleUnauthorized()
+  }
+  if (!res.ok) {
+    throw new ApiError(res.statusText || "Request failed", res.status)
+  }
+  return res.blob()
 }
 
 export interface LessonExercise {

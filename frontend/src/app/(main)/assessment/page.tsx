@@ -93,7 +93,9 @@ function MessageBubble({
         )}
         {(msg.kind === "chat" || isListeningItem || msg.kind === "mic_check") && (
           <div className="flex items-center gap-1 mt-1">
-            <AudioButton assessmentId={assessmentId} messageId={msg.id} disabled={hidden} />
+            {/* Audio always playable — for audio-only items the play button IS
+                the question; hiding the text must not block playback. */}
+            <AudioButton assessmentId={assessmentId} messageId={msg.id} />
           </div>
         )}
       </div>
@@ -249,10 +251,12 @@ export default function AssessmentPage() {
       setIsRecording(false)
       if (!handle || !assessment) return
       try {
-        await uploadBlob(await handle.stop())
+        // recorder.onstop already triggers onStop → uploadBlob for both the
+        // manual stop and the 30s auto-stop. Only await here to surface
+        // recorder errors (e.g. no-data); do NOT upload again or every voice
+        // answer would hit /recordings twice.
+        await handle.stop()
       } catch {
-        // uploadBlob already surfaces the error; recorder errors (no-data)
-        // fall through to a generic message.
         setError("Recording failed — you can type your answer instead.")
         setRecordElapsed(0)
       }

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Loader2, Pause, Volume2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { getToken } from "@/lib/api"
+import { fetchBlob } from "@/lib/api"
 
 // Play button for assessment tutor audio. Fetches the message audio with the
 // auth header (data URIs would bloat every messages poll), caches the blob
@@ -43,11 +43,9 @@ export function AudioButton({
     try {
       setState("loading")
       if (!blobRef.current) {
-        const res = await fetch(`/api/assessment/${assessmentId}/messages/${messageId}/audio`, {
-          headers: { Authorization: `Bearer ${getToken()}` },
-        })
-        if (!res.ok) throw new Error(res.statusText)
-        const blob = await res.blob()
+        const blob = await fetchBlob(
+          `/api/assessment/${assessmentId}/messages/${messageId}/audio`
+        )
         blobRef.current = URL.createObjectURL(blob)
       }
       const audio = new Audio(blobRef.current)
