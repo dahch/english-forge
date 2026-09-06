@@ -168,6 +168,12 @@ def phoneme_accuracy(expected: str, transcript: str) -> float | None:
         return None
     exp_phones = _phonemize(expected)
     got_phones = _phonemize(transcript)
+    return _phoneme_accuracy_from(exp_phones, got_phones)
+
+
+def _phoneme_accuracy_from(exp_phones: str | None, got_phones: str | None) -> float | None:
+    """Distance between two already-phonemized strings. Separated so the async
+    path can defer only the blocking espeak calls to a worker thread."""
     if not exp_phones or got_phones is None:
         return None
     exp_tokens = [t for t in exp_phones.split() if t]
@@ -259,6 +265,45 @@ def score_pronunciation(expected_text: str, transcript: str, words: list[dict] |
             fluency["score"] if fluency else None,
         ),
         # Provenance: lets the analysis know which components had evidence.
+        "phonemizer_used": _PHONEMIZER_AVAILABLE,
+        "timestamps_used": bool(words),
+    }
+
+
+async def score_pronunciation_async(
+    expected_text: str, transcript: str, words: list[dict] | None = None
+) -> dict:
+    """Async variant of `score_pronunciation` for the request hot path.
+
+    The phonemizer (espeak-ng) call blocks on a C extension, so it is deferred
+    to a worker thread with asyncio.to_thread to avoid stalling the event loop
+    on every speaking answer. The Levenshtein distance is pure Python over a
+    few dozen tokens — negligible — and runs inline.
+    """
+    import asyncio
+
+    word_acc = word_accuracy(expected_text, transcript)
+    fluency = fluency_score(words or [])
+
+    phon_acc = None
+    if _PHONEMIZER_AVAILABLE:
+        exp_phones, got_phones = await asyncio.to_thread(
+            lambda: (_phonemize(expected_text), _phonemize(transcript))
+        )
+        phon_acc = _phoneme_accuracy_from(exp_phones, got_phones)
+
+    return {
+        "word_accuracy": word_acc["word_accuracy"],
+        "substitutions": word_acc["substitutions"],
+        "deletions": word_acc["deletions"],
+        "insertions": word_acc["insertions"],
+        "phoneme_accuracy": phon_acc,
+        "fluency": fluency,
+        "composite": composite_score(
+            word_acc["word_accuracy"],
+            phon_acc,
+            fluency["score"] if fluency else None,
+        ),
         "phonemizer_used": _PHONEMIZER_AVAILABLE,
         "timestamps_used": bool(words),
     }

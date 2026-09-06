@@ -9,6 +9,7 @@ from app.services.pronunciation import (
     phoneme_accuracy,
     phonemizer_available,
     score_pronunciation,
+    score_pronunciation_async,
     word_accuracy,
 )
 
@@ -161,3 +162,25 @@ class TestScorePronunciation:
         mid = score_pronunciation("a b c d", "a b c x", None)["composite"]
         bad = score_pronunciation("a b c d", "z y w v", None)["composite"]
         assert good > mid > bad
+
+
+class TestScorePronunciationAsync:
+    @pytest.mark.asyncio
+    async def test_matches_sync_result(self):
+        # The async path defers only the blocking espeak call to a thread; the
+        # metrics it produces must be identical to the sync entry point.
+        expected = "I live near the harbor"
+        transcript = "I live near the harbor"
+        sync_result = score_pronunciation(expected, transcript, None)
+        async_result = await score_pronunciation_async(expected, transcript, None)
+        assert async_result == sync_result
+
+    @pytest.mark.asyncio
+    async def test_async_shape(self):
+        m = await score_pronunciation_async("The harbor", "The harbour", None)
+        assert set(m) >= {
+            "word_accuracy", "substitutions", "deletions", "insertions",
+            "phoneme_accuracy", "fluency", "composite",
+            "phonemizer_used", "timestamps_used",
+        }
+        assert m["fluency"] is None
