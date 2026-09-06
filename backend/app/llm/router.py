@@ -96,20 +96,43 @@ class LLMRouter:
 
 
 def parse_llm_json(content: str) -> dict[str, Any]:
-    content = content.strip()
+    """Parse a JSON object from an LLM response, tolerating markdown fences and prose.
+
+    Tries the whole response first, then balanced JSON objects, then falls back to
+    regex extraction for the common conversational/correction/vocab shapes. This
+    keeps assessment messages working when the model returns prose while also
+    handling structured outputs (assessment analysis, learning paths) that may be
+    wrapped in ```json fences or accompanied by explanatory text.
+    """
+    cleaned = _strip_code_fences(content).strip()
 
     try:
-        return json.loads(content)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    json_match = re.search(r"\{[\s\S]*\}", content)
-    if json_match:
-        try:
-            return json.loads(json_match.group())
-        except json.JSONDecodeError:
-            pass
+    # Try repaired JSON (smart quotes, trailing commas) on the whole response.
+    try:
+        return json.loads(_repair_json(cleaned))
+    except json.JSONDecodeError:
+        pass
 
+    # Extract balanced {...} blocks, preferring larger dicts first.
+    candidates = sorted(
+        _extract_balanced_objects(cleaned),
+        key=lambda b: len(b),
+        reverse=True,
+    )
+    for text in candidates:
+        for attempt in (text, _repair_json(text)):
+            try:
+                data = json.loads(attempt)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+    # Legacy fallback for conversational/structured fragments.
     reply_match = re.search(r'"reply"\s*:\s*"([^"]*)"', content)
     reply = reply_match.group(1) if reply_match else content
 
