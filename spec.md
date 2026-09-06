@@ -295,32 +295,27 @@ english-forge/
 ├── docker-compose.yml
 ├── .env.example
 ├── frontend/                # Next.js PWA
-│   ├── app/
-│   │   ├── (auth)/          # login, register
-│   │   ├── (main)/
-│   │   │   ├── assessment/
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── (auth)/          # login, register
+│   │   │   └── (main)/
+│   │   │       ├── assessment/
+│   │   │       ├── conversation/
+│   │   │       ├── dashboard/
+│   │   │       ├── lessons/
+│   │   │       ├── learning-path/
+│   │   │       └── settings/
+│   │   ├── components/
+│   │   │   ├── layout/          # sidebar, mobile nav
 │   │   │   ├── conversation/
 │   │   │   ├── dashboard/
-│   │   │   ├── lessons/
-│   │   │   ├── learning-path/
-│   │   │   └── settings/
-│   │   ├── lib/
-│   │   │   ├── api.ts
-│   │   │   ├── stt/
-│   │   │   └── types.ts
-│   │   └── components/
-│   │       ├── layout/
-│   │       │   └── sidebar.tsx
-│   │       ├── ui/
-│   │       │   ├── badge.tsx
-│   │       │   ├── progress.tsx
-│   │       │   ├── skeleton.tsx
-│   │       │   └── ...
-│   │       └── conversation/
-│   │       ├── dashboard/
-│   │       ├── lessons/
-│   │       ├── settings/
-│   │       └── vocab/
+│   │   │   ├── vocab/
+│   │   │   └── ui/              # badge, button, card, progress, skeleton, ...
+│   │   └── lib/
+│   │       ├── api.ts
+│   │       ├── stt/             # web-speech.ts, whisper-wasm.ts
+│   │       ├── types.ts
+│   │       └── utils.ts
 │   ├── public/
 │   └── next-env.d.ts
 ├── backend/
