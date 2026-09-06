@@ -41,19 +41,32 @@ NEXT_LEVEL = {
 }
 
 
+# Topic focus per CEFR jump — interpolated into the generation prompt so the
+# lesson counts always match LEVEL_LESSONS_REQUIRED (single source of truth).
+LEVEL_FOCUS = {
+    "A1": "focused on fundamentals (basic tenses, everyday vocabulary, simple questions)",
+    "A2": "with concentrated grammar (present perfect, conditionals type 1, modals, common phrasal verbs)",
+    "B1": "— the densest level (conditionals 2/3, passive voice, reported speech, complex connectors, abstract vocabulary)",
+    "B2": "focused on refinement (collocations, idioms, formal/informal register, nuance)",
+    "C1": "— almost no new grammar, just polishing naturalness, cultural references, irony, and precision",
+}
+
+
 LESSON_TYPES = ["vocabulary", "grammar", "conversation", "listening", "reading", "writing"]
 
 
-LEARNING_PATH_GENERATION_PROMPT = """You are an expert English curriculum designer and CEFR specialist. You are creating a personalized learning path for an adult English learner.
+_LEARNING_PATH_FRAMEWORK = "\n".join(
+    f"- {level}→{NEXT_LEVEL[level]}: {LEVEL_LESSONS_REQUIRED[level]} lessons {LEVEL_FOCUS[level]}."
+    for level, nxt in NEXT_LEVEL.items()
+    if nxt is not None
+)
+
+LEARNING_PATH_GENERATION_PROMPT = f"""You are an expert English curriculum designer and CEFR specialist. You are creating a personalized learning path for an adult English learner.
 
 The learner has just completed a placement assessment.
 
 Use the following CEFR framework for the learning path:
-- A1→A2: 18 lessons focused on fundamentals (basic tenses, everyday vocabulary, simple questions).
-- A2→B1: 22 lessons with concentrated grammar (present perfect, conditionals type 1, modals, common phrasal verbs).
-- B1→B2: 28 lessons — the densest level (conditionals 2/3, passive voice, reported speech, complex connectors, abstract vocabulary).
-- B2→C1: 22 lessons focused on refinement (collocations, idioms, formal/informal register, nuance).
-- C1→C2: 10 lessons — almost no new grammar, just polishing naturalness, cultural references, irony, and precision.
+{_LEARNING_PATH_FRAMEWORK}
 
 Each lesson should be one of these types: vocabulary, grammar, conversation, listening, reading, writing.
 
@@ -246,7 +259,9 @@ async def generate_path(
     db.add(path)
     await db.flush()
 
-    for i, lesson_data in enumerate(lessons_data[:lessons_required]):
+    # lessons_required was capped above to len(lessons_data), so every
+    # returned lesson is stored — no slicing needed.
+    for i, lesson_data in enumerate(lessons_data):
         path_lesson = PathLesson(
             path_id=path.id,
             lesson_type=lesson_data.get("lesson_type", "grammar"),
