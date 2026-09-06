@@ -243,16 +243,16 @@ generated_lessons(id, user_id, title, topic, level, explanation, examples, exerc
 -- learning_paths table
 learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
 
-  - **lessons_required** is capped to the actual number of lessons returned by the LLM
-    (per ADR-005 and commit 5f860ef), so the path can advance even if the LLM
-    returns fewer lessons than requested.
-
 -- path_lessons table
 path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at, created_at)
 
 -- provider_configs table
 provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
 ```
+
+> **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de
+> lecciones devueltas por el LLM, para que el path siempre pueda avanzar
+> aunque el LLM devuelva menos lecciones de las solicitadas.
 
 ---
 
