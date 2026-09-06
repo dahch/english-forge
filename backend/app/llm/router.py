@@ -100,17 +100,23 @@ class LLMRouter:
                     result["model"] = provider.model_name
                     return result
 
-                if attempt == 0:
+                # Empty content with finish_reason="length" means a reasoning
+                # model burned the whole budget on thinking before writing the
+                # answer — one retry with a bigger budget usually recovers it.
+                # Any OTHER empty content won't be fixed by more tokens, so it
+                # fails the provider immediately (no wasted spend before the
+                # next provider is tried).
+                if attempt == 0 and result.get("finish_reason") == "length":
                     budget = max(budget * 4, 4096)
                     logger.warning(
                         f"Provider {provider.provider_name} returned empty content "
-                        f"(finish_reason={result.get('finish_reason')}) — "
-                        f"retrying with max_tokens={budget}"
+                        f"(finish_reason=length) — retrying with max_tokens={budget}"
                     )
                     continue
 
-                # Still empty after the budget bump — fail loudly so the next
-                # provider is tried instead of persisting blank output.
+                # Empty content that wasn't a length-limit (or still empty after
+                # the budget bump) — fail loudly so the next provider is tried
+                # instead of persisting blank output.
                 last_error = ValueError(
                     f"Provider {provider.provider_name} returned empty content "
                     f"(finish_reason={result.get('finish_reason')})"

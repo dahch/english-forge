@@ -223,11 +223,11 @@ class TestCompleteWithFallback:
         assert provider.calls == [200, 4096]
 
     @pytest.mark.asyncio
-    async def test_empty_content_without_length_retries_then_moves_on(self):
-        # Any empty content (not just finish_reason="length") gets one retry
-        # with a bigger budget before the router gives up on the provider.
+    async def test_empty_content_without_length_moves_on_without_retry(self):
+        # Empty content with a non-length finish_reason means the provider
+        # produced nothing — more tokens won't help, so it's failed after a
+        # single call (no budget bump) and the next provider is tried.
         failing = _ScriptedProvider([
-            {"content": None, "finish_reason": "stop", "usage": {}},
             {"content": None, "finish_reason": "stop", "usage": {}},
         ], name="failing")
         ok = _ScriptedProvider([{"content": "fine", "finish_reason": "stop", "usage": {}}], name="ok")
@@ -237,7 +237,8 @@ class TestCompleteWithFallback:
         result = await router.complete_with_fallback(messages=[], system_prompt="s")
         assert result["content"] == "fine"
         assert result["provider"] == "ok"
-        assert failing.calls == [2048, 8192]
+        # Failing provider was called once, at the default budget, no retry.
+        assert failing.calls == [2048]
 
     @pytest.mark.asyncio
     async def test_retry_exhausted_moves_to_next_provider(self):
