@@ -1,7 +1,10 @@
 import type {
+  Assessment,
   CEFRResult,
   ConversationTurn,
   DashboardStats,
+  GeneratedLesson,
+  LearningPath,
   Message,
   ProviderConfig,
   QuizQuestion,
@@ -9,12 +12,27 @@ import type {
   Scenario,
   Session,
   SessionSummary,
+  TutorProfile,
+  User,
   VocabItem,
 } from "./types"
 
 // Same-origin by default: Next.js rewrites proxy /api/* to the backend
 // service inside the docker network. Override only for special setups.
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || ""
+
+export const SESSION_ID_KEY = "ef_active_session_id"
+
+export function getActiveSessionId(): string | null {
+  if (typeof window === "undefined") return null
+  return localStorage.getItem(SESSION_ID_KEY)
+}
+
+export function setActiveSessionId(sessionId: string | null) {
+  if (typeof window === "undefined") return
+  if (sessionId) localStorage.setItem(SESSION_ID_KEY, sessionId)
+  else localStorage.removeItem(SESSION_ID_KEY)
+}
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null
@@ -35,8 +53,20 @@ export function isAuthenticated(): boolean {
 
 let redirecting = false
 
+// Typed error carrying the HTTP status, so callers can branch on status
+// codes (e.g. 404 = "no active X") instead of matching error message text.
+export class ApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
 function handleUnauthorized(): never {
   clearToken()
+  setActiveSessionId(null)
   if (typeof window !== "undefined" && !redirecting) {
     redirecting = true
     window.location.href = "/login"
@@ -65,7 +95,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || "Request failed")
+    throw new ApiError(err.detail || "Request failed", res.status)
   }
 
   if (res.status === 204) return undefined as T
@@ -76,6 +106,14 @@ export interface LessonExercise {
   question: string
   type: string
   explanation: string
+  // multiple_choice only
+  options?: string[]
+}
+
+export interface ExerciseCheckResult {
+  correct: boolean
+  correct_answer: string
+  explanation: string
 }
 
 export interface LibraryLesson {
@@ -85,30 +123,15 @@ export interface LibraryLesson {
   level: string
   explanation: string
   examples: string[]
-  exercises: LessonExercise[]
+  // Present in the detail response only — the list returns exercise_count.
+  exercises?: LessonExercise[]
   exercise_count: number
-}
-
-export interface ExerciseCheckResult {
-  correct: boolean
-  correct_answer: string
-  explanation: string
-}
-
-export interface GeneratedLesson {
-  title?: string
-  topic?: string
-  explanation?: string
-  examples?: string[]
-  exercises?: { question: string; type: string; answer: string; explanation?: string }[]
-  based_on_errors?: string
-  [key: string]: unknown
 }
 
 export const api = {
   auth: {
     register: (email: string, password: string, display_name: string) =>
-      request<{ id: string; email: string; display_name: string }>("/api/auth/register", {
+      request<User>("/api/auth/register", {
         method: "POST",
         body: JSON.stringify({ email, password, display_name }),
       }),
@@ -117,7 +140,13 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ email, password }),
       }),
-    me: () => request<{ id: string; email: string; display_name: string }>("/api/auth/me"),
+    me: () => request<User>("/api/auth/me"),
+  },
+
+  tutorProfile: {
+    get: () => request<TutorProfile>("/api/tutor-profile"),
+    update: (data: Partial<Omit<TutorProfile, "id" | "user_id">>) =>
+      request<TutorProfile>("/api/tutor-profile", { method: "PATCH", body: JSON.stringify(data) }),
   },
 
   scenarios: {
@@ -168,10 +197,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ quality }),
       }),
-    due: (limit: number = 20) =>
-      request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
-    generateQuiz: (count: number = 5) =>
-      request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
+    due: (limit: number = 20) => request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
+    generateQuiz: (count: number = 5) => request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
     checkQuiz: (vocab_item_id: string, answer: string) =>
       request<QuizResult>("/api/vocab/quiz/check", {
         method: "POST",
@@ -181,19 +208,58 @@ export const api = {
 
   lessons: {
     library: () => request<LibraryLesson[]>("/api/lessons/library"),
-    get: (id: string) => request<GeneratedLesson>(`/api/lessons/library/${id}`),
+    get: (id: string) => request<LibraryLesson>(`/api/lessons/library/${id}`),
     checkExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
       request<ExerciseCheckResult>(`/api/lessons/library/${lessonId}/exercise`, {
         method: "POST",
         body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
       }),
+    generated: () => request<GeneratedLesson[]>("/api/lessons/generated"),
+    checkGeneratedExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
+      request<ExerciseCheckResult>(`/api/lessons/generated/${lessonId}/exercise`, {
+        method: "POST",
+        body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
+      }),
+    completeGenerated: (id: string, completed: boolean = true) =>
+      request<{ id: string; completed: boolean }>(`/api/lessons/generated/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      }),
     generate: () => request<GeneratedLesson>("/api/lessons/generate", { method: "POST" }),
+  },
+
+  assessment: {
+    current: () => request<Assessment>("/api/assessment/current"),
+    start: () => request<Assessment>("/api/assessment/start", { method: "POST" }),
+    send: (id: string, text: string) =>
+      request<Assessment>(`/api/assessment/${id}/message`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      }),
+    complete: (id: string) =>
+      request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
+  },
+
+  learningPath: {
+    current: () => request<LearningPath>("/api/learning-paths/current"),
+    generate: (assessmentId?: string) =>
+      request<LearningPath>("/api/learning-paths/generate", {
+        method: "POST",
+        body: JSON.stringify(assessmentId ? { assessment_id: assessmentId } : {}),
+      }),
+    completeLesson: (pathId: string, lessonId: string, completed: boolean = true) =>
+      request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      }),
+    advance: (pathId: string) =>
+      request<LearningPath>(`/api/learning-paths/${pathId}/advance`, { method: "POST" }),
   },
 
   dashboard: {
     stats: () => request<DashboardStats>("/api/dashboard/stats"),
     weekly: (weeks: number = 4) =>
-      request<{ week: string; minutes: number; new_words: number; reviews: number }[]>(
+      request<{ week: string; minutes: number; new_words: number; reviews: number; lessons: number }[]>(
         `/api/dashboard/weekly?weeks=${weeks}`
       ),
     cefr: () => request<CEFRResult>("/api/dashboard/cefr"),
@@ -219,13 +285,13 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(data),
       }),
-    deleteProvider: (id: string) =>
-      request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
+    deleteProvider: (id: string) => request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
     get: () => request<{ key: string; value: string }[]>("/api/settings"),
     update: (data: Record<string, unknown>) =>
       request<{ key: string; value: string }[]>("/api/settings", {
         method: "PATCH",
         body: JSON.stringify(data),
       }),
+    clearData: () => request<{ message: string }>("/api/settings/clear-data", { method: "DELETE" }),
   },
 }

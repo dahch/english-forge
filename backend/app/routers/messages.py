@@ -30,6 +30,7 @@ from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.srs.sm2 import next_review_date
+from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
 
@@ -76,10 +77,13 @@ async def send_message(
             else:
                 scenario_key = scenario.name.lower().replace(" ", "_").replace("-", "_")
 
+    profile_dict = await get_tutor_profile_dict(db, current_user.id)
+
     system_prompt = build_system_prompt(
         scenario_key=scenario_key,
         scenario_custom_prompt=scenario_prompt,
         cefr_level=session.cefr_level,
+        tutor_profile=profile_dict,
     )
 
     llm_router = LLMRouter(db, current_user.id)
@@ -153,7 +157,8 @@ async def send_message(
     audio_url = None
     try:
         tts = TTSPersonalAPI()
-        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=None)
+        voice = await resolve_tts_voice(db, current_user.id, profile_dict)
+        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
@@ -162,9 +167,21 @@ async def send_message(
         pass
 
     await db.flush()
+    await db.refresh(user_msg)
     await db.refresh(assistant_msg)
 
+    user_message_response = MessageResponse(
+        id=user_msg.id,
+        session_id=user_msg.session_id,
+        role=user_msg.role,
+        text=user_msg.text,
+        audio_url=user_msg.audio_url,
+        created_at=user_msg.created_at,
+        corrections=correction_responses,
+    )
+
     return ConversationTurnResponse(
+        user_message=user_message_response,
         assistant_message=MessageResponse(
             id=assistant_msg.id,
             session_id=assistant_msg.session_id,
@@ -172,6 +189,8 @@ async def send_message(
             text=assistant_msg.text,
             audio_url=assistant_msg.audio_url,
             created_at=assistant_msg.created_at,
+            # Corrections attach to the user message; duplicated here only so
+            # legacy clients reading assistant_message.corrections keep working.
             corrections=correction_responses,
         ),
         corrections=correction_responses,

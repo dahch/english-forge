@@ -26,6 +26,8 @@ class UserResponse(BaseModel):
     id: str
     email: str
     display_name: str
+    current_level: str
+    assessment_completed: bool
     created_at: datetime
 
     model_config = {"from_attributes": True}

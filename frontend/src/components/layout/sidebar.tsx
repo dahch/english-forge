@@ -14,12 +14,16 @@ import {
   Settings,
   LogOut,
   Sparkles,
+  ClipboardCheck,
+  Map,
 } from "lucide-react"
 
 const navItems = [
   { href: "/conversation", label: "Conversation", icon: MessageSquare },
   { href: "/vocab", label: "Vocabulary", icon: BookOpen },
   { href: "/lessons", label: "Lessons", icon: GraduationCap },
+  { href: "/assessment", label: "Assessment", icon: ClipboardCheck },
+  { href: "/learning-path", label: "Path", icon: Map },
   { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
   { href: "/settings", label: "Settings", icon: Settings },
 ]
@@ -78,7 +82,7 @@ export function MobileNav() {
 
   return (
     <nav className="md:hidden fixed bottom-0 left-0 right-0 border-t bg-card z-50">
-      <div className="flex justify-around py-2">
+      <div className="flex overflow-x-auto scrollbar-hide snap-x snap-mandatory py-2">
         {navItems.map((item) => {
           const isActive = pathname.startsWith(item.href)
           return (
@@ -86,12 +90,12 @@ export function MobileNav() {
               key={item.href}
               href={item.href}
               className={cn(
-                "flex flex-col items-center gap-1 px-3 py-1 text-xs",
+                "flex flex-col items-center gap-1 px-4 py-1 text-xs shrink-0 snap-center",
                 isActive ? "text-primary" : "text-muted-foreground"
               )}
             >
               <item.icon className="h-5 w-5" />
-              <span className="truncate">{item.label}</span>
+              <span className="whitespace-nowrap">{item.label}</span>
             </Link>
           )
         })}

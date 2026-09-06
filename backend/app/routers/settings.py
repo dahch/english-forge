@@ -1,15 +1,32 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.integrations.crypto import decrypt_value, encrypt_value
-from app.models.models import ProviderConfig, Setting, User
+from app.models.models import (
+    Assessment,
+    AssessmentMessage,
+    Correction,
+    GeneratedLesson,
+    LearningPath,
+    Message,
+    PathLesson,
+    ProgressDaily,
+    ProviderConfig,
+    Scenario,
+    Session,
+    Setting,
+    TutorProfile,
+    User,
+    VocabItem,
+)
 from app.schemas.settings import (
     ProviderConfigCreate,
     ProviderConfigResponse,
@@ -17,6 +34,8 @@ from app.schemas.settings import (
     SettingResponse,
     UserSettingsUpdate,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -200,3 +219,147 @@ async def update_settings(
     result = await db.execute(select(Setting).where(Setting.user_id == current_user.id))
     settings = result.scalars().all()
     return [SettingResponse(key=s.key, value=s.value) for s in settings]
+
+
+@router.delete("/clear-data", status_code=200)
+async def clear_user_data(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all user learning data while preserving the account and provider configs.
+
+    Clears: sessions, messages, corrections, vocab, scenarios, assessments,
+    generated lessons, learning paths, progress entries, and settings.
+    """
+    user_id = current_user.id
+    deleted_counts: dict[str, int] = {}
+
+    # Delete children before parents to respect foreign key constraints.
+    # ORM cascade rules only apply when loading/deleting objects through the
+    # session identity map; bulk deletes bypass those cascades, so we must
+    # delete in the correct SQL order.
+
+    # Corrections reference messages.
+    deleted_counts["corrections"] = (
+        await db.execute(
+            delete(Correction)
+            .where(Correction.message_id.in_(
+                select(Message.id).where(Message.session_id.in_(
+                    select(Session.id).where(Session.user_id == user_id)
+                ))
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Vocab items may reference messages.
+    deleted_counts["vocab_items"] = (
+        await db.execute(
+            delete(VocabItem).where(VocabItem.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Assessment messages reference assessments.
+    deleted_counts["assessment_messages"] = (
+        await db.execute(
+            delete(AssessmentMessage)
+            .where(AssessmentMessage.assessment_id.in_(
+                select(Assessment.id).where(Assessment.user_id == user_id)
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Path lessons reference learning paths.
+    deleted_counts["path_lessons"] = (
+        await db.execute(
+            delete(PathLesson)
+            .where(PathLesson.path_id.in_(
+                select(LearningPath.id).where(LearningPath.user_id == user_id)
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Messages reference sessions.
+    deleted_counts["messages"] = (
+        await db.execute(
+            delete(Message)
+            .where(Message.session_id.in_(
+                select(Session.id).where(Session.user_id == user_id)
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Sessions reference users and scenarios.
+    deleted_counts["sessions"] = (
+        await db.execute(
+            delete(Session).where(Session.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Learning paths reference users (and assessments with SET NULL).
+    deleted_counts["learning_paths"] = (
+        await db.execute(
+            delete(LearningPath).where(LearningPath.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Assessments reference users.
+    deleted_counts["assessments"] = (
+        await db.execute(
+            delete(Assessment).where(Assessment.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Generated lessons reference users.
+    deleted_counts["generated_lessons"] = (
+        await db.execute(
+            delete(GeneratedLesson).where(GeneratedLesson.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Scenarios reference users.
+    deleted_counts["scenarios"] = (
+        await db.execute(
+            delete(Scenario).where(Scenario.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Progress entries reference users.
+    deleted_counts["progress_daily"] = (
+        await db.execute(
+            delete(ProgressDaily).where(ProgressDaily.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Settings reference users (but NOT provider configs).
+    deleted_counts["settings"] = (
+        await db.execute(
+            delete(Setting).where(Setting.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Tutor profile is a preference like settings — wipe it too so the
+    # "start fresh" reset is complete.
+    deleted_counts["tutor_profiles"] = (
+        await db.execute(
+            delete(TutorProfile).where(TutorProfile.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Reset user level and assessment status so the frontend starts fresh.
+    current_user.current_level = "B1"
+    current_user.assessment_completed = False
+
+    await db.commit()
+
+    logger.info(
+        f"Cleared all data for user {user_id}: "
+        + ", ".join(f"{table}={count}" for table, count in deleted_counts.items())
+    )
+    return {
+        "message": "All user data cleared successfully",
+        "deleted": deleted_counts,
+    }

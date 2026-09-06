@@ -33,6 +33,8 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="B1")
+    assessment_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -41,6 +43,26 @@ class User(Base):
     progress_entries: Mapped[list["ProgressDaily"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     settings: Mapped[list["Setting"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     provider_configs: Mapped[list["ProviderConfig"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    tutor_profile: Mapped["TutorProfile | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
+    assessments: Mapped[list["Assessment"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    generated_lessons: Mapped[list["GeneratedLesson"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class TutorProfile(Base):
+    __tablename__ = "tutor_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, default="Sarah")
+    age: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    personality: Mapped[str] = mapped_column(String(100), nullable=False, default="friendly")
+    voice: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="tutor_profile")
 
 
 class Scenario(Base):
@@ -120,6 +142,97 @@ class VocabItem(Base):
     user: Mapped["User"] = relationship(back_populates="vocab_items")
 
 
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    estimated_level: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strengths: Mapped[str | None] = mapped_column(Text, nullable=True)
+    weaknesses: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recommendations: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="assessments")
+    # (created_at, id) — created_at uses func.now() (the transaction
+    # timestamp), so rows inserted in the same request can share a timestamp
+    # and flip order without the id tiebreaker.
+    messages: Mapped[list["AssessmentMessage"]] = relationship(
+        back_populates="assessment", cascade="all, delete-orphan",
+        order_by="[AssessmentMessage.created_at, AssessmentMessage.id]",
+    )
+    learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="assessment")
+
+
+class AssessmentMessage(Base):
+    __tablename__ = "assessment_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    assessment_id: Mapped[str] = mapped_column(String(36), ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    assessment: Mapped["Assessment"] = relationship(back_populates="messages")
+
+
+class GeneratedLesson(Base):
+    __tablename__ = "generated_lessons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    topic: Mapped[str] = mapped_column(String(100), nullable=True)
+    level: Mapped[str] = mapped_column(String(2), nullable=True)
+    explanation: Mapped[str] = mapped_column(Text, nullable=True)
+    examples: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exercises: Mapped[str | None] = mapped_column(Text, nullable=True)
+    based_on_errors: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="generated_lessons")
+
+
+class LearningPath(Base):
+    __tablename__ = "learning_paths"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    assessment_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("assessments.id", ondelete="SET NULL"), nullable=True)
+    current_level: Mapped[str] = mapped_column(String(2), nullable=False)
+    target_level: Mapped[str] = mapped_column(String(2), nullable=False)
+    lessons_required: Mapped[int] = mapped_column(Integer, nullable=False)
+    lessons_completed: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    user: Mapped["User"] = relationship(back_populates="learning_paths")
+    assessment: Mapped["Assessment | None"] = relationship(back_populates="learning_paths")
+    path_lessons: Mapped[list["PathLesson"]] = relationship(back_populates="learning_path", cascade="all, delete-orphan", order_by="PathLesson.order")
+
+
+class PathLesson(Base):
+    __tablename__ = "path_lessons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    path_id: Mapped[str] = mapped_column(String(36), ForeignKey("learning_paths.id", ondelete="CASCADE"), nullable=False)
+    lesson_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    topic: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    order: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    learning_path: Mapped["LearningPath"] = relationship(back_populates="path_lessons")
+
+
 class ProgressDaily(Base):
     __tablename__ = "progress_daily"
     __table_args__ = (UniqueConstraint("date", "user_id", name="uq_progress_daily_date_user"),)
@@ -131,6 +244,7 @@ class ProgressDaily(Base):
     new_words: Mapped[int] = mapped_column(Integer, default=0)
     reviews_done: Mapped[int] = mapped_column(Integer, default=0)
     streak_count: Mapped[int] = mapped_column(Integer, default=0)
+    lessons_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     user: Mapped["User"] = relationship(back_populates="progress_entries")
 

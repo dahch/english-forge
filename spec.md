@@ -17,13 +17,14 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 - **STT**: Whisper embebido (whisper.cpp/whisper-wasm) o Web Speech API / STT nativo del móvil, configurable.
 - Sin backend de terceros, sin suscripción, sin telemetría — todo corre en tu infraestructura.
 
-No se busca un producto multiusuario ni monetizable: es una herramienta personal, así que se prioriza simplicidad de despliegue (Docker Compose, un solo usuario) sobre escalabilidad.
+**Multi-usuario**: El sistema soporta múltiples usuarios con JWT auth, registro, y login. Cada usuario tiene sus propios ajustes, historial de conversaciones, vocabulario y progreso. El despliegue puede ser single-user o multi-user según necesidad — la arquitectura está diseñada para ambos.
 
 ---
 
 ## 2. Funcionalidades (paridad Praktika + mejoras)
 
 ### 2.1 Núcleo conversacional
+
 - **Chat de voz en tiempo real** con un tutor IA: STT → LLM (persona + motor de corrección) → TTS → reproducción.
 - **Escenarios de roleplay** predefinidos (entrevista de trabajo, pedir comida, hacer check-in en hotel, small talk, reunión de trabajo, llamada telefónica, etc.) y **escenarios personalizados** (el usuario describe la situación y el sistema genera el prompt del personaje).
 - **Modo "free talk"**: conversación abierta sobre cualquier tema, con corrección activa.
@@ -31,6 +32,7 @@ No se busca un producto multiusuario ni monetizable: es una herramienta personal
 - **Personas del tutor**: distintos acentos/personalidades (ES: "profesor estricto", "amigo casual", "coach de negocios"), cada una es solo un system prompt distinto.
 
 ### 2.2 Motor de corrección
+
 - Tras cada turno del usuario, el LLM devuelve (en JSON estructurado, además de la respuesta conversacional):
   - Transcripción "limpia" de lo que dijo.
   - Errores detectados (gramática, uso de palabras, naturalidad) con explicación breve en español.
@@ -40,25 +42,30 @@ No se busca un producto multiusuario ni monetizable: es una herramienta personal
 - **Resumen de sesión**: al terminar una conversación, pantalla con errores agrupados por categoría, puntuación de fluidez estimada y palabras nuevas para añadir al vocabulario.
 
 ### 2.3 Vocabulario y SRS
+
 - Banco de palabras/expresiones personal, alimentado automáticamente desde las conversaciones (o añadido manualmente).
 - Algoritmo de repetición espaciada tipo **SM-2** (igual que Anki) para repasos diarios.
 - Tarjetas con: palabra, definición, pronunciación (IPA + audio TTS), frase de ejemplo, frase generada por el usuario en su última práctica.
 - Modo "quiz" rápido (multiple choice / completar frase / escuchar y escribir).
 
 ### 2.4 Lecciones estructuradas
+
 - Generación de mini-lecciones de gramática/vocabulario bajo demanda por el LLM, basadas en los errores recurrentes del usuario ("veo que confundes present perfect vs past simple, aquí tienes una lección corta + 5 ejercicios").
 - Biblioteca local de lecciones fijas para temas base (tiempos verbales, phrasal verbs, preposiciones, etc.) como fallback sin necesitar LLM.
 
 ### 2.5 Progreso y gamificación
+
 - Dashboard: minutos hablados, palabras nuevas aprendidas, racha de días, nivel CEFR estimado (heurística basada en errores/complejidad de frases), gráfico de evolución.
 - Streaks y XP simple (sin presión monetizable, solo motivación personal).
 - Metas diarias configurables (ej. "10 min de conversación" o "20 tarjetas de repaso").
 
 ### 2.6 Pronunciación
+
 - Comparación fonética aproximada: se usa la confianza/alineamiento de Whisper + comparación de la transcripción esperada vs. obtenida como proxy de pronunciación (no hay modelo dedicado de scoring fonético, se documenta como limitación).
 - Opción de "repetir esta frase" con feedback de similitud.
 
 ### 2.7 Fuera de alcance (explícitamente simplificado)
+
 - Avatar animado / lipsync: **no es prioridad** (según lo indicado). Se deja un placeholder de avatar estático o un simple indicador de "hablando/escuchando", con arquitectura preparada por si luego se quiere añadir (Live2D / Ready Player Me) sin rehacer nada.
 - Multiusuario, pagos, onboarding comercial: no aplica (uso personal).
 
@@ -67,35 +74,36 @@ No se busca un producto multiusuario ni monetizable: es una herramienta personal
 ## 3. Arquitectura técnica
 
 ```
-┌─────────────────────────────┐
+├─────────────────────────────┐
 │   Frontend (Next.js PWA)    │  ← funciona en navegador desktop y móvil (instalable como PWA)
 │  - UI conversación/voz      │
 │  - Dashboard, SRS, lecciones│
 │  - STT: Web Speech API /    │
 │    whisper-wasm en cliente  │
 └──────────────┬──────────────┘
-               │ REST + WebSocket
+               │ REST + WebSocket (JWT)
 ┌──────────────▼──────────────┐
 │   Backend (FastAPI, Python) │
 │  - Orquestación LLM (BYOK)  │
 │  - Motor de corrección      │
 │  - SRS engine               │
 │  - Progreso / analítica     │
+│  - JWT auth, multi-user     │
 │  - Proxy hacia Pocket (TTS) │
 │  - (Opcional) STT server-side│
 │    con faster-whisper       │
 └──────────────┬──────────────┘
                │
-   ┌───────────┼─────────────────┬───────────────┐
-   ▼           ▼                 ▼               ▼
-Postgres/    Pocket TTS      Proveedores LLM   Whisper local
-SQLite       (tu homelab)    (OpenAI, Anthropic, (opcional,
-(progreso,                    DeepSeek, Fireworks, faster-whisper
- vocab, hist.)                 endpoint custom)    en backend)
+    ┌───────────┼─────────────────┬───────────────┐
+    ▼           ▼                 ▼               ▼
+ SQLite/    Pocket TTS      Proveedores LLM   Whisper local
+ SQLite     (tu homelab)    (OpenAI, Anthropic, (opcional,
+   (progreso,                    DeepSeek, Fireworks, faster-whisper
+   vocab, hist.)                 endpoint custom)    en backend)
 ```
 
-- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket.
-- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. El despliegue puede ser single-user o multi-user según necesidad.
+- **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
+- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. Soporta modo single-user o multi-user según necesidad — la arquitectura está preparada para ambos.
 - **PWA**: instalar en el móvil como app (icono, offline shell) sin pasar por app stores.
 
 ---
@@ -133,7 +141,7 @@ providers:
     default_model: ${CUSTOM_MODEL}
 ```
 
-> Nota: no tengo certeza de qué API expone exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
+> Nota: no tengo certeza de qué API expande exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
 
 - Las claves se guardan **solo en el backend**, vía `.env` o pantalla de ajustes cifrada en la base de datos local (nunca se exponen al frontend).
 - Selector en la UI: qué proveedor/modelo usar por defecto para (a) conversación, (b) corrección, (c) generación de lecciones — pueden ser distintos (ej. modelo barato para corrección estructurada, modelo mejor para roleplay).
@@ -176,6 +184,8 @@ TTS_JOB_TIMEOUT_SECONDS=30
 
 ⚠️ **Voces**: para practicar inglés lo lógico es usar voces en inglés, no las voces en español que ya usas para otras cosas. Antes de fijar una voz por defecto, hay que consultar `GET /v1/voices` en Pocket TTS (a través de `personal-api` si expone ese passthrough, o directo si el homelab lo permite) y confirmar el nombre exacto — no asumir que existe una voz concreta.
 
+---
+
 ## 6. STT — combinando lo que ya tienes (Moonshine) con opciones sin infraestructura
 
 Tu stack ya incluye un worker STT (`worker-stt`, cola `stt-jobs`) que llama a Moonshine (`MOONSHINE_URL`, endpoint `POST /transcribe` multipart, devuelve `{"text": "..."}`). Eso da un **cuarto modo** disponible además de los que ya habíamos planteado. Los 4 modos, todos intercambiables desde Settings:
@@ -198,17 +208,60 @@ Recomendación por defecto para una app de **conversación en tiempo real**: **W
 
 ---
 
-## 7. Modelo de datos (simplificado)
+## 7. Modelo de datos
+
+The data model has evolved beyond the initial simplified SQL. The following is the **current full model** (SQLAlchemy ORM definitions in `backend/app/models/models.py`):
 
 ```sql
-sessions(id, scenario_id, started_at, ended_at, cefr_level, provider_used)
+-- users table (extended columns added via startup migration)
+users(id, email, hashed_password, display_name, current_level, assessment_completed, created_at)
+
+-- sessions table
+sessions(id, user_id, scenario_id, started_at, ended_at, cefr_level, provider_used)
+
+-- messages table
 messages(id, session_id, role, text, audio_url, created_at)
+
+-- corrections table
 corrections(id, message_id, error_type, original_fragment, correction, explanation)
-vocab_items(id, word, definition, example, ipa, ease_factor, interval_days, next_review_at, source_message_id)
-scenarios(id, name, system_prompt, cefr_level, is_custom)
-progress_daily(date, minutes_spoken, new_words, reviews_done, streak_count)
-settings(key, value)   -- claves API, proveedor por defecto, voz TTS, modo STT, etc.
+
+-- vocab_items table
+vocab_items(id, word, definition, example, ipa, ease_factor, interval_days, next_review_at, last_reviewed_at, source_message_id, created_at)
+
+-- scenarios table
+scenarios(id, user_id, name, system_prompt, cefr_level, is_custom, created_at)
+
+-- progress_daily table
+progress_daily(date, user_id, minutes_spoken, new_words, reviews_done, streak_count, lessons_completed, PRIMARY KEY (date, user_id))
+
+-- settings table
+settings(id, user_id, key, value, PRIMARY KEY (key, user_id))
+
+-- tutor_profiles table
+tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, updated_at)
+
+-- assessments table
+assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, created_at)
+
+-- assessment_messages table
+assessment_messages(id, assessment_id, role, text, created_at)
+
+-- generated_lessons table
+generated_lessons(id, user_id, title, topic, level, explanation, examples, exercises, based_on_errors, completed, completed_at, created_at)
+
+-- learning_paths table
+learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
+
+-- path_lessons table
+path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at, created_at)
+
+-- provider_configs table
+provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
 ```
+
+> **Nota sobre columnas adicionales**: `current_level` y `assessment_completed` en `users`, y `lessons_completed` en `progress_daily`, son columnas que pueden no estar presentes en bases de datos existentes. El backend incluye un mecanismo de **sincronización al inicio** (`_COLUMNS_TO_ADD` en `backend/app/main.py`) que se ejecuta en cada arranque y añade columnas faltantes con sus valores por defecto mediante `ALTER TABLE`. Esto es seguro porque cada columna solo se añade si está ausente (comprobada por el inspector). Además, se crean índices parciales únicos al inicio (`uq_assessments_user_in_progress` y `uq_learning_paths_user_active`) para garantizar invariantes como "solo un assessment en progreso por usuario" y "solo una learning path activa por usuario".
+
+> **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
 ---
 
@@ -221,6 +274,7 @@ settings(key, value)   -- claves API, proveedor por defecto, voz TTS, modo STT, 
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
+8. **Señal `is_complete`**: tras el último mensaje del usuario, si el LLM incluye `is_complete: true` en la respuesta JSON, el cliente asume que la fase de evaluación terminó y debe llamar a `POST /api/assessment/{id}/complete`. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computes) y se propaga desde la respuesta del LLM.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -247,19 +301,33 @@ settings(key, value)   -- claves API, proveedor por defecto, voz TTS, modo STT, 
 
 ```
 english-forge/
-├── docker-compose.yml
-├── .env.example
-├── frontend/                # Next.js PWA
-│   ├── app/
-│   │   ├── conversation/
-│   │   ├── vocab/
-│   │   ├── lessons/
-│   │   ├── dashboard/
-│   │   └── settings/
-│   ├── lib/stt/             # web-speech.ts, whisper-wasm.ts
-│   ├── lib/audio-player.ts
-│   └── public/whisper-wasm/ # modelo + binario
-├── backend/
+├ docker-compose.yml
+├ .env.example
+├ frontend/                # Next.js PWA
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── (auth)/          # login, register
+│   │   │   └── (main)/
+│   │   │       ├── assessment/
+│   │   │       ├── conversation/
+│   │   │       ├── dashboard/
+│   │   │       ├── lessons/
+│   │   │       ├── learning-path/
+│   │   │       └── settings/
+│   │   ├── components/
+│   │   │   ├── layout/          # sidebar, mobile nav
+│   │   │   ├── conversation/
+│   │   │   ├── dashboard/
+│   │   │   ├── vocab/
+│   │   │   └── ui/              # badge, button, card, progress, skeleton, ...
+│   │   └── lib/
+│   │       ├── api.ts
+│   │       ├── stt/             # web-speech.ts, whisper-wasm.ts
+│   │       ├── types.ts
+│   │       └── utils.ts
+│   ├── public/
+│   └── next-env.d.ts
+├ backend/
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── llm/
@@ -271,9 +339,9 @@ english-forge/
 │   │   │   ├── tts_personal_api.py    # POST /v1/speak + poll /v1/jobs/{id} contra tu personal-api
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
 │   │   │   └── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
-│   │   ├── srs/sm2.py
-│   │   ├── models/                  # SQLAlchemy
-│   │   ├── routers/                 # sessions, vocab, lessons, settings
+│   │   └── models/                  # SQLAlchemy
+│   │       ├── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
+│   │   ├── routers/                 # sessions, vocab, lessons, messages, assessment, ws, settings, tutor_profile, scenarios, dashboard, learning_paths
 │   │   └── prompts/                 # templates de system prompts por persona/escenario
 │   └── requirements.txt
 └── README.md
@@ -283,25 +351,29 @@ english-forge/
 
 ## 10. Plan de fases
 
-**Fase 1 — MVP funcional**
-- Conversación por texto (sin voz aún) con 1 escenario, 1 proveedor LLM, corrección básica.
+**Phase 1 — MVP funcional** ✅
+- Conversación por texto con 1 escenario, 1 proveedor LLM, corrección básica.
 - CRUD de vocabulario manual + SRS.
 
-**Fase 2 — Voz completa**
-- Integrar STT (Web Speech API) y TTS (Pocket).
+**Phase 2 — Voz completa** ✅
+- STT (Web Speech API por defecto, Moonshine vía personal-api como alternativa).
+- TTS (Pocket TTS vía personal-api con colas RQ).
 - Resumen de sesión con corrections/new_vocab automáticos.
 
-**Fase 3 — Multi-proveedor + ajustes**
-- Pantalla de settings BYOK con los 5 proveedores, fallback, selección de modelo por tarea.
-- Modo whisper server-side y whisper-wasm como alternativas de STT.
+**Phase 3 — Multi-proveedor + ajustes** ✅
+- Pantalla de settings BYOK con 5 proveedores configurables (OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass/Custom), fallback, selección de modelo por tarea.
 
-**Fase 4 — Progreso y lecciones**
-- Dashboard, streaks, estimación CEFR.
-- Generación de mini-lecciones basadas en errores recurrentes.
+**Phase 4 — Progreso y lecciones** ✅
+- Dashboard, streaks, estimación CEFR heurística.
+- Generación de mini-lecciones basadas en errores recurrentes (CRUD de lecciones generadas, endpoint `/api/lessons/generate`).
+- Learning paths con progression automática.
+- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005).
 
-**Fase 5 (opcional, futura)**
+**Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).
 - Scoring de pronunciación más fino.
+- Migración a PostgreSQL para persistencia a largo plazo.
+- Aplicación móvil real (Capacitor/Expo) para usar STT nativo.
 
 ---
 

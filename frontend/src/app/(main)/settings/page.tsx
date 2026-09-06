@@ -9,14 +9,40 @@ import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import type { ProviderConfig } from "@/lib/types"
-import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle } from "lucide-react"
+import type { ProviderConfig, TutorProfile } from "@/lib/types"
+import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
+
+const PERSONALITY_PRESETS = [
+  "friendly",
+  "professional",
+  "strict",
+  "humorous",
+  "encouraging",
+  "patient",
+  "witty",
+  "academic",
+  "casual",
+  "motivating",
+]
 
 export default function SettingsPage() {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
+  const [tutorProfile, setTutorProfile] = useState<TutorProfile | null>(null)
+  const [tutorForm, setTutorForm] = useState<Partial<Omit<TutorProfile, "id" | "user_id">>>({
+    name: "",
+    age: null,
+    gender: "",
+    personality: "",
+    voice: "",
+  })
+  const [tutorSaved, setTutorSaved] = useState(false)
+  const [customPersonality, setCustomPersonality] = useState(false)
   const [error, setError] = useState("")
+  const [success, setSuccess] = useState("")
   const [showAddProvider, setShowAddProvider] = useState(false)
+  const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const [newProvider, setNewProvider] = useState({
     provider_name: "",
     api_key: "",
@@ -33,6 +59,19 @@ export default function SettingsPage() {
       const map: Record<string, string> = {}
       data.forEach((s) => { map[s.key] = s.value })
       setSettings(map)
+    }).catch(console.error)
+    api.tutorProfile.get().then((p) => {
+      setTutorProfile(p)
+      setTutorForm({
+        name: p.name || "",
+        age: p.age,
+        gender: p.gender || "",
+        personality: p.personality || "",
+        voice: p.voice || "",
+      })
+      setCustomPersonality(
+        !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
+      )
     }).catch(console.error)
   }, [])
 
@@ -66,6 +105,38 @@ export default function SettingsPage() {
     }
   }
 
+  const saveTutorProfile = async () => {
+    try {
+      const payload = {
+        ...tutorForm,
+        age: tutorForm.age ? Number(tutorForm.age) : null,
+      }
+      const updated = await api.tutorProfile.update(payload)
+      setTutorProfile(updated)
+      setTutorSaved(true)
+      setTimeout(() => setTutorSaved(false), 2000)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to save tutor profile")
+    }
+  }
+
+  const clearData = async () => {
+    setClearing(true)
+    setError("")
+    try {
+      await api.settings.clearData()
+      setSuccess("All data cleared successfully. Refreshing...")
+      setTimeout(() => {
+        window.location.reload()
+      }, 1500)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to clear data")
+    } finally {
+      setClearing(false)
+      setShowClearConfirm(false)
+    }
+  }
+
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
       <h1 className="text-2xl font-bold flex items-center gap-2">
@@ -78,6 +149,13 @@ export default function SettingsPage() {
           <AlertCircle className="h-4 w-4" />
           {error}
           <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setError("")}>Dismiss</Button>
+        </div>
+      )}
+
+      {success && (
+        <div className="flex items-center gap-2 p-3 rounded-md bg-green-600/10 text-green-400 text-sm">
+          <CheckCircle2 className="h-4 w-4" />
+          {success}
         </div>
       )}
 
@@ -94,22 +172,22 @@ export default function SettingsPage() {
             <p className="text-sm text-muted-foreground">No providers configured. Add one to get started.</p>
           )}
           {providers.map((p) => (
-            <div key={p.id} className="flex items-center justify-between p-3 rounded-lg bg-secondary">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
+            <div key={p.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-lg bg-secondary">
+              <div className="space-y-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">{p.provider_name}</span>
                   <Badge variant="secondary">{p.protocol}</Badge>
-                  <Badge>{p.model}</Badge>
+                  <Badge className="max-w-full break-all whitespace-normal">{p.model}</Badge>
                   {p.is_active ? (
                     <Badge className="bg-green-600">Active</Badge>
                   ) : (
                     <Badge variant="outline">Inactive</Badge>
                   )}
                 </div>
-                <p className="text-xs text-muted-foreground">{p.base_url}</p>
+                <p className="text-xs text-muted-foreground break-all">{p.base_url}</p>
                 <p className="text-xs text-muted-foreground">Tasks: {p.task_routing}</p>
               </div>
-              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)}>
+              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)} className="self-end sm:self-center shrink-0">
                 <Trash2 className="h-4 w-4 text-destructive" />
               </Button>
             </div>
@@ -191,6 +269,111 @@ export default function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
+            <UserCircle className="h-5 w-5" />
+            Tutor Profile
+          </CardTitle>
+          <CardDescription>Personalize the tutor that chats, teaches, and assesses you.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label>Name</Label>
+              <Input
+                value={tutorForm.name}
+                onChange={(e) => setTutorForm({ ...tutorForm, name: e.target.value })}
+                placeholder="e.g. Sarah"
+              />
+            </div>
+            <div className="space-y-1">
+              <Label>Age</Label>
+              <Input
+                type="number"
+                value={tutorForm.age ?? ""}
+                onChange={(e) => setTutorForm({ ...tutorForm, age: e.target.value ? Number(e.target.value) : null })}
+                placeholder="30"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label>Gender</Label>
+              <Select value={tutorForm.gender || "unspecified"} onValueChange={(v) => setTutorForm({ ...tutorForm, gender: v === "unspecified" ? "" : v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="unspecified">Unspecified</SelectItem>
+                  <SelectItem value="female">Female</SelectItem>
+                  <SelectItem value="male">Male</SelectItem>
+                  <SelectItem value="non-binary">Non-binary</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>TTS Voice</Label>
+              <Input
+                value={tutorForm.voice || ""}
+                onChange={(e) => setTutorForm({ ...tutorForm, voice: e.target.value })}
+                placeholder="e.g. alba"
+              />
+              <p className="text-xs text-muted-foreground">Voice ID used when the tutor speaks.</p>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label>Personality</Label>
+            {customPersonality ? (
+              <>
+                <Input
+                  value={tutorForm.personality || ""}
+                  onChange={(e) => setTutorForm({ ...tutorForm, personality: e.target.value })}
+                  placeholder="Describe the personality, e.g. friendly and witty..."
+                />
+                <button
+                  type="button"
+                  className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                  onClick={() => {
+                    setCustomPersonality(false)
+                    setTutorForm((f) => ({ ...f, personality: "" }))
+                  }}
+                >
+                  Choose from presets
+                </button>
+              </>
+            ) : (
+              <Select
+                value={tutorForm.personality || undefined}
+                onValueChange={(v) => {
+                  if (v === "__custom__") {
+                    setCustomPersonality(true)
+                    setTutorForm((f) => ({ ...f, personality: "" }))
+                  } else {
+                    setTutorForm((f) => ({ ...f, personality: v }))
+                  }
+                }}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a personality" />
+                </SelectTrigger>
+                <SelectContent>
+                  {PERSONALITY_PRESETS.map((preset) => (
+                    <SelectItem key={preset} value={preset} className="capitalize">
+                      {preset}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="__custom__">Custom...</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
+            <p className="text-xs text-muted-foreground">Pick a preset or write your own to guide the tutor&apos;s tone in conversations, lessons, and assessment.</p>
+          </div>
+          <Button onClick={saveTutorProfile} disabled={tutorSaved}>
+            <Save className="h-4 w-4 mr-1" />
+            {tutorSaved ? "Saved!" : "Save Tutor Profile"}
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             Preferences
           </CardTitle>
@@ -240,6 +423,53 @@ export default function SettingsPage() {
             <Save className="h-4 w-4 mr-1" />
             Save Preferences
           </Button>
+        </CardContent>
+      </Card>
+
+      <Card className="border-destructive/50">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-destructive">
+            <Database className="h-5 w-5" />
+            Clear All Data
+          </CardTitle>
+          <CardDescription>
+            Delete all your learning data (sessions, messages, vocabulary, assessments, lessons, progress).
+            Your account and provider configurations will be preserved.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {showClearConfirm ? (
+            <div className="space-y-3">
+              <p className="text-sm text-destructive font-medium">
+                Are you sure? This action cannot be undone.
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  variant="destructive"
+                  onClick={clearData}
+                  disabled={clearing}
+                >
+                  <Trash2 className="h-4 w-4 mr-1" />
+                  {clearing ? "Clearing..." : "Yes, Clear All Data"}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setShowClearConfirm(false)}
+                  disabled={clearing}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <Button
+              variant="destructive"
+              onClick={() => setShowClearConfirm(true)}
+            >
+              <Trash2 className="h-4 w-4 mr-1" />
+              Clear All Data
+            </Button>
+          )}
         </CardContent>
       </Card>
     </div>

@@ -183,9 +183,14 @@ async def end_session(
         for v in new_vocab_items
     ]
 
+    # started_at comes from the DB as a naive datetime (TIMESTAMP WITHOUT TIME
+    # ZONE) while ended_at was assigned timezone-aware above — normalize both
+    # before subtracting or Python raises TypeError.
     duration = 0.0
     if session.ended_at and session.started_at:
-        duration = (session.ended_at - session.started_at).total_seconds() / 60.0
+        ended = session.ended_at if session.ended_at.tzinfo else session.ended_at.replace(tzinfo=timezone.utc)
+        started = session.started_at if session.started_at.tzinfo else session.started_at.replace(tzinfo=timezone.utc)
+        duration = (ended - started).total_seconds() / 60.0
 
     await db.flush()
 
