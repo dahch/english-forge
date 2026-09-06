@@ -47,6 +47,11 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
 }
 
 
+def _column_exists(sync_conn, table: str, column_name: str) -> bool:
+    inspector = sa.inspect(sync_conn)
+    return column_name in {c["name"] for c in inspector.get_columns(table)}
+
+
 def _ensure_new_columns_sync(sync_conn) -> None:
     inspector = sa.inspect(sync_conn)
     for table, columns in _COLUMNS_TO_ADD.items():
@@ -63,30 +68,74 @@ def _ensure_new_columns_sync(sync_conn) -> None:
                         sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
                     logger.info(f"Added missing column {table}.{column_name}")
                 except sa.exc.ProgrammingError:
-                    logger.info(f"Column {table}.{column_name} already added by a concurrent startup — skipping")
+                    if _column_exists(sync_conn, table, column_name):
+                        logger.info(f"Column {table}.{column_name} already added by a concurrent startup — skipping")
+                    else:
+                        # A real failure (not a startup race) — e.g. a NOT NULL
+                        # column without a default on a non-empty table would
+                        # fail permanently. Surface it instead of pretending the
+                        # migration succeeded.
+                        logger.warning(
+                            f"Failed to add column {table}.{column_name} and it is still missing "
+                            f"after the attempt. DDL: ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"
+                        )
+
+
+def _index_exists(sync_conn, table_name: str, index_name: str) -> bool:
+    if sync_conn.dialect.name == "sqlite":
+        rows = sync_conn.execute(text(f"PRAGMA index_list({table_name!r})")).fetchall()
+        return any(r[1] == index_name for r in rows)
+    rows = sync_conn.execute(
+        text("SELECT 1 FROM pg_indexes WHERE tablename = :t AND indexname = :n"),
+        {"t": table_name, "n": index_name},
+    )
+    return rows.first() is not None
 
 
 # Partial unique indexes enforcing invariants that plain column adds can't
-# express. IF NOT EXISTS makes repeated startups idempotent.
-_INDEXES_TO_ADD: list[str] = [
+# express. IF NOT EXISTS makes repeated startups idempotent. Each entry is
+# (index_name, table_name, create_sql) so failures can be verified, not just
+# blamed on a startup race.
+_INDEXES_TO_ADD: list[tuple[str, str, str]] = [
     # Only one in-progress assessment per user — makes the duplicate-start
     # guard in POST /api/assessment/start atomic (see start_assessment).
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_user_in_progress "
-    "ON assessments (user_id) WHERE completed_at IS NULL",
+    (
+        "uq_assessments_user_in_progress",
+        "assessments",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_user_in_progress "
+        "ON assessments (user_id) WHERE completed_at IS NULL",
+    ),
     # Only one active learning path per user — makes the deactivate+insert in
     # POST /api/learning-paths/generate atomic (see _generate_path_for_user).
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_learning_paths_user_active "
-    "ON learning_paths (user_id) WHERE is_active",
+    (
+        "uq_learning_paths_user_active",
+        "learning_paths",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_learning_paths_user_active "
+        "ON learning_paths (user_id) WHERE is_active",
+    ),
 ]
 
 
 def _ensure_indexes_sync(sync_conn) -> None:
-    for index_sql in _INDEXES_TO_ADD:
+    for index_name, table_name, index_sql in _INDEXES_TO_ADD:
         try:
             with sync_conn.begin_nested():
                 sync_conn.execute(text(index_sql))
+            logger.info(f"Verified index {index_name}")
         except sa.exc.ProgrammingError:
-            logger.info(f"Index already created by a concurrent startup — skipping: {index_sql[:60]}...")
+            if _index_exists(sync_conn, table_name, index_name):
+                logger.info(f"Index {index_name} already created by a concurrent startup — skipping")
+            else:
+                # Creation failed for a real reason (typically pre-existing
+                # duplicate rows). These indexes are load-bearing for the
+                # atomic duplicate-start guards, so log loudly rather than
+                # leaving the invariant silently unprotected.
+                logger.warning(
+                    f"Failed to create index {index_name} and it is not present — "
+                    f"likely pre-existing duplicate rows. The invariant it enforces "
+                    f"(one active path / one in-progress assessment per user) is NOT "
+                    f"protected. SQL: {index_sql}"
+                )
 
 
 def _validate_column_migration_metadata() -> None:
