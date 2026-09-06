@@ -64,6 +64,18 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     "progress_daily": [
         ("lessons_completed", "INTEGER NOT NULL DEFAULT 0"),
     ],
+    # Assessment v2: multi-skill sections (audio listening + pronunciation).
+    # Legacy rows (pre-v2) map to 'conversation' — they were pure chat.
+    "assessments": [
+        ("phase", "VARCHAR(20) NOT NULL DEFAULT 'conversation'"),
+        ("section_step", "INTEGER NOT NULL DEFAULT 0"),
+        ("dimension_scores", "TEXT"),
+    ],
+    "assessment_messages": [
+        ("kind", "VARCHAR(20) NOT NULL DEFAULT 'chat'"),
+        ("audio_url", "VARCHAR(500)"),
+        ("metrics", "TEXT"),
+    ],
 }
 
 

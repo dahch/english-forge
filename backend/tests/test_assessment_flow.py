@@ -1,0 +1,180 @@
+"""Integration test for the multi-phase assessment flow.
+
+Drives the real router handlers against an in-memory SQLite DB, with the
+LLM (conversation, listening grading, analysis) and TTS mocked. Covers:
+- mic check → conversation transition
+- the MIN_ASSESSMENT_EXCHANGES gate (LLM cannot end the interview early)
+- conversation → listening → speaking phase transitions
+- is_complete only after the speaking bank is exhausted
+- deterministic aggregation in _analyze_assessment
+"""
+
+import json
+
+import pytest
+import pytest_asyncio
+from fastapi import Response
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.llm.router import LLMRouter
+from app.models.models import Base, AssessmentMessage, User
+from app.routers.assessment import (
+    MAX_ASSESSMENT_EXCHANGES,
+    MIN_ASSESSMENT_EXCHANGES,
+    AssessmentMessageCreate,
+    AssessmentResponse,
+    assessment_message,
+    complete_assessment,
+    start_assessment,
+)
+
+
+@pytest_asyncio.fixture
+async def db():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def user(db: AsyncSession) -> User:
+    u = User(email="test@example.com", hashed_password="x", display_name="Test")
+    db.add(u)
+    await db.flush()
+    return u
+
+
+def _install_llm(monkeypatch, *, listening_correct: bool = True):
+    """Fake LLMRouter.complete_with_fallback that branches on the prompt."""
+    calls = []
+
+    async def fake_complete(self, messages, system_prompt, task, **kwargs):
+        calls.append(system_prompt)
+        last_user = messages[-1]["content"] if messages else ""
+        if "listening comprehension" in system_prompt:
+            reply = {"correct": listening_correct, "reason": "ok"}
+        elif "OBJECTIVELY MEASURED" in last_user:
+            reply = {"grammar": 60, "vocabulary": 55, "fluency": 50,
+                     "recommendations": ["practice more"], "summary": "Nivel B1."}
+        else:  # conversation
+            reply = {"reply": "And why is that?", "question_count": 2, "is_complete": True}
+        return {"content": json.dumps(reply), "provider": "test", "model": "test"}
+
+    monkeypatch.setattr(LLMRouter, "complete_with_fallback", fake_complete)
+    return calls
+
+
+async def _send(db, user, assessment_id, text, source="text", metrics=None):
+    return await assessment_message(
+        assessment_id, AssessmentMessageCreate(text=text, source=source, metrics=metrics), user, db
+    )
+
+
+async def _assistant_kinds(db, assessment_id):
+    result = await db.execute(
+        select(AssessmentMessage)
+        .where(AssessmentMessage.assessment_id == assessment_id)
+        .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
+    )
+    return [m.kind for m in result.scalars() if m.role == "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_full_flow(db, user, monkeypatch):
+    _install_llm(monkeypatch)
+
+    resp = await start_assessment(Response(), user, db)
+    assert resp.phase == "mic_check"
+    assert resp.messages[-1].kind == "mic_check"
+
+    # Mic check answer → conversation begins with question 1.
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog", source="voice")
+    assert resp.phase == "conversation"
+    assert resp.messages[-1].kind == "chat"
+
+    # The LLM always answers is_complete=True, but the server must ignore it
+    # until MIN_ASSESSMENT_EXCHANGES questions have been asked.
+    for i in range(MIN_ASSESSMENT_EXCHANGES - 1):
+        resp = await _send(db, user, resp.id, f"Answer number {i}")
+        assert resp.phase == "conversation", f"premature phase exit at exchange {i + 1}"
+
+    # Exchange MIN reached — the LLM's is_complete is now honored, and the
+    # flow advances to the listening section instead of ending the assessment.
+    resp = await _send(db, user, resp.id, "Answer that closes the interview")
+    assert resp.phase == "listening"
+    assert resp.is_complete is False
+    assert resp.messages[-1].kind == "listening"
+    kinds = await _assistant_kinds(db, resp.id)
+    assert kinds[-1] == "listening"
+
+    # Answer the whole listening bank correctly → speaking section.
+    from app.services.assessment_bank import LISTENING_ITEMS, SPEAKING_ITEMS
+
+    for i in range(len(LISTENING_ITEMS)):
+        resp = await _send(db, user, resp.id, f"listening answer {i}")
+        if i < len(LISTENING_ITEMS) - 1:
+            assert resp.phase == "listening"
+            assert resp.messages[-1].kind == "listening"
+    assert resp.phase == "speaking"
+    assert resp.messages[-1].kind == "speaking"
+
+    # Pronunciation items carry the expected sentence + focus in the text.
+    assert "Focus:" in resp.messages[-1].text
+
+    # Answer the whole speaking bank with client-computed metrics.
+    for i in range(len(SPEAKING_ITEMS)):
+        resp = await _send(
+            db, user, resp.id, f"spoken sentence {i}", source="voice",
+            metrics={"composite": 70.0 + i},
+        )
+        if i < len(SPEAKING_ITEMS) - 1:
+            assert resp.phase == "speaking"
+            assert resp.is_complete is False
+
+    # Bank exhausted → is_complete signals the client to call /complete.
+    assert resp.is_complete is True
+
+    result = await complete_assessment(resp.id, user, db)
+    # FastAPI would validate through the response model when served over
+    # HTTP; direct handler calls must do the same to see parsed JSON fields.
+    served = AssessmentResponse.model_validate(result)
+    assert result.completed_at is not None
+    assert served.dimension_scores is not None
+    assert served.dimension_scores["listening"] == 100.0
+    assert served.dimension_scores["pronunciation"] == pytest.approx(
+        sum(70.0 + i for i in range(len(SPEAKING_ITEMS))) / len(SPEAKING_ITEMS)
+    )
+    assert served.estimated_level is not None
+    assert 0.05 <= served.confidence <= 0.95
+    # Strengths/weaknesses are labels of measured dimensions only.
+    assert set(served.strengths) <= {"grammar", "vocabulary", "fluency", "listening", "pronunciation"}
+
+
+@pytest.mark.asyncio
+async def test_wants_to_finish_is_respected_before_min(db, user, monkeypatch):
+    """Explicit user intent (end word) still ends the interview early — the
+    min-exchange gate only blocks the LLM's own decision."""
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog")
+    assert resp.phase == "conversation"
+
+    resp = await _send(db, user, resp.id, "stop")
+    assert resp.phase == "listening"
+
+
+@pytest.mark.asyncio
+async def test_max_cap_forces_transition(db, user, monkeypatch):
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog")
+    for _ in range(MAX_ASSESSMENT_EXCHANGES):
+        if resp.phase != "conversation":
+            break
+        resp = await _send(db, user, resp.id, "some answer")
+    assert resp.phase == "listening"

@@ -1,11 +1,28 @@
+"""Multi-skill placement assessment.
+
+Sections (phases), tracked server-side on Assessment.phase:
+  mic_check    — one read-aloud sentence; verifies the mic + STT pipeline.
+  conversation — tutor interview by voice/text (grammar, vocabulary, fluency).
+                 MIN_ASSESSMENT_EXCHANGES gate before it can end.
+  listening    — audio-only comprehension items (pocket-tts playback, hidden
+                 text), graded per item.
+  speaking     — read-aloud sentences scored deterministically (WER/PER/
+                 fluency) via POST /recordings + client-sent metrics.
+
+The LLM never decides the final level or confidence — those come from
+deterministic aggregation (app.services.assessment_scoring). The LLM scores
+the conversation dimensions with a rubric and writes the qualitative summary.
+"""
+
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -14,16 +31,59 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.llm.prompts import ASSESSMENT_ANALYSIS_PROMPT, ASSESSMENT_SYSTEM_PROMPT, build_tutor_persona
+from app.integrations.tts_personal_api import TTSPersonalAPI
+from app.llm.prompts import (
+    ASSESSMENT_ANALYSIS_PROMPT,
+    ASSESSMENT_SYSTEM_PROMPT,
+    LISTENING_GRADING_PROMPT,
+    build_tutor_persona,
+)
 from app.llm.router import LLMRouter, parse_llm_json
 from app.models.models import Assessment, AssessmentMessage, Setting, User
-from app.utils import get_tutor_profile_dict
+from app.services.assessment_bank import (
+    LISTENING_EARLY_STOP_FAILS,
+    LISTENING_ITEMS,
+    SPEAKING_ITEMS,
+    ListeningItem,
+    SpeakingItem,
+)
+from app.services.assessment_scoring import (
+    compute_confidence,
+    final_level,
+    mean_or_none,
+    strengths_weaknesses,
+)
+from app.services.pronunciation import normalize_text, score_pronunciation
+from app.services.stt import transcribe_audio
+from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 
 MAX_ASSESSMENT_EXCHANGES = 10
+MIN_ASSESSMENT_EXCHANGES = 6
+
+# Phases (assessment.phase)
+PHASE_MIC_CHECK = "mic_check"
+PHASE_CONVERSATION = "conversation"
+PHASE_LISTENING = "listening"
+PHASE_SPEAKING = "speaking"
+
+# Message kinds (assessment_messages.kind)
+KIND_CHAT = "chat"
+KIND_MIC_CHECK = "mic_check"
+KIND_LISTENING = "listening"
+KIND_SPEAKING = "speaking"
+
+_MIC_CHECK_TEXT = (
+    "Let's make sure I can hear you clearly. "
+    "Please read this sentence aloud: The quick brown fox jumps over the lazy dog."
+)
+_MIC_CHECK_EXPECTED = "The quick brown fox jumps over the lazy dog."
+
+# Maximum accepted recording upload (30s of opus/webm is well under this).
+_MAX_RECORDING_BYTES = 10 * 1024 * 1024
 
 _CEFR_LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
 
@@ -59,18 +119,45 @@ def _coerce_json_list(value) -> str:
     return json.dumps([str(item) for item in value])
 
 
+def _clamp_score(value, default: float | None = None) -> float | None:
+    """Coerce an LLM-produced dimension score to a clamped float."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(100.0, score))
+
+
 class AssessmentMessageCreate(BaseModel):
     # max_length keeps a single turn from writing unbounded text to the DB.
     text: str = Field(..., min_length=1, max_length=2000)
+    # "voice" when the text came from /recordings (STT), "text" when typed.
+    source: str = Field("text", pattern="^(text|voice)$")
+    # Evidence captured at recording time (pronunciation metrics for speaking
+    # items). Only stored, never trusted for conversation answers.
+    metrics: dict | None = None
 
 
 class AssessmentMessageResponse(BaseModel):
     id: str
     role: str
     text: str
+    kind: str
+    audio_url: str | None
+    metrics: dict | None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("metrics", mode="before")
+    @classmethod
+    def parse_metrics(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
 
 
 class AssessmentResponse(BaseModel):
@@ -83,9 +170,11 @@ class AssessmentResponse(BaseModel):
     weaknesses: list[str] | None
     recommendations: list[str] | None
     summary: str | None
+    phase: str | None
+    dimension_scores: dict | None
     messages: list[AssessmentMessageResponse]
-    # Transient signal: the conversation phase is over and the client should
-    # call /complete. Defaults to False for endpoints that don't compute it.
+    # Transient signal: every section is done and the client should call
+    # /complete. Defaults to False for endpoints that don't compute it.
     is_complete: bool = False
 
     model_config = {"from_attributes": True}
@@ -100,6 +189,16 @@ class AssessmentResponse(BaseModel):
                 return []
         return v
 
+    @field_validator("dimension_scores", mode="before")
+    @classmethod
+    def parse_dimension_scores(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
+
 
 class AssessmentResult(BaseModel):
     estimated_level: str
@@ -110,16 +209,64 @@ class AssessmentResult(BaseModel):
     summary: str
 
 
+class RecordingResponse(BaseModel):
+    transcript: str
+    words: list[dict]
+    # Pronunciation metrics — present when expected_text was supplied.
+    metrics: dict | None = None
+
+
 # Serializable responses touch the `messages` relationship — it must be
 # eagerly loaded, otherwise Pydantic triggers a lazy load outside the
 # greenlet context (MissingGreenlet) during response validation.
+#
+# populate_existing forces the messages collection to re-load even when the
+# Assessment object is already in the identity map: phase transitions add
+# messages earlier in the same request (farewell + next item), and without
+# this the response would silently omit them.
 async def _get_assessment_with_messages(db: AsyncSession, assessment_id: str) -> Assessment:
     result = await db.execute(
         select(Assessment)
         .where(Assessment.id == assessment_id)
         .options(selectinload(Assessment.messages))
+        .execution_options(populate_existing=True)
     )
     return result.scalar_one()
+
+
+def _assistant_message(assessment_id: str, text: str, kind: str) -> AssessmentMessage:
+    return AssessmentMessage(assessment_id=assessment_id, role="assistant", text=text, kind=kind)
+
+
+def _user_message(
+    assessment_id: str, text: str, kind: str, source: str, metrics: dict | None
+) -> AssessmentMessage:
+    msg = AssessmentMessage(
+        assessment_id=assessment_id, role="user", text=text, kind=kind
+    )
+    if source == "voice" or metrics is not None:
+        payload = dict(metrics or {})
+        payload["source"] = source
+        msg.metrics = json.dumps(payload, ensure_ascii=False)
+    return msg
+
+
+def _item_for_step(phase: str, step: int):
+    """Current banked item for a phase/step, or None when the bank is done."""
+    if phase == PHASE_LISTENING:
+        return LISTENING_ITEMS[step] if step < len(LISTENING_ITEMS) else None
+    if phase == PHASE_SPEAKING:
+        return SPEAKING_ITEMS[step] if step < len(SPEAKING_ITEMS) else None
+    return None
+
+
+def _expected_text_for(phase: str, step: int) -> str | None:
+    if phase == PHASE_MIC_CHECK:
+        return _MIC_CHECK_EXPECTED
+    if phase == PHASE_SPEAKING:
+        item = _item_for_step(phase, step)
+        return item.text if item else None
+    return None
 
 
 @router.get("/current", response_model=AssessmentResponse)
@@ -167,7 +314,7 @@ async def start_assessment(
     # startup) makes this insert atomic: a double-click that passes the
     # SELECT above still can't create a second in-progress row — the loser
     # gets rolled back and re-selects the winner's row.
-    assessment = Assessment(user_id=current_user.id)
+    assessment = Assessment(user_id=current_user.id, phase=PHASE_MIC_CHECK)
     try:
         async with db.begin_nested():
             db.add(assessment)
@@ -184,36 +331,192 @@ async def start_assessment(
             response.status_code = 200
             return existing
         raise
-    await db.refresh(assessment)
+    await db.flush()
 
-    tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-    persona = build_tutor_persona(tutor_profile)
-
-    prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nThis is the start of the assessment. Greet the student and ask your first question. Return question_count=1 and is_complete=false."
-
-    llm = LLMRouter(db, current_user.id)
-    try:
-        result = await llm.complete_with_fallback(
-            messages=[],
-            system_prompt=prompt,
-            task="assessment",
-            temperature=0.7,
-            max_tokens=500,
-        )
-        parsed = parse_llm_json(result["content"])
-    except Exception as e:
-        logger.error(f"Assessment start failed: {e}")
-        parsed = {"reply": "Hi! I'm your English tutor. Let's start with a simple question: what do you like to do in your free time?", "question_count": 1, "is_complete": False}
-
-    assistant_msg = AssessmentMessage(
-        assessment_id=assessment.id,
-        role="assistant",
-        text=parsed.get("reply", ""),
-    )
-    db.add(assistant_msg)
+    # The first message is a deterministic mic check — no LLM round-trip. It
+    # validates permissions/volume/STT before the interview starts.
+    db.add(_assistant_message(assessment.id, _MIC_CHECK_TEXT, KIND_MIC_CHECK))
     await db.flush()
 
     return await _get_assessment_with_messages(db, assessment.id)
+
+
+async def _synth_assistant_tts(
+    db: AsyncSession, current_user: User, assessment: Assessment, msg: AssessmentMessage
+) -> bytes | None:
+    """Lazily synthesize TTS for an assistant message, caching the data URI
+    on the row. Returns the raw bytes, or None when TTS is unavailable."""
+    if msg.audio_url and msg.audio_url.startswith("data:"):
+        header, _, payload = msg.audio_url.partition(",")
+        try:
+            return base64.b64decode(payload)
+        except Exception:
+            pass
+    voice = await resolve_tts_voice(db, current_user.id)
+    try:
+        audio = await TTSPersonalAPI().synthesize(msg.text, voice=voice)
+    except Exception as e:
+        logger.error(f"Assessment TTS synthesis failed for message {msg.id}: {e}")
+        return None
+    if audio:
+        msg.audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio).decode()}"
+        await db.flush()
+    return audio
+
+
+@router.get("/{assessment_id}/messages/{message_id}/audio")
+async def get_message_audio(
+    assessment_id: str,
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Assessment).where(
+            Assessment.id == assessment_id, Assessment.user_id == current_user.id
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    msg_result = await db.execute(
+        select(AssessmentMessage).where(
+            AssessmentMessage.id == message_id,
+            AssessmentMessage.assessment_id == assessment_id,
+        )
+    )
+    msg = msg_result.scalar_one_or_none()
+    if not msg or msg.role != "assistant":
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    audio = await _synth_assistant_tts(db, current_user, assessment, msg)
+    if not audio:
+        raise HTTPException(status_code=503, detail="Audio generation is unavailable right now")
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+@router.post("/{assessment_id}/recordings", response_model=RecordingResponse)
+async def upload_recording(
+    assessment_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Transcribe a student recording (Moonshine via personal-api, in-process
+    whisper as fallback) and, when the phase has an expected text, score
+    pronunciation deterministically. Recordings are never persisted."""
+    result = await db.execute(
+        select(Assessment).where(
+            Assessment.id == assessment_id,
+            Assessment.user_id == current_user.id,
+            Assessment.completed_at.is_(None),
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="Empty recording")
+    if len(audio) > _MAX_RECORDING_BYTES:
+        raise HTTPException(status_code=413, detail="Recording too large (max 10MB)")
+
+    content_type = file.content_type or "audio/webm"
+    stt = await transcribe_audio(audio, content_type)
+
+    expected = _expected_text_for(assessment.phase, assessment.section_step)
+    metrics = None
+    if expected and stt["text"].strip():
+        metrics = score_pronunciation(expected, stt["text"], stt["words"])
+    return RecordingResponse(transcript=stt["text"], words=stt["words"], metrics=metrics)
+
+
+async def _grade_listening_answer(
+    db: AsyncSession, current_user: User, item: ListeningItem, answer: str
+) -> dict:
+    """Grade a listening answer with the LLM; deterministic keyword fallback
+    when the LLM is unavailable (grading must never break the message flow)."""
+    prompt = LISTENING_GRADING_PROMPT.format(
+        item_text=item.tutor_text,
+        expected_answer=item.expected_answer,
+        student_answer=answer,
+    )
+    llm = LLMRouter(db, current_user.id)
+    for attempt in range(2):
+        try:
+            result = await llm.complete_with_fallback(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You grade English listening comprehension. Return valid JSON only.",
+                task="assessment",
+                temperature=0.0,
+                max_tokens=200,
+            )
+            parsed = parse_llm_json(result["content"])
+            if isinstance(parsed.get("correct"), bool):
+                return {
+                    "correct": 1 if parsed["correct"] else 0,
+                    "reason": str(parsed.get("reason", ""))[:500],
+                }
+        except Exception as e:
+            logger.error(f"Listening grading attempt {attempt + 1}/2 failed: {e}")
+
+    # Keyword fallback: fraction of the expected answer's content words that
+    # appear in the student's response.
+    stop = {"the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "at", "on", "and"}
+    expected_words = {w for w in normalize_text(item.expected_answer) if w not in stop}
+    answered_words = set(normalize_text(answer))
+    overlap = (len(expected_words & answered_words) / len(expected_words)) if expected_words else 0.0
+    return {
+        "correct": 1 if overlap >= 0.4 else 0,
+        "reason": "Graded by keyword matching (grading model unavailable).",
+    }
+
+
+def _conversation_questions_asked(messages: list[AssessmentMessage]) -> int:
+    return sum(1 for m in messages if m.role == "assistant" and m.kind == KIND_CHAT)
+
+
+async def _build_next_question(
+    db: AsyncSession,
+    current_user: User,
+    assessment: Assessment,
+    messages: list[AssessmentMessage],
+) -> dict | None:
+    """Ask the tutor LLM for the next conversation question.
+
+    Returns the parsed {"reply", "is_complete", ...} dict, or None when every
+    attempt failed (callers then continue with a fixed recovery line)."""
+    messages_for_llm = [{"role": m.role, "content": m.text} for m in messages]
+    questions_asked = _conversation_questions_asked(messages)
+
+    tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
+    persona = build_tutor_persona(tutor_profile)
+    prompt = (
+        f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\n"
+        f"You have asked {questions_asked} questions so far. "
+        f"The maximum is {MAX_ASSESSMENT_EXCHANGES}. "
+        f"Only mark is_complete=true if the student explicitly asked to stop."
+    )
+
+    llm = LLMRouter(db, current_user.id)
+    for attempt in range(3):
+        try:
+            result = await llm.complete_with_fallback(
+                messages=messages_for_llm,
+                system_prompt=prompt,
+                task="assessment",
+                temperature=0.7,
+                max_tokens=500,
+            )
+            parsed = parse_llm_json(result["content"])
+            if parsed.get("reply", "").strip():
+                return parsed
+            logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
+        except Exception as e:
+            logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
+    return None
 
 
 @router.post("/{assessment_id}/message", response_model=AssessmentResponse)
@@ -232,91 +535,227 @@ async def assessment_message(
     if assessment.completed_at:
         raise HTTPException(status_code=400, detail="Assessment already completed")
 
-    user_msg = AssessmentMessage(assessment_id=assessment.id, role="user", text=body.text)
-    db.add(user_msg)
+    phase = assessment.phase or PHASE_CONVERSATION
+    if phase == PHASE_MIC_CHECK:
+        return await _handle_mic_check(db, current_user, assessment, body)
+    if phase == PHASE_CONVERSATION:
+        return await _handle_conversation(db, current_user, assessment, body)
+    if phase == PHASE_LISTENING:
+        return await _handle_listening(db, current_user, assessment, body)
+    if phase == PHASE_SPEAKING:
+        return await _handle_speaking(db, current_user, assessment, body)
+    raise HTTPException(status_code=400, detail=f"Unknown assessment phase: {phase}")
+
+
+async def _handle_mic_check(
+    db: AsyncSession, current_user: User, assessment: Assessment, body: AssessmentMessageCreate
+) -> AssessmentResponse:
+    db.add(_user_message(assessment.id, body.text, KIND_MIC_CHECK, body.source, body.metrics))
+
+    # Move to the interview and ask question 1 (LLM greets + asks).
+    assessment.phase = PHASE_CONVERSATION
     await db.flush()
 
-    # Load previous messages — id as a tiebreaker because created_at uses
-    # func.now() (the transaction timestamp), so the user message and the
-    # assistant reply inserted in the same request can share a timestamp.
-    msg_result = await db.execute(
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    parsed = await _build_next_question(db, current_user, assessment, list(assessment.messages))
+    reply = parsed.get("reply", "") if parsed else (
+        "Great, your microphone works! So, let's start easy: what do you like to do in your free time?"
+    )
+    db.add(_assistant_message(assessment.id, reply, KIND_CHAT))
+    await db.flush()
+
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = False
+    return resp
+
+
+async def _handle_conversation(
+    db: AsyncSession, current_user: User, assessment: Assessment, body: AssessmentMessageCreate
+) -> AssessmentResponse:
+    db.add(_user_message(assessment.id, body.text, KIND_CHAT, body.source, body.metrics))
+    await db.flush()
+
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    messages = list(assessment.messages)
+    questions_asked = _conversation_questions_asked(messages)
+
+    # Server-side completion triggers: the 10-question cap, or the student
+    # explicitly asking to finish. The LLM can only end the section on its own
+    # once MIN_ASSESSMENT_EXCHANGES have happened — a 2-3 answer interview is
+    # not enough evidence to place a level.
+    server_complete = (
+        questions_asked >= MAX_ASSESSMENT_EXCHANGES or _wants_to_finish(body.text)
+    )
+    parsed = None
+    if not server_complete:
+        parsed = await _build_next_question(db, current_user, assessment, messages)
+        if parsed is None:
+            # LLM failed and this isn't a server-forced stop — recover with a
+            # fixed line and keep the conversation alive (the student's next
+            # message retries the LLM). We never transition phases on an LLM
+            # outage: completing sections is evidence-based, not accidental.
+            parsed = {
+                "reply": "Sorry, I lost my train of thought for a second — tell me a bit more about that.",
+                "question_count": questions_asked,
+                "is_complete": False,
+            }
+
+    llm_complete = bool(parsed and parsed.get("is_complete"))
+    if server_complete or (llm_complete and questions_asked >= MIN_ASSESSMENT_EXCHANGES):
+        farewell = parsed.get("reply", "") if parsed and parsed.get("reply", "").strip() else (
+            "Thank you so much for the chat! Now let's try something a little different."
+        )
+        db.add(_assistant_message(assessment.id, farewell, KIND_CHAT))
+
+        # Transition to the audio-only listening section.
+        assessment.phase = PHASE_LISTENING
+        assessment.section_step = 0
+        await db.flush()
+        first_item = LISTENING_ITEMS[0]
+        db.add(_assistant_message(assessment.id, first_item.tutor_text, KIND_LISTENING))
+        await db.flush()
+        assessment = await _get_assessment_with_messages(db, assessment.id)
+        resp = AssessmentResponse.model_validate(assessment)
+        resp.is_complete = False
+        return resp
+
+    reply = parsed.get("reply", "") if parsed else ""
+    db.add(_assistant_message(assessment.id, reply, KIND_CHAT))
+    await db.flush()
+
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = False
+    return resp
+
+
+async def _handle_listening(
+    db: AsyncSession, current_user: User, assessment: Assessment, body: AssessmentMessageCreate
+) -> AssessmentResponse:
+    step = assessment.section_step
+    item = _item_for_step(PHASE_LISTENING, step)
+    if item is None:
+        # Bank exhausted but the phase never advanced (edge case) — advance now.
+        return await _advance_to_speaking(db, current_user, assessment)
+
+    grading = await _grade_listening_answer(db, current_user, item, body.text)
+    db.add(_user_message(assessment.id, body.text, KIND_LISTENING, body.source, {**body.metrics, **grading} if body.metrics else grading))
+
+    # Re-count answered listening items from scratch — the section_step is
+    # derived from message history so retries can't double-advance it.
+    answered = [
+        m for m in await _refresh_messages(db, assessment.id)
+        if m.role == "user" and m.kind == KIND_LISTENING
+    ]
+    consecutive_fails = 0
+    for m in reversed(answered):
+        metrics = json.loads(m.metrics or "{}")
+        if metrics.get("correct") == 1:
+            break
+        consecutive_fails += 1
+
+    if len(answered) >= len(LISTENING_ITEMS) or consecutive_fails >= LISTENING_EARLY_STOP_FAILS:
+        return await _advance_to_speaking(db, current_user, assessment)
+
+    assessment.section_step = len(answered)
+    await db.flush()
+    next_item = LISTENING_ITEMS[assessment.section_step]
+    db.add(_assistant_message(assessment.id, next_item.tutor_text, KIND_LISTENING))
+    await db.flush()
+
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = False
+    return resp
+
+
+async def _advance_to_speaking(
+    db: AsyncSession, current_user: User, assessment: Assessment
+) -> AssessmentResponse:
+    assessment.phase = PHASE_SPEAKING
+    assessment.section_step = 0
+    await db.flush()
+    first_item = SPEAKING_ITEMS[0]
+    db.add(_assistant_message(
+        assessment.id,
+        f"{first_item.text}\n\nFocus: {first_item.focus}",
+        KIND_SPEAKING,
+    ))
+    await db.flush()
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = False
+    return resp
+
+
+async def _handle_speaking(
+    db: AsyncSession, current_user: User, assessment: Assessment, body: AssessmentMessageCreate
+) -> AssessmentResponse:
+    step = assessment.section_step
+    item = _item_for_step(PHASE_SPEAKING, step)
+    if item is None:
+        raise HTTPException(status_code=400, detail="Speaking section already finished")
+
+    # Server re-computes metrics from the transcript when the client didn't
+    # send them (e.g. typed fallback) — WER/PER are deterministic anyway.
+    metrics = body.metrics
+    if not metrics or "composite" not in metrics:
+        metrics = score_pronunciation(item.text, body.text, None)
+    db.add(_user_message(assessment.id, body.text, KIND_SPEAKING, body.source, metrics))
+
+    answered = [
+        m for m in await _refresh_messages(db, assessment.id)
+        if m.role == "user" and m.kind == KIND_SPEAKING
+    ]
+    if len(answered) >= len(SPEAKING_ITEMS):
+        # Every section done — the client should now call /complete.
+        db.add(_assistant_message(
+            assessment.id,
+            "Perfect, that's everything! Let me put your results together.",
+            KIND_CHAT,
+        ))
+        await db.flush()
+        assessment = await _get_assessment_with_messages(db, assessment.id)
+        resp = AssessmentResponse.model_validate(assessment)
+        resp.is_complete = True
+        return resp
+
+    assessment.section_step = len(answered)
+    await db.flush()
+    next_item = SPEAKING_ITEMS[assessment.section_step]
+    db.add(_assistant_message(
+        assessment.id,
+        f"{next_item.text}\n\nFocus: {next_item.focus}",
+        KIND_SPEAKING,
+    ))
+    await db.flush()
+
+    assessment = await _get_assessment_with_messages(db, assessment.id)
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = False
+    return resp
+
+
+async def _refresh_messages(db: AsyncSession, assessment_id: str) -> list[AssessmentMessage]:
+    result = await db.execute(
         select(AssessmentMessage)
         .where(AssessmentMessage.assessment_id == assessment_id)
         .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
     )
-    messages = msg_result.scalars().all()
-
-    messages_for_llm = [{"role": m.role, "content": m.text} for m in messages]
-
-    # Assistant messages map 1:1 to questions asked — the greeting message
-    # embeds question 1 (see ASSESSMENT_SYSTEM_PROMPT rules 1-2), so the
-    # count below is exact and the 10-question cap is enforced server-side.
-    questions_asked = sum(1 for m in messages if m.role == "assistant")
-
-    # Server-side completion triggers: the 10-question cap, or the student
-    # explicitly asking to finish. Both mean there is nothing left to ask, so
-    # short-circuit before the LLM round-trip and go straight to the closing.
-    server_complete = questions_asked >= MAX_ASSESSMENT_EXCHANGES or _wants_to_finish(body.text)
-
-    parsed = None
-    if not server_complete:
-        tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-        persona = build_tutor_persona(tutor_profile)
-
-        prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
-
-        llm = LLMRouter(db, current_user.id)
-        for attempt in range(3):
-            try:
-                result = await llm.complete_with_fallback(
-                    messages=messages_for_llm,
-                    system_prompt=prompt,
-                    task="assessment",
-                    temperature=0.7,
-                    max_tokens=500,
-                )
-                candidate = parse_llm_json(result["content"])
-                if candidate.get("reply", "").strip():
-                    parsed = candidate
-                    break
-                logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
-            except Exception as e:
-                logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
-    else:
-        parsed = {
-            "reply": "Thank you so much for the chat! Let's see your results now.",
-            "question_count": questions_asked,
-            "is_complete": True,
-        }
-
-    if not parsed:
-        # LLM failed and this isn't a server-forced stop — can't continue the
-        # conversation, so fall back to the closing message.
-        parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": questions_asked, "is_complete": True}
-
-    # When the model wraps up on its own it is instructed to close with the
-    # "results now" line — keep its actual farewell instead of overwriting it.
-    # Only server-forced stops (and the fallback above) guarantee that text.
-    is_complete = server_complete or bool(parsed.get("is_complete"))
-
-    assistant_msg = AssessmentMessage(
-        assessment_id=assessment.id,
-        role="assistant",
-        text=parsed.get("reply", ""),
-    )
-    db.add(assistant_msg)
-    await db.flush()
-
-    assessment = await _get_assessment_with_messages(db, assessment.id)
-    response = AssessmentResponse.model_validate(assessment)
-    response.is_complete = is_complete
-    return response
+    return list(result.scalars().all())
 
 
 async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: Assessment) -> None:
-    """Run the LLM analysis over the assessment conversation and persist the
-    results (level, confidence, strengths, weaknesses, recommendations, summary).
-    Shared by POST /{id}/complete and POST /{id}/reanalyze."""
+    """Run the assessment analysis and persist the results (level, confidence,
+    dimension scores, strengths, weaknesses, recommendations, summary).
+
+    Dimension scores for listening/pronunciation are computed deterministically
+    from graded items / pronunciation metrics; the LLM scores the conversation
+    dimensions with a rubric and writes the qualitative fields. The final
+    level and confidence are aggregated deterministically — the LLM is never
+    allowed to invent a level or claim unaudited dimensions.
+    """
     msg_result = await db.execute(
         select(AssessmentMessage)
         .where(AssessmentMessage.assessment_id == assessment.id)
@@ -327,7 +766,38 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
     if len(messages) < 2:
         raise HTTPException(status_code=400, detail="Assessment has too few messages to evaluate")
 
+    # --- Deterministic dimensions from stored evidence ---
+    listening_correct: list[float] = []
+    for m in messages:
+        if m.role == "user" and m.kind == KIND_LISTENING and m.metrics:
+            try:
+                listening_correct.append(100.0 if json.loads(m.metrics).get("correct") == 1 else 0.0)
+            except Exception:
+                pass
+    listening_dim = mean_or_none(listening_correct)
+
+    pron_scores: list[float] = []
+    for m in messages:
+        if m.role == "user" and m.kind == KIND_SPEAKING and m.metrics:
+            try:
+                composite = json.loads(m.metrics).get("composite")
+                score = _clamp_score(composite)
+                if score is not None:
+                    pron_scores.append(score)
+            except Exception:
+                pass
+    pronunciation_dim = mean_or_none(pron_scores)
+
+    # --- LLM: conversation dims + qualitative fields ---
     conversation_text = "\n".join(f"{m.role.upper()}: {m.text}" for m in messages)
+    n_exchanges = _conversation_questions_asked(messages)
+    evidence_block = (
+        "\n\nOBJECTIVELY MEASURED DIMENSIONS (fixed data — do not re-estimate):\n"
+        f"- listening: {listening_dim if listening_dim is not None else 'NOT ASSESSED'}"
+        f" ({len(listening_correct)} items)\n"
+        f"- pronunciation: {pronunciation_dim if pronunciation_dim is not None else 'NOT ASSESSED'}"
+        f" ({len(pron_scores)} recordings)\n"
+    )
 
     llm = LLMRouter(db, current_user.id)
     raw_analysis = ""
@@ -337,7 +807,10 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
     for attempt in range(3):
         try:
             analysis_result = await llm.complete_with_fallback(
-                messages=[{"role": "user", "content": f"{ASSESSMENT_ANALYSIS_PROMPT}\n\nCONVERSATION:\n{conversation_text}"}],
+                messages=[{
+                    "role": "user",
+                    "content": f"{ASSESSMENT_ANALYSIS_PROMPT}{evidence_block}\n\nCONVERSATION:\n{conversation_text}",
+                }],
                 system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
                 task="assessment",
                 temperature=0.3,
@@ -371,30 +844,32 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
     # The parsed shape must actually look like an analysis — the legacy
     # conversational fallback ({"reply": ...}) would otherwise silently save
     # empty result cards (blank summary/strengths/weaknesses).
-    if not (parsed.get("estimated_level") or parsed.get("summary")):
+    if not parsed.get("summary"):
         logger.error(
             f"Assessment analysis for assessment {assessment.id} returned an unexpected shape: "
             f"keys={list(parsed.keys())}, raw={raw_analysis[:500]}"
         )
         raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
 
-    logger.info(
-        f"Assessment analysis parsed for assessment {assessment.id}: "
-        f"keys={list(parsed.keys())}, estimated_level={parsed.get('estimated_level')}, "
-        f"confidence={parsed.get('confidence')}"
-    )
-
-    raw_level = str(parsed.get("estimated_level") or "").strip().upper()
-    if raw_level not in _CEFR_LEVELS:
-        # LLM returned null/garbage — fall back to the user's preferred CEFR
-        # level (from settings) so we don't demote them or crash on the NOT
-        # NULL VARCHAR(2) column.
+    # --- Aggregation (deterministic) ---
+    dimension_scores: dict[str, float | None] = {
+        "grammar": _clamp_score(parsed.get("grammar")),
+        "vocabulary": _clamp_score(parsed.get("vocabulary")),
+        "fluency": _clamp_score(parsed.get("fluency")),
+        "listening": listening_dim,
+        "pronunciation": pronunciation_dim,
+    }
+    level = final_level(dimension_scores)
+    if level is None:
+        # No dimension could be scored (LLM failed the rubric and no audio
+        # evidence) — fall back to the user's preferred CEFR level so we don't
+        # crash on the NOT NULL VARCHAR(2) column.
         cefr_setting = await db.execute(
             select(Setting).where(Setting.user_id == current_user.id, Setting.key == "default_cefr")
         )
         preferred = cefr_setting.scalar_one_or_none()
         preferred_level = (preferred.value or "").strip().upper() if preferred else ""
-        raw_level = (
+        level = (
             preferred_level
             if preferred_level in _CEFR_LEVELS
             else current_user.current_level
@@ -402,20 +877,23 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
             else "A1"
         )
         logger.warning(
-            f"Assessment {assessment.id} returned invalid level '{parsed.get('estimated_level')}', "
-            f"falling back to {raw_level}"
+            f"Assessment {assessment.id} produced no scoreable dimension, "
+            f"falling back to {level}"
         )
-    assessment.estimated_level = raw_level
-    try:
-        confidence = float(parsed.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        confidence = 0.5
-    assessment.confidence = min(1.0, max(0.0, confidence))
-    # Coerce double-encoded strings back to lists — the LLM occasionally
-    # wraps an array in a JSON string, which would otherwise double-encode
-    # and render as [] in the response.
-    assessment.strengths = _coerce_json_list(parsed.get("strengths"))
-    assessment.weaknesses = _coerce_json_list(parsed.get("weaknesses"))
+
+    confidence = compute_confidence(
+        dimension_scores,
+        n_exchanges=n_exchanges,
+        n_listening=len(listening_correct),
+        n_speaking=len(pron_scores),
+    )
+    strengths, weaknesses = strengths_weaknesses(dimension_scores)
+
+    assessment.estimated_level = level
+    assessment.confidence = confidence
+    assessment.dimension_scores = json.dumps(dimension_scores, ensure_ascii=False)
+    assessment.strengths = _coerce_json_list(strengths)
+    assessment.weaknesses = _coerce_json_list(weaknesses)
     assessment.recommendations = _coerce_json_list(parsed.get("recommendations"))
     assessment.summary = parsed.get("summary", "")
 
@@ -428,6 +906,7 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
     logger.info(
         f"Assessment {assessment.id} analysis persisted for user {current_user.id}: "
         f"level={assessment.estimated_level}, confidence={assessment.confidence}, "
+        f"dimension_scores={assessment.dimension_scores}, "
         f"strengths={len(json.loads(assessment.strengths or '[]'))}, "
         f"weaknesses={len(json.loads(assessment.weaknesses or '[]'))}"
     )

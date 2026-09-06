@@ -38,8 +38,19 @@ class STTPersonalAPI(STTProvider):
         self._timeout = settings.TTS_JOB_TIMEOUT_SECONDS
 
     async def transcribe(self, audio_bytes: bytes, content_type: str = "audio/wav") -> str | None:
+        result = await self.transcribe_detailed(audio_bytes, content_type)
+        return result.get("text") or None
+
+    async def transcribe_detailed(self, audio_bytes: bytes, content_type: str = "audio/wav") -> dict:
+        """Transcribe returning {"text", "words"}.
+
+        `words` is the Moonshine word-timestamp list ([{word, start, end}], in
+        seconds) exposed by personal-api after the pronunciation-scoring
+        upgrade. Empty list when the server predates that change — callers
+        must treat it as optional.
+        """
         if not audio_bytes:
-            return None
+            return {"text": "", "words": []}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
@@ -52,7 +63,7 @@ class STTPersonalAPI(STTProvider):
         job_id = data.get("job_id")
         if not job_id:
             logger.error("No job_id returned by /v1/transcribe")
-            return None
+            return {"text": "", "words": []}
 
         elapsed = 0.0
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -70,14 +81,17 @@ class STTPersonalAPI(STTProvider):
                     result = job_data.get("result", {})
                     if "error" in result:
                         logger.error(f"STT job failed: {result['error']}")
-                        return None
-                    return result.get("text", "")
+                        return {"text": "", "words": []}
+                    words = result.get("words") or []
+                    if not isinstance(words, list):
+                        words = []
+                    return {"text": result.get("text", ""), "words": words}
 
                 if status == "failed":
                     result = job_data.get("result", {})
                     error_msg = result.get("error", "Unknown error")
                     logger.error(f"STT job failed: {error_msg}")
-                    return None
+                    return {"text": "", "words": []}
 
         logger.error(f"STT job {job_id} timed out after {self._timeout}s")
-        return None
+        return {"text": "", "words": []}
