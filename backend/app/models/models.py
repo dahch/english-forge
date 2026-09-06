@@ -202,6 +202,12 @@ class AssessmentMessage(Base):
     # answers: {"correct": 0|1, "reason": str}. For speaking answers:
     # {"word_accuracy": f, "phoneme_accuracy": f|null, "fluency": {...}}.
     metrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The banked item this message answers (user listening/speaking answers
+    # only; assistant item prompts leave it NULL). Promoted out of the metrics
+    # JSON so the partial unique index on (assessment_id, item_id) enforces the
+    # one-answer-per-item invariant atomically at the DB (see main.py). Nullable
+    # because chat/mic_check answers have no item.
+    item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # Client-side default with microsecond precision: phase transitions insert
     # a user answer and the next item in the same request, and SQLite's
     # func.now() only has second precision — the (created_at, id) order_by

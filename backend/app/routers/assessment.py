@@ -326,6 +326,15 @@ async def complete_assessment(
         # `messages` outside the greenlet (MissingGreenlet → 500).
         return await reload_assessment(db, assessment.id)
 
+    # Evidence integrity: an assessment that never left the mic check has no
+    # measured evidence at all. Reject /complete so a bare start→complete can't
+    # lock in a default level from an empty analysis.
+    if assessment.phase == PHASE_MIC_CHECK:
+        raise HTTPException(
+            status_code=400,
+            detail="Answer the mic check before finishing the assessment",
+        )
+
     try:
         await analyze_assessment(db, current_user, assessment)
     except ValueError as e:

@@ -199,6 +199,22 @@ async def test_voice_required_in_voice_measured_phases(db, user, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_complete_rejected_during_mic_check(db, user, monkeypatch):
+    """A bare start→complete must not finalize: an assessment that never left
+    the mic check has no measured evidence, so /complete is rejected instead of
+    locking in a default level from an empty analysis."""
+    from fastapi import HTTPException
+
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    assert resp.phase == "mic_check"
+
+    with pytest.raises(HTTPException) as exc:
+        await complete_assessment(resp.id, user, db)
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_duplicate_item_submission_does_not_advance(db, user, monkeypatch):
     """Sending two answers for the same banked item (double-click) must not
     double-advance the section or corrupt the message history."""

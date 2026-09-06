@@ -246,12 +246,38 @@ def composite_score(word_acc: float, phoneme_acc: float | None, fluency: float |
     return round(max(0.0, min(100.0, (weighted / total_w) * 100.0)), 1)
 
 
+def words_align_with(transcript: str, words: list[dict] | None) -> bool:
+    """Whether the word timestamps actually transcribe `transcript`.
+
+    The client echoes the STT `words` back on /message (the server recomputes
+    every metric). Before trusting them for the fluency metrics, the server
+    verifies the words' text aligns with the transcript they claim to cover —
+    a fabricated or stale list is dropped so the composite can't be inflated
+    through client-controlled timestamps alone. In normal use the words come
+    from the same Moonshine result as the transcript, so they always align.
+    """
+    if not words:
+        return False
+    seq: list[str] = []
+    for w in words:
+        if not isinstance(w, dict):
+            return False
+        seq.extend(normalize_text(str(w.get("word", ""))))
+    if not seq:
+        return False
+    acc = word_accuracy(transcript, " ".join(seq))["word_accuracy"]
+    # Same source → should match near-exactly; tolerate minor tokenization /
+    # punctuation differences. Well below a perfect match catches fabrication.
+    return acc >= 0.7
+
+
 def score_pronunciation(expected_text: str, transcript: str, words: list[dict] | None = None) -> dict:
     """Full scoring entry point. Returns a JSON-serializable metrics dict that
     is stored on the speaking answer's AssessmentMessage.metrics."""
     word_acc = word_accuracy(expected_text, transcript)
     phon_acc = phoneme_accuracy(expected_text, transcript)
-    fluency = fluency_score(words or [])
+    trust_words = words if words_align_with(transcript, words) else None
+    fluency = fluency_score(trust_words or [])
     return {
         "word_accuracy": word_acc["word_accuracy"],
         "substitutions": word_acc["substitutions"],
@@ -266,7 +292,7 @@ def score_pronunciation(expected_text: str, transcript: str, words: list[dict] |
         ),
         # Provenance: lets the analysis know which components had evidence.
         "phonemizer_used": _PHONEMIZER_AVAILABLE,
-        "timestamps_used": bool(words),
+        "timestamps_used": bool(trust_words),
     }
 
 
@@ -283,7 +309,8 @@ async def score_pronunciation_async(
     import asyncio
 
     word_acc = word_accuracy(expected_text, transcript)
-    fluency = fluency_score(words or [])
+    trust_words = words if words_align_with(transcript, words) else None
+    fluency = fluency_score(trust_words or [])
 
     phon_acc = None
     if _PHONEMIZER_AVAILABLE:
@@ -305,5 +332,5 @@ async def score_pronunciation_async(
             fluency["score"] if fluency else None,
         ),
         "phonemizer_used": _PHONEMIZER_AVAILABLE,
-        "timestamps_used": bool(words),
+        "timestamps_used": bool(trust_words),
     }

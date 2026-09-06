@@ -23,6 +23,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -126,9 +127,13 @@ def _assistant_message(assessment_id: str, text: str, kind: str, metrics: dict |
 
 
 def _user_message(
-    assessment_id: str, text: str, kind: str, source: str, metrics: dict | None = None
+    assessment_id: str, text: str, kind: str, source: str, metrics: dict | None = None, item_id: str | None = None
 ) -> AssessmentMessage:
     msg = AssessmentMessage(assessment_id=assessment_id, role="user", text=text, kind=kind)
+    # item_id is promoted to a real column (unique-index backed); it also stays
+    # in metrics so the analysis can dedupe evidence without a join.
+    if item_id:
+        msg.item_id = item_id
     payload = dict(metrics or {})
     payload["source"] = source
     msg.metrics = json.dumps(payload, ensure_ascii=False)
@@ -350,15 +355,13 @@ async def _handle_listening(
     item = _item_for_step(PHASE_LISTENING, assessment.section_step)
     if item is None:
         # Bank exhausted but the phase never advanced (edge case) — advance now.
-        return await _advance_to_speaking(db, current_user, assessment)
+        return await _advance_to_speaking(db, assessment)
 
     # The client declares which item it is answering; a stale/duplicate
-    # submission (item no longer current) is dropped silently. NOTE: this
-    # check is not atomic — two concurrent /message calls for the same item
-    # could both pass before either inserts. Low risk in a single-user app
-    # (the real double-tap is sequential and caught here); a truly atomic
-    # guard would need a unique index on (assessment_id, item_id), which
-    # requires promoting item_id out of the metrics JSON column.
+    # submission (item no longer current) is dropped silently. The pre-checks
+    # below are a fast path that avoids grading work; the DB unique index on
+    # (assessment_id, item_id) is the atomic guard — a concurrent duplicate
+    # insert fails with IntegrityError and is dropped too.
     if item_id is not None and item_id != item.id:
         assessment = await reload_assessment(db, assessment.id)
         return assessment, False
@@ -371,15 +374,22 @@ async def _handle_listening(
         return assessment, False
 
     grading = await _grade_listening_answer(db, current_user, item, text)
-    db.add(_user_message(
-        assessment.id, text, KIND_LISTENING, source,
-        metrics={"item_id": item.id, **grading},
-    ))
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(_user_message(
+                assessment.id, text, KIND_LISTENING, source,
+                metrics={"item_id": item.id, **grading}, item_id=item.id,
+            ))
+            await db.flush()
+    except IntegrityError:
+        # A concurrent request already answered this item — the unique index
+        # rejected the insert atomically. Drop it and return current state.
+        assessment = await reload_assessment(db, assessment.id)
+        return assessment, False
 
     answered = answered_before | {item.id}
     if len(answered) >= len(LISTENING_ITEMS):
-        return await _advance_to_speaking(db, current_user, assessment)
+        return await _advance_to_speaking(db, assessment)
 
     # Consecutive fails (from the end of the history backwards) trigger the
     # adaptive early stop. Query fresh — the caller's collection is stale.
@@ -402,7 +412,7 @@ async def _handle_listening(
             break
         consecutive_fails += 1
     if consecutive_fails >= LISTENING_EARLY_STOP_FAILS:
-        return await _advance_to_speaking(db, current_user, assessment)
+        return await _advance_to_speaking(db, assessment)
 
     assessment.section_step = len(answered)
     await db.flush()
@@ -418,7 +428,7 @@ async def _handle_listening(
 
 
 async def _advance_to_speaking(
-    db: AsyncSession, current_user: User, assessment: Assessment
+    db: AsyncSession, assessment: Assessment
 ) -> tuple[Assessment, bool]:
     assessment.phase = PHASE_SPEAKING
     assessment.section_step = 0
@@ -464,11 +474,17 @@ async def _handle_speaking(
     # Evidence integrity: ALWAYS recompute server-side from (item text,
     # transcript, STT word timestamps). The client only echoes the words.
     metrics = await score_pronunciation_async(item.text, text, words or None)
-    db.add(_user_message(
-        assessment.id, text, KIND_SPEAKING, source,
-        metrics={"item_id": item.id, **metrics},
-    ))
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(_user_message(
+                assessment.id, text, KIND_SPEAKING, source,
+                metrics={"item_id": item.id, **metrics}, item_id=item.id,
+            ))
+            await db.flush()
+    except IntegrityError:
+        # Concurrent duplicate answer — the unique index rejected it atomically.
+        assessment = await reload_assessment(db, assessment.id)
+        return assessment, False
 
     answered = answered_before | {item.id}
     if len(answered) >= len(SPEAKING_ITEMS):
