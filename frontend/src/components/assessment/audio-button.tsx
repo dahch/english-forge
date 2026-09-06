@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Loader2, Pause, Volume2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { getToken } from "@/lib/api"
@@ -22,6 +22,14 @@ export function AudioButton({
   const [state, setState] = useState<"idle" | "loading" | "playing">("idle")
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const blobRef = useRef<string | null>(null)
+
+  // Release the object URL on unmount so long assessment sessions don't leak.
+  useEffect(() => {
+    return () => {
+      audioRef.current?.pause()
+      if (blobRef.current) URL.revokeObjectURL(blobRef.current)
+    }
+  }, [])
 
   async function toggle() {
     if (state === "loading") return
@@ -51,7 +59,10 @@ export function AudioButton({
       // Synthesis failed — surface a neutral idle state; the UI shows the
       // item text as fallback in that case.
       setState("idle")
-      blobRef.current = null
+      if (blobRef.current) {
+        URL.revokeObjectURL(blobRef.current)
+        blobRef.current = null
+      }
     }
   }
 

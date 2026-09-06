@@ -23,9 +23,13 @@ export async function startRecording(
     maxSeconds?: number
     onTick?: (elapsedSeconds: number) => void
     onLevel?: (level: number) => void
+    // Fired once when recording ends — manually (stop()) or automatically at
+    // the hard stop — with the captured blob. Lets the page start the
+    // upload/transcribe flow without waiting for another click.
+    onStop?: (blob: Blob) => void
   } = {}
 ): Promise<RecorderHandle> {
-  const { maxSeconds = 30, onTick, onLevel } = options
+  const { maxSeconds = 30, onTick, onLevel, onStop } = options
 
   if (
     typeof window === "undefined" ||
@@ -84,7 +88,10 @@ export async function startRecording(
       cleanup()
       const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" })
       if (blob.size === 0) reject(new RecorderError("no-data", "No audio captured"))
-      else resolve(blob)
+      else {
+        resolve(blob)
+        onStop?.(blob)
+      }
     }
     recorder.onerror = () => {
       cleanup()

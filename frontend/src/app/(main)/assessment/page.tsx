@@ -8,7 +8,6 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Skeleton } from "@/components/ui/skeleton"
 import { AudioButton } from "@/components/assessment/audio-button"
 import { api } from "@/lib/api"
 import { startRecording, type RecorderHandle } from "@/lib/recorder"
@@ -118,8 +117,10 @@ export default function AssessmentPage() {
   const [recordElapsed, setRecordElapsed] = useState(0)
   const [transcribing, setTranscribing] = useState(false)
   const recorderRef = useRef<RecorderHandle | null>(null)
-  // Metrics from the last uploaded recording, attached to the next send.
-  const pendingMetricsRef = useRef<Record<string, unknown> | null>(null)
+  // STT word timestamps from the last recording — echoed to /message so the
+  // server can recompute pronunciation metrics deterministically. Scores are
+  // never accepted from the client.
+  const pendingWordsRef = useRef<{ word: string; start: number; end: number }[] | null>(null)
   const lastSourceRef = useRef<"text" | "voice">("text")
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -161,7 +162,8 @@ export default function AssessmentPage() {
       applyResponse(await api.assessment.start())
       setCompleted(false)
       setInputText("")
-      pendingMetricsRef.current = null
+      pendingWordsRef.current = null
+      lastSourceRef.current = "text"
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start assessment")
     } finally {
@@ -185,15 +187,24 @@ export default function AssessmentPage() {
     if (!assessment || !inputText.trim() || loading) return
     const text = inputText.trim()
     const source = lastSourceRef.current
-    const metrics = pendingMetricsRef.current
+    const words = pendingWordsRef.current
+    // The banked item this answer addresses — the last pending assistant
+    // item message (listening/speaking) carries its item_id in metrics.
+    const pendingItem = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant" && (m.kind === "listening" || m.kind === "speaking"))
+    const itemId =
+      pendingItem && typeof pendingItem.metrics?.item_id === "string"
+        ? pendingItem.metrics.item_id
+        : null
     setInputText("")
-    pendingMetricsRef.current = null
+    pendingWordsRef.current = null
     lastSourceRef.current = "text"
     setLoading(true)
     setError("")
 
     try {
-      const a = applyResponse(await api.assessment.send(assessment.id, text, source, metrics))
+      const a = applyResponse(await api.assessment.send(assessment.id, text, source, words, itemId))
       if (a.is_complete && !a.completed_at) {
         await completeAssessment(a.id)
       }
@@ -205,31 +216,44 @@ export default function AssessmentPage() {
     }
   }
 
+  // Shared by manual stop and the 30s auto-stop: upload → STT → editable
+  // transcript. Words are kept to echo back to /message.
+  const uploadBlob = async (blob: Blob) => {
+    if (!assessment) return
+    setTranscribing(true)
+    setError("")
+    try {
+      const result = await api.assessment.uploadRecording(assessment.id, blob)
+      pendingWordsRef.current = result.words
+      lastSourceRef.current = "voice"
+      setInputText((prev) => (prev.trim() ? prev : result.transcript))
+      if (!result.transcript.trim()) {
+        setError("We couldn't hear anything — check your microphone or type your answer.")
+      }
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error && err.message === "Microphone permission denied"
+          ? "Microphone permission denied. You can type your answer instead."
+          : "Transcription failed — you can type your answer instead."
+      )
+    } finally {
+      setTranscribing(false)
+      setRecordElapsed(0)
+    }
+  }
+
   const toggleRecording = async () => {
     if (isRecording) {
       const handle = recorderRef.current
       recorderRef.current = null
       setIsRecording(false)
       if (!handle || !assessment) return
-      setTranscribing(true)
-      setError("")
       try {
-        const blob = await handle.stop()
-        const result = await api.assessment.uploadRecording(assessment.id, blob)
-        pendingMetricsRef.current = result.metrics
-        lastSourceRef.current = "voice"
-        setInputText((prev) => (prev.trim() ? prev : result.transcript))
-        if (!result.transcript.trim()) {
-          setError("We couldn't hear anything — check your microphone or type your answer.")
-        }
-      } catch (err: unknown) {
-        setError(
-          err instanceof Error && err.message === "Microphone permission denied"
-            ? "Microphone permission denied. You can type your answer instead."
-            : "Transcription failed — you can type your answer instead."
-        )
-      } finally {
-        setTranscribing(false)
+        await uploadBlob(await handle.stop())
+      } catch {
+        // uploadBlob already surfaces the error; recorder errors (no-data)
+        // fall through to a generic message.
+        setError("Recording failed — you can type your answer instead.")
         setRecordElapsed(0)
       }
       return
@@ -240,6 +264,11 @@ export default function AssessmentPage() {
       recorderRef.current = await startRecording({
         maxSeconds: 30,
         onTick: setRecordElapsed,
+        onStop: (blob) => {
+          recorderRef.current = null
+          setIsRecording(false)
+          void uploadBlob(blob)
+        },
       })
       setIsRecording(true)
     } catch (err: unknown) {
@@ -507,11 +536,11 @@ export default function AssessmentPage() {
               value={inputText}
               onChange={(e) => {
                 setInputText(e.target.value)
-                if (lastSourceRef.current === "voice" && pendingMetricsRef.current) {
-                  // The transcript was edited — pronunciation metrics computed
-                  // from the recording no longer match. Drop them; the server
-                  // recomputes WER/PER from the edited text.
-                  pendingMetricsRef.current = null
+                if (lastSourceRef.current === "voice" && pendingWordsRef.current) {
+                  // The transcript was edited — the STT word timestamps no
+                  // longer match. Drop them; the server recomputes WER/PER
+                  // from the edited text (fluency is then unavailable).
+                  pendingWordsRef.current = null
                   lastSourceRef.current = "text"
                 }
               }}

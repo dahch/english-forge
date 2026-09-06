@@ -239,10 +239,13 @@ export const api = {
   assessment: {
     current: () => request<Assessment>("/api/assessment/current"),
     start: () => request<Assessment>("/api/assessment/start", { method: "POST" }),
-    send: (id: string, text: string, source: "text" | "voice" = "text", metrics?: Record<string, unknown> | null) =>
+    // words = STT word timestamps echoed from uploadRecording; item_id = the
+    // banked item this answer addresses. The backend recomputes pronunciation
+    // metrics itself and never trusts client scores.
+    send: (id: string, text: string, source: "text" | "voice" = "text", words?: { word: string; start: number; end: number }[] | null, itemId?: string | null) =>
       request<Assessment>(`/api/assessment/${id}/message`, {
         method: "POST",
-        body: JSON.stringify({ text, source, metrics: metrics ?? null }),
+        body: JSON.stringify({ text, source, words: words ?? null, item_id: itemId ?? null }),
       }),
     // Upload a recording for STT (Moonshine/whisper) and, when the phase has
     // an expected text, pronunciation scoring.

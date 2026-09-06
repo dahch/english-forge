@@ -163,16 +163,15 @@ export interface QuizResult {
 
 // Assessment chat messages. `kind` drives the section UI: "chat" (tutor
 // conversation), "mic_check" (read-aloud calibration), "listening" (audio-only
-// item — text hidden until answered), "speaking" (read-aloud item). Only
-// assistant messages carry audio_url (a fetch-with-auth endpoint, not a data
-// URI — see AudioButton). metrics holds per-answer evidence (listening grade
-// or pronunciation WER/PER/fluency composite).
+// item — text hidden until answered), "speaking" (read-aloud item). Tutor
+// audio plays via a fetch-with-auth endpoint (see AudioButton); the raw data
+// URI is never serialized. metrics holds per-answer evidence (listening grade
+// or pronunciation WER/PER/fluency composite, computed server-side).
 export interface AssessmentMessage {
   id: string
   role: string
   text: string
   kind: string
-  audio_url: string | null
   metrics: Record<string, unknown> | null
   created_at: string
 }
