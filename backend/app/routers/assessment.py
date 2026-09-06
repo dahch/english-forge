@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
@@ -26,6 +26,10 @@ router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 MAX_ASSESSMENT_EXCHANGES = 10
 
 _CEFR_LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
+
+# Reanalyze cost guard: cooldown between LLM analyses of the same assessment.
+_REANALYZE_COOLDOWN = timedelta(seconds=30)
+_reanalyze_last: dict[str, datetime] = {}
 
 # End requests are only honored in short, standalone utterances ("I'm done",
 # "let's finish"). A bare substring match would force-finish the session when
@@ -309,27 +313,13 @@ async def assessment_message(
     return response
 
 
-@router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
-async def complete_assessment(
-    assessment_id: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(
-        select(Assessment).where(Assessment.id == assessment_id, Assessment.user_id == current_user.id)
-    )
-    assessment = result.scalar_one_or_none()
-    if not assessment:
-        raise HTTPException(status_code=404, detail="Assessment not found")
-    if assessment.completed_at:
-        # Idempotent re-complete: return the stored result. Must re-select with
-        # eager loading — serializing the bare ORM object would lazy-load
-        # `messages` outside the greenlet (MissingGreenlet → 500).
-        return await _get_assessment_with_messages(db, assessment.id)
-
+async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: Assessment) -> None:
+    """Run the LLM analysis over the assessment conversation and persist the
+    results (level, confidence, strengths, weaknesses, recommendations, summary).
+    Shared by POST /{id}/complete and POST /{id}/reanalyze."""
     msg_result = await db.execute(
         select(AssessmentMessage)
-        .where(AssessmentMessage.assessment_id == assessment_id)
+        .where(AssessmentMessage.assessment_id == assessment.id)
         .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
     )
     messages = msg_result.scalars().all()
@@ -378,13 +368,22 @@ async def complete_assessment(
         logger.error(f"Assessment analysis JSON parsing failed for assessment {assessment.id}: {e}")
         raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
 
+    # The parsed shape must actually look like an analysis — the legacy
+    # conversational fallback ({"reply": ...}) would otherwise silently save
+    # empty result cards (blank summary/strengths/weaknesses).
+    if not (parsed.get("estimated_level") or parsed.get("summary")):
+        logger.error(
+            f"Assessment analysis for assessment {assessment.id} returned an unexpected shape: "
+            f"keys={list(parsed.keys())}, raw={raw_analysis[:500]}"
+        )
+        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
+
     logger.info(
         f"Assessment analysis parsed for assessment {assessment.id}: "
         f"keys={list(parsed.keys())}, estimated_level={parsed.get('estimated_level')}, "
         f"confidence={parsed.get('confidence')}"
     )
 
-    assessment.completed_at = datetime.now(timezone.utc)
     raw_level = str(parsed.get("estimated_level") or "").strip().upper()
     if raw_level not in _CEFR_LEVELS:
         # LLM returned null/garbage — fall back to the user's preferred CEFR
@@ -427,10 +426,65 @@ async def complete_assessment(
     await db.flush()
 
     logger.info(
-        f"Assessment {assessment.id} completed for user {current_user.id}: "
+        f"Assessment {assessment.id} analysis persisted for user {current_user.id}: "
         f"level={assessment.estimated_level}, confidence={assessment.confidence}, "
         f"strengths={len(json.loads(assessment.strengths or '[]'))}, "
         f"weaknesses={len(json.loads(assessment.weaknesses or '[]'))}"
     )
+
+
+@router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
+async def complete_assessment(
+    assessment_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Assessment).where(Assessment.id == assessment_id, Assessment.user_id == current_user.id)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if assessment.completed_at:
+        # Idempotent re-complete: return the stored result. Must re-select with
+        # eager loading — serializing the bare ORM object would lazy-load
+        # `messages` outside the greenlet (MissingGreenlet → 500).
+        return await _get_assessment_with_messages(db, assessment.id)
+
+    await _analyze_assessment(db, current_user, assessment)
+
+    assessment.completed_at = datetime.now(timezone.utc)
+    await db.flush()
+
+    return await _get_assessment_with_messages(db, assessment.id)
+
+
+@router.post("/{assessment_id}/reanalyze", response_model=AssessmentResponse)
+async def reanalyze_assessment(
+    assessment_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Each reanalyze triggers up to 3 LLM calls — throttle repeat clicks.
+    # Per-process guard (single-worker deployments), not a distributed limit.
+    now = datetime.now(timezone.utc)
+    last = _reanalyze_last.get(assessment_id)
+    if last and (now - last) < _REANALYZE_COOLDOWN:
+        raise HTTPException(status_code=429, detail="Please wait a moment before re-analyzing again")
+    _reanalyze_last[assessment_id] = now
+
+    result = await db.execute(
+        select(Assessment).where(Assessment.id == assessment_id, Assessment.user_id == current_user.id)
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if not assessment.completed_at:
+        raise HTTPException(status_code=400, detail="Assessment is not complete yet")
+
+    # Re-run the LLM analysis over the stored conversation — refreshes the
+    # summary/strengths/weaknesses/recommendations (and estimated level) in
+    # place, e.g. when the original analysis saved empty results.
+    await _analyze_assessment(db, current_user, assessment)
 
     return await _get_assessment_with_messages(db, assessment.id)
