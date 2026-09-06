@@ -341,7 +341,7 @@ async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: 
                 system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
                 task="assessment",
                 temperature=0.3,
-                max_tokens=1200,
+                max_tokens=2048,
             )
         except Exception as e:
             logger.error(f"Assessment analysis LLM call attempt {attempt + 1}/3 failed for assessment {assessment.id}: {e}")

@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     TTS_JOB_POLL_INTERVAL_MS: int = 500
     TTS_JOB_TIMEOUT_SECONDS: int = 30
 
+    # Per-request timeout for LLM providers. Reasoning models can take a while
+    # to "think" before producing output — keep this generous or unset
+    # (None disables the timeout entirely).
+    LLM_TIMEOUT_SECONDS: Optional[int] = 300
+
     STT_MODE: str = "web_speech"
     WHISPER_MODEL: str = "small"
 

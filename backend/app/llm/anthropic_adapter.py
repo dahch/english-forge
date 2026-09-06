@@ -4,6 +4,7 @@ from typing import Any
 
 import anthropic
 
+from app.config import get_settings
 from app.llm.base import ChatProvider
 
 
@@ -11,7 +12,10 @@ class AnthropicProvider(ChatProvider):
     def __init__(self, api_key: str, model: str):
         self._api_key = api_key
         self._model = model
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        self._client = anthropic.AsyncAnthropic(
+            api_key=api_key,
+            timeout=get_settings().LLM_TIMEOUT_SECONDS,
+        )
 
     @property
     def provider_name(self) -> str:

@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+from app.config import get_settings
 from app.llm.base import ChatProvider
 
 
@@ -14,6 +15,7 @@ class OpenAICompatibleProvider(ChatProvider):
         self._api_key = api_key
         self._model = model
         self._label = provider_label
+        self._timeout = get_settings().LLM_TIMEOUT_SECONDS
 
     @property
     def provider_name(self) -> str:
@@ -43,7 +45,7 @@ class OpenAICompatibleProvider(ChatProvider):
         if response_format:
             body["response_format"] = response_format
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/chat/completions",
                 headers={
@@ -55,7 +57,8 @@ class OpenAICompatibleProvider(ChatProvider):
             resp.raise_for_status()
             data = resp.json()
 
-        content = data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"].get("content")
+
         return {
             "content": content,
             "usage": data.get("usage", {}),

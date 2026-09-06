@@ -84,6 +84,14 @@ class LLMRouter:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                if not result.get("content"):
+                    # 200 with empty content (reasoning models can burn the
+                    # token budget on thinking, or return text only in
+                    # reasoning_content). Fail loudly so the next provider is
+                    # tried instead of persisting blank output.
+                    raise ValueError(
+                        f"Provider {provider.provider_name} returned empty content"
+                    )
                 result["provider"] = provider.provider_name
                 result["model"] = provider.model_name
                 return result
