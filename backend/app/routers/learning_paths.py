@@ -15,8 +15,9 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.llm.prompts import LEARNING_PATH_GENERATION_PROMPT, LEVEL_LESSONS_REQUIRED, NEXT_LEVEL
-from app.llm.router import LLMRouter, parse_llm_json
+from app.llm.router import LLMRouter, parse_llm_json, parse_lesson_json
 from app.models.models import Assessment, LearningPath, PathLesson, Setting, User
+from app.routers.lessons import normalize_llm_lesson
 from app.utils import bump_daily_lessons
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,59 @@ class CompleteLessonRequest(BaseModel):
     completed: bool = True
 
 
+class PathLessonDetailResponse(BaseModel):
+    """A single path lesson with its (generated) interactive content.
+
+    `content` is the parsed JSON column: focus/lesson_type metadata plus, once
+    generated, explanation/examples/exercises. Answers are stripped before
+    serialization — grading happens via the exercise endpoint.
+    """
+
+    id: str
+    path_id: str
+    lesson_type: str
+    topic: str
+    description: str
+    content: dict[str, Any] | None
+    order: int
+    completed: bool
+    completed_at: datetime | None
+
+
+class PathExerciseSubmission(BaseModel):
+    exercise_index: int
+    answer: str
+
+
+def _lesson_content_dict(lesson: PathLesson) -> dict[str, Any]:
+    """Parse the content JSON column into a dict (corrupt rows degrade to {})."""
+    try:
+        parsed = json.loads(lesson.content or "{}")
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _lesson_detail_response(lesson: PathLesson, content: dict[str, Any]) -> PathLessonDetailResponse:
+    stripped = {k: v for k, v in content.items() if k != "exercises"}
+    stripped["exercises"] = [
+        {k: v for k, v in ex.items() if k != "answer"}
+        for ex in (content.get("exercises") or [])
+        if isinstance(ex, dict)
+    ]
+    return PathLessonDetailResponse(
+        id=lesson.id,
+        path_id=lesson.path_id,
+        lesson_type=lesson.lesson_type,
+        topic=lesson.topic,
+        description=lesson.description,
+        content=stripped,
+        order=lesson.order,
+        completed=lesson.completed,
+        completed_at=lesson.completed_at,
+    )
+
+
 async def _deactivate_current_paths(db: AsyncSession, user_id: str) -> None:
     result = await db.execute(select(LearningPath).where(LearningPath.user_id == user_id, LearningPath.is_active == True))
     for path in result.scalars().all():
@@ -90,11 +144,15 @@ async def _deactivate_current_paths(db: AsyncSession, user_id: str) -> None:
 # Serializable responses touch the `path_lessons` relationship — it must be
 # eagerly loaded, otherwise Pydantic triggers a lazy load outside the
 # greenlet context (MissingGreenlet) during response validation.
+# populate_existing is equally required: callers that just ran core UPDATEs
+# expire the identity-mapped path/lesson rows, and expired attribute access
+# during response validation would lazy-load synchronously (MissingGreenlet).
 async def _get_path_with_lessons(db: AsyncSession, path_id: str) -> LearningPath:
     result = await db.execute(
         select(LearningPath)
         .where(LearningPath.id == path_id)
         .options(selectinload(LearningPath.path_lessons))
+        .execution_options(populate_existing=True)
     )
     return result.scalar_one()
 
@@ -374,12 +432,161 @@ async def complete_lesson(
 
     await db.flush()
 
-    # Core updates bypass the ORM identity map — expire so the re-select
-    # below returns fresh counters and lesson states.
-    db.expire(path)
-    db.expire(lesson)
+    # Core UPDATEs bypass the ORM identity map, but the reload below runs with
+    # populate_existing, refreshing the identity-mapped rows in async context.
+    # Never db.expire() here: expired attribute access (even path.id) lazy-loads
+    # synchronously outside the greenlet → MissingGreenlet (production 500).
 
     return await _get_path_with_lessons(db, path.id)
+
+
+@router.post("/{path_id}/lessons/{lesson_id}/generate", response_model=PathLessonDetailResponse)
+async def generate_path_lesson(
+    path_id: str,
+    lesson_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate (lazily, idempotently) the interactive content for a path lesson.
+
+    The content is tailored to the lesson's type/topic, the path's level span
+    and — when the path was built from an assessment — the learner's measured
+    weaknesses. Re-calling this on a lesson that already has exercises returns
+    the stored content unchanged."""
+    path_result = await db.execute(
+        select(LearningPath).where(LearningPath.id == path_id, LearningPath.user_id == current_user.id)
+    )
+    path = path_result.scalar_one_or_none()
+    if not path:
+        raise HTTPException(status_code=404, detail="Learning path not found")
+
+    lesson_result = await db.execute(
+        select(PathLesson).where(PathLesson.id == lesson_id, PathLesson.path_id == path_id)
+    )
+    lesson = lesson_result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    content = _lesson_content_dict(lesson)
+    if content.get("exercises"):
+        return _lesson_detail_response(lesson, content)
+
+    assessment_info = ""
+    if path.assessment_id:
+        a_result = await db.execute(
+            select(Assessment).where(
+                Assessment.id == path.assessment_id, Assessment.user_id == current_user.id
+            )
+        )
+        assessment = a_result.scalar_one_or_none()
+        if assessment:
+            strengths = json.loads(assessment.strengths) if assessment.strengths else []
+            weaknesses = json.loads(assessment.weaknesses) if assessment.weaknesses else []
+            assessment_info = (
+                "\nLearner assessment context (personalize toward the weaknesses):\n"
+                f"Estimated level: {assessment.estimated_level or path.current_level}\n"
+                f"Weaknesses: {', '.join(weaknesses) or 'N/A'}\n"
+                f"Strengths: {', '.join(strengths) or 'N/A'}\n"
+                f"Summary: {assessment.summary or 'N/A'}\n"
+            )
+
+    prompt = (
+        f"Create a short interactive English lesson as JSON for a learner going from "
+        f"{path.current_level} to {path.target_level}.\n"
+        f"Lesson type: {lesson.lesson_type}\n"
+        f"Topic: {lesson.topic}\n"
+        f"Description: {lesson.description}\n"
+        f"{assessment_info}\n"
+        f"Return JSON with this EXACT structure (do not omit any field):\n"
+        f'{{"title": "Lesson title", "explanation": "A clear 2-4 sentence explanation", '
+        f'"examples": ["Example 1", "Example 2", "Example 3"], '
+        f'"exercises": [{{"question": "Fill in the blank: ...", "type": "fill_blank", "answer": "correct answer", "options": ["option1", "option2", "option3"]}}]}}\n'
+        f"Include 3-5 exercises mixing fill_blank and multiple_choice (multiple_choice exercises "
+        f"need 3-4 options and the answer must be one of them). "
+        f"Adapt difficulty to {path.current_level}. Respond with ONLY valid JSON."
+    )
+
+    lesson_data: dict | None = None
+    for attempt in range(3):
+        try:
+            llm = LLMRouter(db, current_user.id)
+            result = await llm.complete_with_fallback(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt=(
+                    "You are an expert English teacher. Create focused, practical lessons "
+                    "with exercises. Respond in valid JSON only. Never return empty arrays."
+                ),
+                task="lesson",
+                temperature=0.5,
+                max_tokens=1500,
+            )
+            lesson_data = parse_lesson_json(result["content"])
+            if lesson_data.get("explanation") or lesson_data.get("exercises"):
+                break
+            logger.warning(
+                f"Path lesson generation attempt {attempt + 1}/3 returned empty content (lesson {lesson.id})"
+            )
+            lesson_data = None
+        except Exception as e:
+            logger.error(f"Path lesson generation attempt {attempt + 1}/3 failed (lesson {lesson.id}): {e}")
+            lesson_data = None
+
+    if not lesson_data:
+        raise HTTPException(status_code=503, detail="Failed to generate the lesson content. Please try again.")
+
+    normalized = normalize_llm_lesson(lesson_data)
+    if not normalized["exercises"]:
+        raise HTTPException(status_code=503, detail="The generated lesson had no usable exercises. Try again.")
+
+    content.update({
+        "explanation": normalized["explanation"],
+        "examples": normalized["examples"],
+        "exercises": normalized["exercises"],
+    })
+    lesson.content = json.dumps(content, ensure_ascii=False)
+    await db.flush()
+
+    logger.info(f"Generated content for path lesson {lesson.id} ({lesson.lesson_type}: {lesson.topic})")
+    return _lesson_detail_response(lesson, content)
+
+
+@router.post("/{path_id}/lessons/{lesson_id}/exercise")
+async def check_path_lesson_exercise(
+    path_id: str,
+    lesson_id: str,
+    body: PathExerciseSubmission,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Grade one exercise of a path lesson. Answers never leave the server —
+    they live only in the stored content JSON."""
+    path_result = await db.execute(
+        select(LearningPath).where(LearningPath.id == path_id, LearningPath.user_id == current_user.id)
+    )
+    if not path_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Learning path not found")
+
+    lesson_result = await db.execute(
+        select(PathLesson).where(PathLesson.id == lesson_id, PathLesson.path_id == path_id)
+    )
+    lesson = lesson_result.scalar_one_or_none()
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    exercises = _lesson_content_dict(lesson).get("exercises") or []
+    if not isinstance(exercises, list) or not 0 <= body.exercise_index < len(exercises):
+        raise HTTPException(status_code=400, detail="Invalid exercise index")
+    exercise = exercises[body.exercise_index]
+    if not isinstance(exercise, dict):
+        raise HTTPException(status_code=400, detail="Invalid exercise index")
+
+    correct_answer = str(exercise.get("answer", ""))
+    is_correct = body.answer.strip().lower() == correct_answer.strip().lower()
+    return {
+        "correct": is_correct,
+        "correct_answer": correct_answer,
+        "explanation": str(exercise.get("explanation", "")),
+    }
 
 
 @router.post("/{path_id}/advance", response_model=FullLearningPathResponse)
@@ -415,7 +622,9 @@ async def advance_level(
     current_user.current_level = path.target_level
 
     await db.flush()
-    db.expire(path)
+    # No db.expire(path) here — expired attribute access lazy-loads
+    # synchronously outside the greenlet (MissingGreenlet). The stale object
+    # is never read again; _generate_path_for_user returns a fresh path.
 
     # Generate the next path automatically — same shared service as
     # POST /generate, without assessment context (the old path is done).

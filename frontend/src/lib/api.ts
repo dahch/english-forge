@@ -6,6 +6,7 @@ import type {
   GeneratedLesson,
   LearningPath,
   Message,
+  PathLessonDetail,
   ProviderConfig,
   QuizQuestion,
   QuizResult,
@@ -221,7 +222,9 @@ export const api = {
         body: JSON.stringify({ quality }),
       }),
     due: (limit: number = 20) => request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
-    generateQuiz: (count: number = 5) => request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
+    // Backend route is POST (GET would 405) with count as a query param.
+    generateQuiz: (count: number = 5) =>
+      request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`, { method: "POST" }),
     checkQuiz: (vocab_item_id: string, answer: string) =>
       request<QuizResult>("/api/vocab/quiz/check", {
         method: "POST",
@@ -284,6 +287,17 @@ export const api = {
       request<LearningPath>("/api/learning-paths/generate", {
         method: "POST",
         body: JSON.stringify(assessmentId ? { assessment_id: assessmentId } : {}),
+      }),
+    // Lazy, idempotent: returns the lesson with its interactive content,
+    // generating explanation/examples/exercises on first open.
+    lessonDetail: (pathId: string, lessonId: string) =>
+      request<PathLessonDetail>(`/api/learning-paths/${pathId}/lessons/${lessonId}/generate`, {
+        method: "POST",
+      }),
+    checkLessonExercise: (pathId: string, lessonId: string, exerciseIndex: number, answer: string) =>
+      request<ExerciseCheckResult>(`/api/learning-paths/${pathId}/lessons/${lessonId}/exercise`, {
+        method: "POST",
+        body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
       }),
     completeLesson: (pathId: string, lessonId: string, completed: boolean = true) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, {

@@ -230,11 +230,28 @@ export interface PathLesson {
   topic: string
   description: string
   // Backend JSON-parses the stored content column, so it arrives as an object.
-  content: { focus: string; lesson_type: string } | null
+  content: PathLessonContent | null
   order: number
   completed: boolean
   completed_at: string | null
 }
+
+// Interactive content of a path lesson. Metadata (focus/lesson_type) is stored
+// at path-generation time; explanation/examples/exercises are generated lazily
+// on first open (POST .../generate, idempotent). Answers never reach the
+// client — grading happens server-side.
+export interface PathLessonContent {
+  focus?: string
+  lesson_type?: string
+  explanation?: string
+  examples?: string[]
+  exercises?: { question: string; type: string; options?: string[]; explanation?: string }[]
+}
+
+// Shape of POST /learning-paths/{path_id}/lessons/{lesson_id}/generate.
+// Structurally identical to PathLesson — a PathLesson can be used as the
+// loading stub while the detail request is in flight.
+export type PathLessonDetail = PathLesson
 
 export type CEFRLevel = "A1" | "A2" | "B1" | "B2" | "C1" | "C2"
 
