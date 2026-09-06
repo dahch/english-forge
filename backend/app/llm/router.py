@@ -107,7 +107,9 @@ def parse_llm_json(content: str) -> dict[str, Any]:
     cleaned = _strip_code_fences(content).strip()
 
     try:
-        return json.loads(cleaned)
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
     except json.JSONDecodeError:
         pass
 
