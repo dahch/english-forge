@@ -1,0 +1,45 @@
+{
+  "title": "Articles: A, An, The",
+  "topic": "grammar",
+  "level": "A2",
+  "explanation": "Articles are determiners that come before nouns. 'A/An' (indefinite) = one of many, first mention, non-specific. Use 'a' before consonant sounds, 'an' before vowel sounds. 'The' (definite) = specific, already mentioned, unique things, superlatives. No article = general plurals, abstract concepts, proper nouns.",
+  "examples": [
+    "I saw a dog in the park. (first mention, any dog)",
+    "The dog was brown. (now we know which dog)",
+    "She is an engineer. (profession, vowel sound)",
+    "The sun rises in the east. (unique thing)",
+    "I love music. (abstract concept, no article)"
+  ],
+  "exercises": [
+    {
+      "question": "I need ___ umbrella. It's raining.",
+      "type": "fill_blank",
+      "answer": "an",
+      "explanation": "'Umbrella' starts with a vowel sound → 'an'."
+    },
+    {
+      "question": "___ moon is very bright tonight.",
+      "type": "fill_blank",
+      "answer": "The",
+      "explanation": "Unique things (there's only one moon) → 'the'."
+    },
+    {
+      "question": "She wants to be ___ doctor.",
+      "type": "fill_blank",
+      "answer": "a",
+      "explanation": "Profession, first mention → 'a'."
+    },
+    {
+      "question": "I love ___ chocolate. (in general)",
+      "type": "fill_blank",
+      "answer": "",
+      "explanation": "General/abstract concept → no article."
+    },
+    {
+      "question": "Can you pass me ___ salt? (the salt on the table)",
+      "type": "fill_blank",
+      "answer": "the",
+      "explanation": "Specific, both know which salt → 'the'."
+    }
+  ]
+}
