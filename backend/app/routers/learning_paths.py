@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
@@ -29,7 +30,11 @@ class PathLessonResponse(BaseModel):
     lesson_type: str
     topic: str
     description: str
-    content: str | None
+    # Stored as a JSON string in the DB; the before-validator parses it into an
+    # object, so the annotation must be dict — str would fail response
+    # validation AFTER the path was persisted (500 with a saved-but-unreadable
+    # path, the "Internal Server Error" seen in production).
+    content: dict[str, Any] | None
     order: int
     completed: bool
     completed_at: datetime | None
@@ -41,9 +46,13 @@ class PathLessonResponse(BaseModel):
     def parse_json_content(cls, v):
         if isinstance(v, str):
             try:
-                return json.loads(v)
+                parsed = json.loads(v)
             except Exception:
-                return v
+                # Corrupt row must not 500 the whole path response.
+                return None
+            # Valid JSON but not an object (double-encoded list/number)
+            # would fail the dict annotation — degrade like corrupt content.
+            return parsed if isinstance(parsed, dict) else None
         return v
 
 
@@ -145,10 +154,12 @@ async def _generate_path_for_user(
     )
 
     llm = LLMRouter(db, current_user.id)
-    raw_content = ""
-    result = None
-    # Retry up to 3 times when the model returns empty content — smaller/flash
-    # models occasionally produce blank responses for structured prompts.
+    lessons_data: list[dict] = []
+    parsed: dict = {}
+    # Retry up to 3 times — smaller/flash models occasionally return blank or
+    # truncated/malformed JSON for long structured prompts. A response is only
+    # accepted once it parses into at least one usable lesson object, so a
+    # malformed attempt is retried instead of failing the whole request.
     for attempt in range(3):
         try:
             result = await llm.complete_with_fallback(
@@ -156,7 +167,9 @@ async def _generate_path_for_user(
                 system_prompt="You are an expert English curriculum designer. Return valid JSON only.",
                 task="lesson",
                 temperature=0.5,
-                max_tokens=4000,
+                # 20+ lessons with descriptions are token-heavy; 4000 truncated
+                # mid-lesson in production, leaving unparseable JSON.
+                max_tokens=8000,
             )
         except Exception as e:
             logger.error(f"Learning path LLM call attempt {attempt + 1}/3 failed for user {current_user.id}: {e}")
@@ -172,32 +185,60 @@ async def _generate_path_for_user(
             f"(provider={provider_used}, model={model_used}, attempt={attempt + 1}/3, length={len(raw_content)}): "
             f"{raw_content[:2000]}"
         )
-        if raw_content.strip():
+
+        if not raw_content.strip():
+            logger.warning(f"Learning path LLM returned empty content (attempt {attempt + 1}/3)")
+            continue
+
+        try:
+            parsed = parse_llm_json(raw_content)
+        except Exception as e:
+            logger.error(f"Learning path JSON parsing failed for user {current_user.id} (attempt {attempt + 1}/3): {e}")
+            continue
+
+        # Tolerate a bare lessons array — the model occasionally returns "[...]"
+        # instead of {"lessons": [...]}.
+        if isinstance(parsed, list):
+            parsed = {"lessons": parsed}
+        if not isinstance(parsed, dict):
+            logger.error(
+                f"Learning path parsed into unusable shape for user {current_user.id} "
+                f"(attempt {attempt + 1}/3): {type(parsed).__name__}"
+            )
+            continue
+
+        lessons_data = parsed.get("lessons") or parsed.get("items") or []
+        # The LLM sometimes double-encodes the array as a JSON string.
+        if isinstance(lessons_data, str):
+            try:
+                lessons_data = json.loads(lessons_data)
+            except Exception:
+                lessons_data = []
+        if isinstance(lessons_data, dict):
+            lessons_data = [lessons_data]
+        # Drop non-object entries — a stray string/number in the array would
+        # otherwise crash lesson persistence with an AttributeError (500).
+        lessons_data = [lesson for lesson in (lessons_data or []) if isinstance(lesson, dict)]
+        if lessons_data:
             break
-        logger.warning(f"Learning path LLM returned empty content (attempt {attempt + 1}/3)")
 
-    if not raw_content.strip():
-        raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
-
-    try:
-        parsed = parse_llm_json(raw_content)
-    except Exception as e:
-        logger.error(f"Learning path JSON parsing failed for user {current_user.id}: {e}")
-        raise HTTPException(status_code=503, detail="Failed to parse the generated learning path. Please try again.")
+        logger.warning(
+            f"Learning path response had no usable lessons (attempt {attempt + 1}/3): "
+            f"keys={list(parsed.keys())}, raw_tail=...{raw_content[-300:]}"
+        )
 
     logger.info(
         f"Learning path parsed result for user {current_user.id}: "
-        f"keys={list(parsed.keys())}, path_title={parsed.get('path_title')}, "
-        f"lessons_count={len(parsed.get('lessons', []))}"
+        f"keys={list(parsed.keys()) if parsed else []}, path_title={parsed.get('path_title')}, "
+        f"lessons_count={len(lessons_data)}"
     )
 
-    lessons_data = parsed.get("lessons", [])
     if not lessons_data:
         logger.error(
-            f"Generated learning path has no lessons for user {current_user.id}. "
-            f"Parsed keys: {list(parsed.keys())}"
+            f"Generated learning path has no usable lessons for user {current_user.id} after 3 attempts. "
+            f"Last parsed keys: {list(parsed.keys()) if parsed else []}"
         )
-        raise HTTPException(status_code=500, detail="Generated learning path has no lessons")
+        raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
 
     # Keep counters and stored lessons consistent in both directions:
     # fewer returned than requested → shrink lessons_required so the path can
