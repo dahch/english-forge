@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from sqlalchemy import select, delete
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 from app.models.models import (
     Assessment,
@@ -51,10 +51,10 @@ from app.models.models import (
 
 
 async def clear_user_data(email: str, dry_run: bool = False):
-    from app.database import DATABASE_URL
+    from app.config import get_settings
 
-    engine = create_async_engine(DATABASE_URL)
-    async_session = async_sessionmaker(engine, class_=type(engine))
+    engine = create_async_engine(get_settings().DATABASE_URL)
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as db:
         # Find the user
