@@ -171,14 +171,11 @@ async def test_complete_lesson_response_validates_after_core_updates(db, user, p
     map) and then re-serializes the path. Without populate_existing on the
     reload, response validation touches expired attributes and raises
     MissingGreenlet."""
-    from datetime import datetime, timezone
-
     from app.routers.learning_paths import CompleteLessonRequest
 
     path, lesson = path_with_lesson
     result = await complete_lesson(
-        path.id, lesson.id, CompleteLessonRequest(completed=True),
-        datetime.now(timezone.utc) and user, db,
+        path.id, lesson.id, CompleteLessonRequest(completed=True), user, db,
     )
     served = FullLearningPathResponse.model_validate(result)
     assert served.lessons_completed == 1
