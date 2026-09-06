@@ -7,7 +7,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 ## Features
 
 - **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2)
-- **CEFR Assessment** — Conversational placement test (up to 10 questions) that estimates your level, strengths, and weaknesses
+- **CEFR Assessment** — Multi-skill placement: voice interview (min 6 exchanges), audio-only listening items, and read-aloud pronunciation scoring (WER + phoneme error rate + fluency), with per-dimension scores (A1–C2)
 - **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets and automatic progression
 - **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
 - **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
@@ -104,7 +104,7 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
-**Note:** The conversation and assessment pages always use Web Speech API in the browser. The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet.
+**Note:** The conversation page uses Web Speech API in the browser. The assessment page records with MediaRecorder and transcribes server-side (Moonshine via personal-api, faster-whisper in-process fallback). The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet.
 
 ## Architecture
 
@@ -157,7 +157,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
