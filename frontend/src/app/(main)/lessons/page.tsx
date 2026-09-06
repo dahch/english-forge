@@ -148,7 +148,7 @@ export default function LessonsPage() {
 
         <div className="space-y-4">
           <h2 className="text-xl font-semibold">Exercises</h2>
-          {activeLesson.exercises ? (
+          {activeLesson.exercises && activeLesson.exercises.length > 0 ? (
             activeLesson.exercises.map((ex, i) => {
               const result = exerciseResults[i]
               return (

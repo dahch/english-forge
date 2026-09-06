@@ -9,13 +9,16 @@ import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api } from "@/lib/api"
-import type { Assessment, Message } from "@/lib/types"
+import type { Assessment, AssessmentMessage } from "@/lib/types"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
 import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2 } from "lucide-react"
 
+// Must match MAX_ASSESSMENT_EXCHANGES in backend/app/routers/assessment.py.
+const MAX_ASSESSMENT_QUESTIONS = 10
+
 export default function AssessmentPage() {
   const [assessment, setAssessment] = useState<Assessment | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
+  const [messages, setMessages] = useState<AssessmentMessage[]>([])
   const [inputText, setInputText] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
@@ -208,7 +211,7 @@ export default function AssessmentPage() {
           <Sparkles className="h-12 w-12 text-primary mx-auto" />
           <h1 className="text-2xl font-bold">Initial Assessment</h1>
           <p className="text-muted-foreground">
-            Have a 10-minute conversation with your tutor. We'll analyze your English level (A1-C2) and build a personalized learning path.
+            Have a 10-minute conversation with your tutor. We&apos;ll analyze your English level (A1-C2) and build a personalized learning path.
           </p>
           <Button onClick={start} size="lg" disabled={loading}>
             {loading ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Mic className="h-4 w-4 mr-1" />}
@@ -230,7 +233,7 @@ export default function AssessmentPage() {
       <div className="flex items-center justify-between p-4 border-b">
         <div className="flex items-center gap-2">
           <h1 className="font-semibold">Assessment</h1>
-          <Badge variant="secondary">{Math.min(assistantCount, 10)} / 10</Badge>
+          <Badge variant="secondary">{Math.min(assistantCount, MAX_ASSESSMENT_QUESTIONS)} / {MAX_ASSESSMENT_QUESTIONS}</Badge>
         </div>
         <Button variant="outline" size="sm" onClick={() => completeAssessment(assessment.id)} disabled={loading}>
           Finish & See Results

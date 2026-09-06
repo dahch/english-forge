@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api } from "@/lib/api"
+import { api, ApiError } from "@/lib/api"
 import type { LearningPath, PathLesson } from "@/lib/types"
 import { MapPin, CheckCircle2, Lock, Sparkles, AlertCircle, Loader2, Trophy } from "lucide-react"
 
@@ -26,17 +26,14 @@ export default function LearningPathPage() {
   const [advancing, setAdvancing] = useState(false)
   const [completing, setCompleting] = useState<string | null>(null)
 
-  useEffect(() => {
-    loadPath()
-  }, [])
-
   const loadPath = async () => {
     setLoading(true)
     try {
       const p = await api.learningPath.current()
       setPath(p)
     } catch (err: unknown) {
-      if (err instanceof Error && err.message.includes("No active learning path")) {
+      // 404 = no active path yet — an expected empty state, not an error.
+      if (err instanceof ApiError && err.status === 404) {
         setPath(null)
       } else {
         setError(err instanceof Error ? err.message : "Failed to load learning path")
@@ -58,6 +55,10 @@ export default function LearningPathPage() {
       setLoading(false)
     }
   }
+
+  useEffect(() => {
+    loadPath()
+  }, [])
 
   const completeLesson = async (lesson: PathLesson) => {
     if (!path || lesson.completed) return
