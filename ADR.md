@@ -94,3 +94,12 @@
 - **Consequences**:
   - Pros: Greatly reduced false positives from normal conversation; still catches intentional early-finish requests.
   - Cons: Slightly more restrictive; users with very short "basta" or "done" utterances are correctly handled; edge case of "basta" in longer sentences may need future refinement.
+
+## ADR-010: Tolerant LLM JSON Parsing with Retry
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: LLMs routinely return JSON wrapped in markdown fences, preceded/followed by prose, with smart quotes or trailing commas, double-encoded strings, or a non-dict top-level shape. Every LLM-backed feature (conversation corrections, assessment messages, assessment analysis, lesson generation, learning path generation) previously assumed well-formed JSON and would crash or persist broken data.
+- **Decision**: Centralized parsing in `parse_llm_json()` (`backend/app/llm/router.py`) with a layered fallback: strip code fences (`_strip_code_fences`) → try `json.loads` → repair smart quotes/trailing commas (`_repair_json`) → extract balanced `{...}` blocks respecting string literals (`_extract_balanced_objects`) → regex extraction of the conversational `reply`/`corrections`/`new_vocab` shape. `parse_llm_json` always returns a dict — a top-level JSON array is wrapped as `{"items": [...]}`. A strict variant, `parse_lesson_json()`, raises `ValueError` when no lesson-shaped object is found so lesson generation fails loudly instead of persisting an empty lesson. On top of parsing, the multi-step flows (assessment message, assessment analysis, learning path generation, lesson generation) retry the entire LLM call up to 3 times, logging the raw response between attempts, and surface HTTP 503 only after all attempts fail. Learning path generation additionally validates the parsed shape (lessons list, allowed `lesson_type` values) per attempt and retries on unusable output.
+- **Consequences**:
+  - Pros: Resilient to real-world LLM output across providers; no silent persistence of broken JSON; failures observable via raw-response logs; single parsing entry point keeps behavior consistent.
+  - Cons: The conversational regex fallback can mask genuinely malformed responses (they degrade to plain text); retries add latency and cost on persistent failures; callers must choose correctly between the tolerant (`parse_llm_json`) and strict (`parse_lesson_json`) entry points.
