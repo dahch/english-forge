@@ -78,9 +78,9 @@ class LLMRouter:
         last_error: Exception | None = None
         for provider in self._providers:
             # Reasoning models can burn the whole token budget on thinking and
-            # return HTTP 200 with empty content and finish_reason="length".
-            # One retry with a bigger budget usually recovers the real answer
-            # before the next provider is tried.
+            # return HTTP 200 with empty content (usually finish_reason=
+            # "length"). One retry with a bigger budget usually recovers the
+            # real answer before the next provider is tried.
             budget = max_tokens
             for attempt in range(2):
                 try:
@@ -100,16 +100,17 @@ class LLMRouter:
                     result["model"] = provider.model_name
                     return result
 
-                if result.get("finish_reason") == "length" and attempt == 0:
+                if attempt == 0:
                     budget = max(budget * 4, 4096)
                     logger.warning(
                         f"Provider {provider.provider_name} returned empty content "
-                        f"(token budget exhausted while thinking) — retrying with max_tokens={budget}"
+                        f"(finish_reason={result.get('finish_reason')}) — "
+                        f"retrying with max_tokens={budget}"
                     )
                     continue
 
-                # 200 with empty content and no room to grow — fail loudly so
-                # the next provider is tried instead of persisting blank output.
+                # Still empty after the budget bump — fail loudly so the next
+                # provider is tried instead of persisting blank output.
                 last_error = ValueError(
                     f"Provider {provider.provider_name} returned empty content "
                     f"(finish_reason={result.get('finish_reason')})"

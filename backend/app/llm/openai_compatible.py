@@ -17,11 +17,12 @@ def _extract_content(data: dict, provider_label: str) -> tuple[str | None, str |
 
     Reasoning models (e.g. DeepSeek served on Fireworks) return the thinking
     process in `message.reasoning_content` and the final answer in
-    `message.content` — but when the token budget is consumed by thinking,
-    `content` comes back null/empty with finish_reason="length". Some of those
-    models emit the answer inside reasoning_content, so it is used as a
-    fallback before declaring the response empty. The raw shape is logged
-    either way so failures are diagnosable.
+    `message.content`. When the token budget is consumed by thinking, content
+    comes back null/empty with finish_reason="length" — the caller retries
+    with a bigger budget. `reasoning_content` is deliberately NOT used as a
+    content fallback: it is the model's raw chain-of-thought, and leaking it
+    as a chat reply is worse than retrying (or failing over) with more room.
+    The raw shape is logged either way so failures are diagnosable.
     """
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -30,20 +31,12 @@ def _extract_content(data: dict, provider_label: str) -> tuple[str | None, str |
     usage = data.get("usage", {})
 
     if not content:
-        reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip():
-            logger.warning(
-                f"Provider {provider_label} returned empty content but has reasoning_content "
-                f"(finish_reason={finish_reason}, completion_tokens={usage.get('completion_tokens')}) "
-                f"— falling back to reasoning_content"
-            )
-            content = reasoning
-        else:
-            logger.warning(
-                f"Provider {provider_label} returned empty content "
-                f"(finish_reason={finish_reason}, message_keys={sorted(message.keys())}, "
-                f"usage={usage})"
-            )
+        logger.warning(
+            f"Provider {provider_label} returned empty content "
+            f"(finish_reason={finish_reason}, message_keys={sorted(message.keys())}, "
+            f"reasoning_present={bool(message.get('reasoning_content'))}, "
+            f"usage={usage})"
+        )
     return content, finish_reason
 
 

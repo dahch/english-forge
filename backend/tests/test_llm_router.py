@@ -147,9 +147,10 @@ class TestExtractContent:
         assert content == "hi"
         assert finish == "stop"
 
-    def test_reasoning_content_fallback(self):
-        # Reasoning models (DeepSeek on Fireworks) can burn the token budget on
-        # thinking and return the answer only in reasoning_content.
+    def test_reasoning_content_never_used_as_content(self):
+        # Reasoning models return their chain-of-thought in reasoning_content
+        # when the budget ran out. It must NOT leak as content — the router
+        # retries with a bigger budget instead.
         data = {
             "choices": [{
                 "message": {"role": "assistant", "content": None, "reasoning_content": '{"correct": true}'},
@@ -158,7 +159,7 @@ class TestExtractContent:
             "usage": {"completion_tokens": 200},
         }
         content, finish = _extract_content(data, "test-provider")
-        assert content == '{"correct": true}'
+        assert content is None
         assert finish == "length"
 
     def test_empty_content_stays_empty(self):
@@ -222,8 +223,13 @@ class TestCompleteWithFallback:
         assert provider.calls == [200, 4096]
 
     @pytest.mark.asyncio
-    async def test_empty_content_without_length_moves_to_next_provider(self):
-        failing = _ScriptedProvider([{"content": None, "finish_reason": "stop", "usage": {}}], name="failing")
+    async def test_empty_content_without_length_retries_then_moves_on(self):
+        # Any empty content (not just finish_reason="length") gets one retry
+        # with a bigger budget before the router gives up on the provider.
+        failing = _ScriptedProvider([
+            {"content": None, "finish_reason": "stop", "usage": {}},
+            {"content": None, "finish_reason": "stop", "usage": {}},
+        ], name="failing")
         ok = _ScriptedProvider([{"content": "fine", "finish_reason": "stop", "usage": {}}], name="ok")
         router = LLMRouter(None, "user")
         router._providers = [failing, ok]
@@ -231,7 +237,7 @@ class TestCompleteWithFallback:
         result = await router.complete_with_fallback(messages=[], system_prompt="s")
         assert result["content"] == "fine"
         assert result["provider"] == "ok"
-        assert failing.calls == [2048]  # no retry without finish_reason=length
+        assert failing.calls == [2048, 8192]
 
     @pytest.mark.asyncio
     async def test_retry_exhausted_moves_to_next_provider(self):
