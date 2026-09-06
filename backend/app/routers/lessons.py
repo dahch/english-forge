@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.llm.router import parse_llm_json
+from app.llm.router import parse_lesson_json
 from app.models.models import Correction, GeneratedLesson, Message, Session, User
 from app.utils import bump_daily_lessons
 
@@ -173,8 +174,6 @@ async def complete_generated_lesson(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import datetime, timezone
-
     result = await db.execute(
         select(GeneratedLesson)
         .where(GeneratedLesson.id == lesson_id, GeneratedLesson.user_id == current_user.id)
@@ -239,7 +238,7 @@ async def generate_lesson(
         f"Return JSON with this structure:\n"
         f'{{"title": "...", "topic": "...", "explanation": "...", "examples": ["...", "..."], '
         f'"exercises": [{{"question": "...", "type": "fill_blank|multiple_choice", "answer": "...", "options": ["..."]}}]}}\n'
-        f"Include 3-5 exercises. Respond with ONLY valid JSON."
+        f"Include 3-5 exercises. Respond with ONLY valid JSON — no markdown code fences, no text before or after it."
     )
 
     try:
@@ -254,8 +253,8 @@ async def generate_lesson(
         raise HTTPException(status_code=503, detail=f"Failed to generate lesson: {e}")
 
     try:
-        lesson_data = parse_llm_json(result["content"])
-    except Exception as e:
+        lesson_data = parse_lesson_json(result["content"])
+    except ValueError as e:
         raise HTTPException(status_code=503, detail=f"LLM returned malformed lesson JSON: {e}")
 
     lesson_data["generated"] = True
@@ -278,7 +277,30 @@ async def generate_lesson(
     examples = _as_list(lesson_data.get("examples", []))
     examples = [str(ex) for ex in examples]
     exercises = _as_list(lesson_data.get("exercises", []))
-    exercises = [ex for ex in exercises if isinstance(ex, dict)]
+    # Exercises may arrive as JSON-encoded strings or dicts missing keys —
+    # coerce what's usable and drop the rest so we never persist junk.
+    normalized_exercises: list[dict] = []
+    for ex in exercises:
+        if isinstance(ex, str):
+            try:
+                ex = json.loads(ex)
+            except Exception:
+                continue
+        if not isinstance(ex, dict):
+            continue
+        question = str(ex.get("question", "")).strip()
+        if not question:
+            continue
+        ex["question"] = question
+        ex["answer"] = str(ex.get("answer", ""))
+        normalized_exercises.append(ex)
+    exercises = normalized_exercises
+
+    if not exercises:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM returned a lesson without valid exercises. Try again.",
+        )
 
     # Persist the generated lesson so it survives navigation/reloads
     stored = GeneratedLesson(
@@ -297,9 +319,19 @@ async def generate_lesson(
 
     # Same contract as the list endpoint — answers never leave the server
     # (ADR-003/005); grading happens via the exercise check endpoint.
-    lesson_data["id"] = stored.id
-    lesson_data["created_at"] = stored.created_at.isoformat() if stored.created_at else None
-    lesson_data["examples"] = examples
-    lesson_data["exercises"] = [{k: v for k, v in ex.items() if k != "answer"} for ex in exercises]
-
-    return lesson_data
+    # Identical shape matters: the frontend discriminates generated lessons
+    # by the presence of `completed`, so a fresh lesson must carry it too.
+    return {
+        "id": stored.id,
+        "title": stored.title,
+        "topic": stored.topic,
+        "level": stored.level,
+        "explanation": stored.explanation,
+        "examples": examples,
+        "exercises": [{k: v for k, v in ex.items() if k != "answer"} for ex in exercises],
+        "based_on_errors": stored.based_on_errors,
+        "completed": stored.completed,
+        "completed_at": None,
+        "created_at": stored.created_at.isoformat() if stored.created_at else None,
+        "generated": True,
+    }

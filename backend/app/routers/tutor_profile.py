@@ -52,6 +52,8 @@ async def get_profile(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Creates the row on first access so the Settings page always has a
+    # profile to render; PATCH keeps working without a bootstrap step.
     profile = await _get_or_create_profile(db, current_user)
     return profile
 
@@ -66,11 +68,12 @@ async def update_profile(
 
     # model_fields_set distinguishes "field absent" from "field explicitly
     # sent as null", so the Settings page can clear age/gender/voice.
-    # name/personality are NOT NULL columns — ignore explicit nulls for them.
+    # name/personality are NOT NULL columns — ignore explicit nulls AND empty
+    # strings for them (the frontend can send "" from an untouched input).
     nullable_fields = {"age", "gender", "voice"}
     for field in body.model_fields_set:
         value = getattr(body, field)
-        if value is None and field not in nullable_fields:
+        if not value and field not in nullable_fields:
             continue
         setattr(profile, field, value)
 

@@ -30,7 +30,7 @@ from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.srs.sm2 import next_review_date
-from app.utils import get_tutor_profile_dict
+from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
 
@@ -157,7 +157,8 @@ async def send_message(
     audio_url = None
     try:
         tts = TTSPersonalAPI()
-        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=None)
+        voice = await resolve_tts_voice(db, current_user.id)
+        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
@@ -188,7 +189,9 @@ async def send_message(
             text=assistant_msg.text,
             audio_url=assistant_msg.audio_url,
             created_at=assistant_msg.created_at,
-            corrections=[],
+            # Corrections attach to the user message; duplicated here only so
+            # legacy clients reading assistant_message.corrections keep working.
+            corrections=correction_responses,
         ),
         corrections=correction_responses,
         new_vocab=new_vocab_list,
