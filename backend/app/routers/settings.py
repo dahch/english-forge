@@ -23,6 +23,7 @@ from app.models.models import (
     Scenario,
     Session,
     Setting,
+    TutorProfile,
     User,
     VocabItem,
 )
@@ -337,6 +338,14 @@ async def clear_user_data(
     deleted_counts["settings"] = (
         await db.execute(
             delete(Setting).where(Setting.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Tutor profile is a preference like settings — wipe it too so the
+    # "start fresh" reset is complete.
+    deleted_counts["tutor_profiles"] = (
+        await db.execute(
+            delete(TutorProfile).where(TutorProfile.user_id == user_id).execution_options(synchronize_session=False)
         )
     ).rowcount
 

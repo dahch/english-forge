@@ -16,7 +16,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.llm.prompts import ASSESSMENT_ANALYSIS_PROMPT, ASSESSMENT_SYSTEM_PROMPT, build_tutor_persona
 from app.llm.router import LLMRouter, parse_llm_json
-from app.models.models import Assessment, AssessmentMessage, User
+from app.models.models import Assessment, AssessmentMessage, Setting, User
 from app.utils import get_tutor_profile_dict
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,23 @@ _END_WORDS_RE = re.compile(r"\b(finish|end|stop|terminar|basta|done)\b", re.IGNO
 def _wants_to_finish(text: str) -> bool:
     stripped = text.strip().strip(".!?,;:¡¿")
     return len(stripped.split()) <= 4 and bool(_END_WORDS_RE.search(stripped))
+
+
+def _coerce_json_list(value) -> str:
+    """Serialize a value as a JSON list, unwrapping double-encoded strings.
+
+    The LLM sometimes returns a JSON-encoded string where a list is expected;
+    storing that raw string would double-encode on the second json.dumps and
+    render as [] in the response. Returns '[]' for anything unusable.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = []
+    if not isinstance(value, list):
+        value = [value] if value else []
+    return json.dumps([str(item) for item in value])
 
 
 class AssessmentMessageCreate(BaseModel):
@@ -106,16 +123,18 @@ async def get_current_assessment(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Prefer an in-progress assessment; if none exists, return the most recent
+    # completed one so the client can display results / allow a new attempt.
     result = await db.execute(
         select(Assessment)
-        .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
-        .order_by(Assessment.started_at.desc())
+        .where(Assessment.user_id == current_user.id)
+        .order_by(Assessment.completed_at.is_(None).desc(), Assessment.started_at.desc())
         .options(selectinload(Assessment.messages))
         .limit(1)
     )
     assessment = result.scalar_one_or_none()
     if not assessment:
-        raise HTTPException(status_code=404, detail="No in-progress assessment")
+        raise HTTPException(status_code=404, detail="No assessment found")
     return assessment
 
 
@@ -321,25 +340,37 @@ async def complete_assessment(
     conversation_text = "\n".join(f"{m.role.upper()}: {m.text}" for m in messages)
 
     llm = LLMRouter(db, current_user.id)
-    try:
-        analysis_result = await llm.complete_with_fallback(
-            messages=[{"role": "user", "content": f"{ASSESSMENT_ANALYSIS_PROMPT}\n\nCONVERSATION:\n{conversation_text}"}],
-            system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
-            task="assessment",
-            temperature=0.3,
-            max_tokens=1200,
-        )
-    except Exception as e:
-        logger.error(f"Assessment analysis LLM call failed for assessment {assessment.id}: {e}")
-        # Generic detail — raw exception text can leak provider URLs/keys.
-        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
+    raw_analysis = ""
+    analysis_result = None
+    # Retry up to 3 times when the model returns empty content — smaller/flash
+    # models occasionally produce blank responses for structured prompts.
+    for attempt in range(3):
+        try:
+            analysis_result = await llm.complete_with_fallback(
+                messages=[{"role": "user", "content": f"{ASSESSMENT_ANALYSIS_PROMPT}\n\nCONVERSATION:\n{conversation_text}"}],
+                system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
+                task="assessment",
+                temperature=0.3,
+                max_tokens=1200,
+            )
+        except Exception as e:
+            logger.error(f"Assessment analysis LLM call attempt {attempt + 1}/3 failed for assessment {assessment.id}: {e}")
+            if attempt < 2:
+                continue
+            raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
 
-    raw_analysis = analysis_result.get("content", "")
-    logger.info(
-        f"Assessment analysis raw response for assessment {assessment.id} "
-        f"(provider={analysis_result.get('provider', 'unknown')}, model={analysis_result.get('model', 'unknown')}, "
-        f"length={len(raw_analysis)}): {raw_analysis[:1500]}"
-    )
+        raw_analysis = analysis_result.get("content", "")
+        logger.info(
+            f"Assessment analysis raw response for assessment {assessment.id} "
+            f"(provider={analysis_result.get('provider', 'unknown')}, model={analysis_result.get('model', 'unknown')}, "
+            f"attempt={attempt + 1}/3, length={len(raw_analysis)}): {raw_analysis[:1500]}"
+        )
+        if raw_analysis.strip():
+            break
+        logger.warning(f"Assessment analysis LLM returned empty content (attempt {attempt + 1}/3)")
+
+    if not raw_analysis.strip():
+        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
 
     try:
         parsed = parse_llm_json(raw_analysis)
@@ -356,10 +387,18 @@ async def complete_assessment(
     assessment.completed_at = datetime.now(timezone.utc)
     raw_level = str(parsed.get("estimated_level") or "").strip().upper()
     if raw_level not in _CEFR_LEVELS:
-        # LLM returned null/garbage — keep the user's existing level instead of
-        # crashing on the NOT NULL VARCHAR(2) column or demoting them to A1.
+        # LLM returned null/garbage — fall back to the user's preferred CEFR
+        # level (from settings) so we don't demote them or crash on the NOT
+        # NULL VARCHAR(2) column.
+        cefr_setting = await db.execute(
+            select(Setting).where(Setting.user_id == current_user.id, Setting.key == "default_cefr")
+        )
+        preferred = cefr_setting.scalar_one_or_none()
+        preferred_level = (preferred.value or "").strip().upper() if preferred else ""
         raw_level = (
-            current_user.current_level
+            preferred_level
+            if preferred_level in _CEFR_LEVELS
+            else current_user.current_level
             if current_user.current_level in _CEFR_LEVELS
             else "A1"
         )
@@ -369,12 +408,16 @@ async def complete_assessment(
         )
     assessment.estimated_level = raw_level
     try:
-        assessment.confidence = float(parsed.get("confidence", 0.5))
+        confidence = float(parsed.get("confidence", 0.5))
     except (TypeError, ValueError):
-        assessment.confidence = 0.5
-    assessment.strengths = json.dumps(parsed.get("strengths", []))
-    assessment.weaknesses = json.dumps(parsed.get("weaknesses", []))
-    assessment.recommendations = json.dumps(parsed.get("recommendations", []))
+        confidence = 0.5
+    assessment.confidence = min(1.0, max(0.0, confidence))
+    # Coerce double-encoded strings back to lists — the LLM occasionally
+    # wraps an array in a JSON string, which would otherwise double-encode
+    # and render as [] in the response.
+    assessment.strengths = _coerce_json_list(parsed.get("strengths"))
+    assessment.weaknesses = _coerce_json_list(parsed.get("weaknesses"))
+    assessment.recommendations = _coerce_json_list(parsed.get("recommendations"))
     assessment.summary = parsed.get("summary", "")
 
     # Update user level and mark assessment completed

@@ -34,7 +34,7 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="B1")
-    assessment_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    assessment_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -244,7 +244,7 @@ class ProgressDaily(Base):
     new_words: Mapped[int] = mapped_column(Integer, default=0)
     reviews_done: Mapped[int] = mapped_column(Integer, default=0)
     streak_count: Mapped[int] = mapped_column(Integer, default=0)
-    lessons_completed: Mapped[int] = mapped_column(Integer, default=0)
+    lessons_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     user: Mapped["User"] = relationship(back_populates="progress_entries")
 

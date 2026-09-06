@@ -15,7 +15,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.llm.prompts import LEARNING_PATH_GENERATION_PROMPT, LEVEL_LESSONS_REQUIRED, NEXT_LEVEL
 from app.llm.router import LLMRouter, parse_llm_json
-from app.models.models import Assessment, LearningPath, PathLesson, User
+from app.models.models import Assessment, LearningPath, PathLesson, Setting, User
 from app.utils import bump_daily_lessons
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,14 @@ async def _generate_path_for_user(
     current_user: User,
     assessment: Assessment | None = None,
 ) -> LearningPath:
-    current_level = current_user.current_level or "A1"
+    # Prefer the user's preferred CEFR level from settings over the stored
+    # current_level — the latter may be stale if the assessment analysis failed.
+    cefr_setting = await db.execute(
+        select(Setting).where(Setting.user_id == current_user.id, Setting.key == "default_cefr")
+    )
+    preferred = cefr_setting.scalar_one_or_none()
+    preferred_level = (preferred.value or "").strip().upper() if preferred else ""
+    current_level = preferred_level if preferred_level else (current_user.current_level or "A1")
     target_level = NEXT_LEVEL.get(current_level)
     if not target_level:
         raise HTTPException(status_code=400, detail="You have already reached C2 — the highest level. Keep practicing!")
@@ -138,27 +145,39 @@ async def _generate_path_for_user(
     )
 
     llm = LLMRouter(db, current_user.id)
-    try:
-        result = await llm.complete_with_fallback(
-            messages=[{"role": "user", "content": prompt}],
-            system_prompt="You are an expert English curriculum designer. Return valid JSON only.",
-            task="lesson",
-            temperature=0.5,
-            max_tokens=2500,
-        )
-    except Exception as e:
-        logger.error(f"Learning path LLM call failed for user {current_user.id}: {e}")
-        # Generic detail — raw exception text can leak provider URLs/keys.
-        raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
+    raw_content = ""
+    result = None
+    # Retry up to 3 times when the model returns empty content — smaller/flash
+    # models occasionally produce blank responses for structured prompts.
+    for attempt in range(3):
+        try:
+            result = await llm.complete_with_fallback(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You are an expert English curriculum designer. Return valid JSON only.",
+                task="lesson",
+                temperature=0.5,
+                max_tokens=4000,
+            )
+        except Exception as e:
+            logger.error(f"Learning path LLM call attempt {attempt + 1}/3 failed for user {current_user.id}: {e}")
+            if attempt < 2:
+                continue
+            raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
 
-    raw_content = result.get("content", "")
-    provider_used = result.get("provider", "unknown")
-    model_used = result.get("model", "unknown")
-    logger.info(
-        f"Learning path raw LLM response for user {current_user.id} "
-        f"(provider={provider_used}, model={model_used}, length={len(raw_content)}): "
-        f"{raw_content[:2000]}"
-    )
+        raw_content = result.get("content", "")
+        provider_used = result.get("provider", "unknown")
+        model_used = result.get("model", "unknown")
+        logger.info(
+            f"Learning path raw LLM response for user {current_user.id} "
+            f"(provider={provider_used}, model={model_used}, attempt={attempt + 1}/3, length={len(raw_content)}): "
+            f"{raw_content[:2000]}"
+        )
+        if raw_content.strip():
+            break
+        logger.warning(f"Learning path LLM returned empty content (attempt {attempt + 1}/3)")
+
+    if not raw_content.strip():
+        raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
 
     try:
         parsed = parse_llm_json(raw_content)
