@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.llm.prompts import build_tutor_persona
+from app.llm.prompts import ASSESSMENT_ANALYSIS_PROMPT, ASSESSMENT_SYSTEM_PROMPT, build_tutor_persona
 from app.llm.router import LLMRouter, parse_llm_json
 from app.models.models import Assessment, AssessmentMessage, User
 from app.utils import get_tutor_profile_dict
@@ -36,57 +36,6 @@ _END_WORDS_RE = re.compile(r"\b(finish|end|stop|terminar|basta|done)\b", re.IGNO
 def _wants_to_finish(text: str) -> bool:
     stripped = text.strip().strip(".!?,;:¡¿")
     return len(stripped.split()) <= 4 and bool(_END_WORDS_RE.search(stripped))
-
-
-ASSESSMENT_SYSTEM_PROMPT = """You are an expert English teacher and certified CEFR assessor. You are conducting a friendly placement conversation to gauge the student's English proficiency.
-
-Your persona:
-- Warm, encouraging, and professional.
-- You speak ONLY in English during the conversation.
-- You ask natural, conversational questions — not textbook test questions.
-- You subtly adapt difficulty based on the student's replies: if their grammar and vocabulary are strong, ask more abstract or nuanced questions; if they struggle, simplify and ask concrete questions.
-
-Rules for the conversation:
-1. Greet the student warmly and ask the first simple question (e.g., about their name, where they are from, or what they do).
-2. Ask up to 10 questions in total. The question embedded in your first greeting message counts as question 1 — every question you ask, including that one, counts toward the total.
-3. Each question should be slightly more complex than the previous one when the student answers well.
-4. If the student makes many errors, ask easier, more concrete questions to keep them comfortable.
-5. Keep each reply concise (1-3 sentences). The goal is to hear the student speak, not to lecture.
-6. Do NOT explicitly say this is a test or exam. Frame it as a friendly chat.
-7. If the student says "finish", "end", "stop", or "terminar", stop asking questions and say something like "Thank you, that was great! We'll look at your results now."
-8. After 10 questions, say "Thank you, that was great! We'll look at your results now." and do not ask more questions.
-
-You must respond in valid JSON with this structure:
-{
-  "reply": "Your conversational response to the student, including the next question or the closing message.",
-  "question_count": number,
-  "is_complete": boolean
-}
-"""
-
-
-ASSESSMENT_ANALYSIS_PROMPT = """You are an expert English teacher and CEFR assessor. Analyze the following conversation between a student and an English tutor. The tutor asked natural questions to gauge the student's proficiency.
-
-Evaluate the student across these dimensions:
-- Grammar accuracy and range (verb tenses, sentence structures, articles, prepositions)
-- Vocabulary range and precision (word choice, collocations, idiomatic expressions)
-- Fluency and coherence (length and flow of responses, use of connectors)
-- Listening/reading comprehension (do the answers address the questions appropriately?)
-- Pronunciation proxy (based on spelling and word choice, since we only have text)
-
-Based on the CEFR levels (A1, A2, B1, B2, C1, C2), assign an estimated level. Be conservative: only assign a higher level if the student consistently demonstrates the required abilities. If the conversation is very short, lower your confidence.
-
-Return a JSON object exactly like this:
-{
-  "estimated_level": "A1|A2|B1|B2|C1|C2",
-  "confidence": 0.0-1.0,
-  "strengths": ["grammar", "vocabulary", "fluency", "listening", "pronunciation"],
-  "weaknesses": ["grammar", "vocabulary", "fluency", "listening", "pronunciation"],
-  "recommendations": ["specific recommendation 1", "specific recommendation 2", "specific recommendation 3"],
-  "summary": "A brief paragraph in Spanish explaining the student's level and what they can do now."
-}
-
-Strengths, weaknesses, and recommendations should be concrete and actionable. Write the summary in Spanish."""
 
 
 class AssessmentMessageCreate(BaseModel):
@@ -280,44 +229,52 @@ async def assessment_message(
     # embeds question 1 (see ASSESSMENT_SYSTEM_PROMPT rules 1-2), so the
     # count below is exact and the 10-question cap is enforced server-side.
     questions_asked = sum(1 for m in messages if m.role == "assistant")
-    is_complete = questions_asked >= MAX_ASSESSMENT_EXCHANGES
 
-    # Check if user wants to finish early
-    if _wants_to_finish(body.text):
-        is_complete = True
+    # Server-side completion triggers: the 10-question cap, or the student
+    # explicitly asking to finish. Both mean there is nothing left to ask, so
+    # short-circuit before the LLM round-trip and go straight to the closing.
+    server_complete = questions_asked >= MAX_ASSESSMENT_EXCHANGES or _wants_to_finish(body.text)
 
-    tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-    persona = build_tutor_persona(tutor_profile)
-
-    prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
-
-    llm = LLMRouter(db, current_user.id)
     parsed = None
-    for attempt in range(3):
-        try:
-            result = await llm.complete_with_fallback(
-                messages=messages_for_llm,
-                system_prompt=prompt,
-                task="assessment",
-                temperature=0.7,
-                max_tokens=500,
-            )
-            parsed = parse_llm_json(result["content"])
-            if parsed.get("reply", "").strip():
-                break
-            logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
-            parsed = None
-        except Exception as e:
-            logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
-            parsed = None
+    if not server_complete:
+        tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
+        persona = build_tutor_persona(tutor_profile)
+
+        prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
+
+        llm = LLMRouter(db, current_user.id)
+        for attempt in range(3):
+            try:
+                result = await llm.complete_with_fallback(
+                    messages=messages_for_llm,
+                    system_prompt=prompt,
+                    task="assessment",
+                    temperature=0.7,
+                    max_tokens=500,
+                )
+                candidate = parse_llm_json(result["content"])
+                if candidate.get("reply", "").strip():
+                    parsed = candidate
+                    break
+                logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
+            except Exception as e:
+                logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
+    else:
+        parsed = {
+            "reply": "Thank you so much for the chat! Let's see your results now.",
+            "question_count": questions_asked,
+            "is_complete": True,
+        }
 
     if not parsed:
-        is_complete = True
+        # LLM failed and this isn't a server-forced stop — can't continue the
+        # conversation, so fall back to the closing message.
         parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": questions_asked, "is_complete": True}
 
-    if parsed.get("is_complete") or is_complete:
-        parsed["is_complete"] = True
-        parsed["reply"] = "Thank you so much for the chat! Let's see your results now."
+    # When the model wraps up on its own it is instructed to close with the
+    # "results now" line — keep its actual farewell instead of overwriting it.
+    # Only server-forced stops (and the fallback above) guarantee that text.
+    is_complete = server_complete or bool(parsed.get("is_complete"))
 
     assistant_msg = AssessmentMessage(
         assessment_id=assessment.id,
@@ -329,7 +286,7 @@ async def assessment_message(
 
     assessment = await _get_assessment_with_messages(db, assessment.id)
     response = AssessmentResponse.model_validate(assessment)
-    response.is_complete = bool(parsed.get("is_complete")) or is_complete
+    response.is_complete = is_complete
     return response
 
 
@@ -372,11 +329,29 @@ async def complete_assessment(
             temperature=0.3,
             max_tokens=1200,
         )
-        parsed = parse_llm_json(analysis_result["content"])
     except Exception as e:
-        logger.error(f"Assessment analysis failed: {e}")
+        logger.error(f"Assessment analysis LLM call failed for assessment {assessment.id}: {e}")
         # Generic detail — raw exception text can leak provider URLs/keys.
         raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
+
+    raw_analysis = analysis_result.get("content", "")
+    logger.info(
+        f"Assessment analysis raw response for assessment {assessment.id} "
+        f"(provider={analysis_result.get('provider', 'unknown')}, model={analysis_result.get('model', 'unknown')}, "
+        f"length={len(raw_analysis)}): {raw_analysis[:1500]}"
+    )
+
+    try:
+        parsed = parse_llm_json(raw_analysis)
+    except Exception as e:
+        logger.error(f"Assessment analysis JSON parsing failed for assessment {assessment.id}: {e}")
+        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
+
+    logger.info(
+        f"Assessment analysis parsed for assessment {assessment.id}: "
+        f"keys={list(parsed.keys())}, estimated_level={parsed.get('estimated_level')}, "
+        f"confidence={parsed.get('confidence')}"
+    )
 
     assessment.completed_at = datetime.now(timezone.utc)
     raw_level = str(parsed.get("estimated_level") or "").strip().upper()
@@ -387,6 +362,10 @@ async def complete_assessment(
             current_user.current_level
             if current_user.current_level in _CEFR_LEVELS
             else "A1"
+        )
+        logger.warning(
+            f"Assessment {assessment.id} returned invalid level '{parsed.get('estimated_level')}', "
+            f"falling back to {raw_level}"
         )
     assessment.estimated_level = raw_level
     try:
@@ -403,5 +382,12 @@ async def complete_assessment(
     current_user.assessment_completed = True
 
     await db.flush()
+
+    logger.info(
+        f"Assessment {assessment.id} completed for user {current_user.id}: "
+        f"level={assessment.estimated_level}, confidence={assessment.confidence}, "
+        f"strengths={len(json.loads(assessment.strengths or '[]'))}, "
+        f"weaknesses={len(json.loads(assessment.weaknesses or '[]'))}"
+    )
 
     return await _get_assessment_with_messages(db, assessment.id)
