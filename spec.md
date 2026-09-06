@@ -96,10 +96,12 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
                │
     ┌───────────┼─────────────────┬───────────────┐
     ▼           ▼                 ▼               ▼
- SQLite/    Pocket TTS      Proveedores LLM   Whisper local
- SQLite     (tu homelab)    (OpenAI, Anthropic, (opcional,
-   (progreso,                    DeepSeek, Fireworks, faster-whisper
-   vocab, hist.)                 endpoint custom)    en backend)
+ SQLite     Pocket TTS      Proveedores LLM   Whisper local
+ (default;  (tu homelab)    (OpenAI, Anthropic, (opcional,
+ PostgreSQL                      DeepSeek, Fireworks, faster-whisper
+ soportado)                      endpoint custom)    en backend)
+   (progreso,
+    vocab, hist.)
 ```
 
 - **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
@@ -143,7 +145,7 @@ providers:
 
 > Nota: no tengo certeza de qué API expande exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
 
-- Las claves se guardan **solo en el backend**, vía `.env` o pantalla de ajustes cifrada en la base de datos local (nunca se exponen al frontend).
+- Las claves se guardan **solo en el backend**, vía la pantalla de ajustes cifrada en la base de datos local (nunca se exponen al frontend). El `LLMRouter` lee los proveedores exclusivamente de `provider_configs` — las variables `*_API_KEY` de `.env` no se consumen actualmente (TBD).
 - Selector en la UI: qué proveedor/modelo usar por defecto para (a) conversación, (b) corrección, (c) generación de lecciones — pueden ser distintos (ej. modelo barato para corrección estructurada, modelo mejor para roleplay).
 - Fallback automático: si el proveedor primario falla (rate limit, error), reintentar con el siguiente configurado.
 - Tracking de uso: contador local de tokens/llamadas por proveedor (sin coste real porque BYOK, pero útil para saber consumo).
@@ -231,17 +233,17 @@ vocab_items(id, word, definition, example, ipa, ease_factor, interval_days, next
 -- scenarios table
 scenarios(id, user_id, name, system_prompt, cefr_level, is_custom, created_at)
 
--- progress_daily table
-progress_daily(date, user_id, minutes_spoken, new_words, reviews_done, streak_count, lessons_completed, PRIMARY KEY (date, user_id))
+-- progress_daily table (PK is id; uniqueness per date+user via unique constraint)
+progress_daily(id, date, user_id, minutes_spoken, new_words, reviews_done, streak_count, lessons_completed, UNIQUE (date, user_id))
 
--- settings table
-settings(id, user_id, key, value, PRIMARY KEY (key, user_id))
+-- settings table (PK is id; uniqueness per key+user via unique constraint)
+settings(id, user_id, key, value, UNIQUE (key, user_id))
 
 -- tutor_profiles table
 tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, updated_at)
 
--- assessments table
-assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, created_at)
+-- assessments table (no created_at — ordering uses started_at + id)
+assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary)
 
 -- assessment_messages table
 assessment_messages(id, assessment_id, role, text, created_at)
@@ -252,8 +254,8 @@ generated_lessons(id, user_id, title, topic, level, explanation, examples, exerc
 -- learning_paths table
 learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
 
--- path_lessons table
-path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at, created_at)
+-- path_lessons table (no created_at; `order` is a reserved word in SQL but quoted by SQLAlchemy)
+path_lessons(id, path_id, lesson_type, topic, description, content, order, completed, completed_at)
 
 -- provider_configs table
 provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
@@ -262,6 +264,8 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 > **Nota sobre columnas adicionales**: `current_level` y `assessment_completed` en `users`, y `lessons_completed` en `progress_daily`, son columnas que pueden no estar presentes en bases de datos existentes. El backend incluye un mecanismo de **sincronización al inicio** (`_COLUMNS_TO_ADD` en `backend/app/main.py`) que se ejecuta en cada arranque y añade columnas faltantes con sus valores por defecto mediante `ALTER TABLE`. Esto es seguro porque cada columna solo se añade si está ausente (comprobada por el inspector). Además, se crean índices parciales únicos al inicio (`uq_assessments_user_in_progress` y `uq_learning_paths_user_active`) para garantizar invariantes como "solo un assessment en progreso por usuario" y "solo una learning path activa por usuario".
 
 > **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
+
+> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto (`{focus, lesson_type}`) mediante un `field_validator` y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path.
 
 ---
 
@@ -274,7 +278,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
-8. **Señal `is_complete`**: tras el último mensaje del usuario, si el LLM incluye `is_complete: true` en la respuesta JSON, el cliente asume que la fase de evaluación terminó y debe llamar a `POST /api/assessment/{id}/complete`. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computes) y se propaga desde la respuesta del LLM.
+8. **Señal `is_complete`**: tras cada mensaje del usuario, el backend marca la evaluación como completa si (a) el **servidor** detecta el fin — se alcanzó el tope de 10 preguntas (`MAX_ASSESSMENT_EXCHANGES`) o `_wants_to_finish()` reconoce una petición de cierre en un enunciado corto — o (b) el LLM incluye `is_complete: true` en su respuesta JSON. Cuando `is_complete` llega `true` en la respuesta, el cliente debe llamar a `POST /api/assessment/{id}/complete`, que ejecuta el análisis final con reintento de hasta 3 intentos del LLM. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computan).
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -303,7 +307,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 english-forge/
 ├ docker-compose.yml
 ├ .env.example
-├ frontend/                # Next.js PWA
+├ frontend/                # Next.js 16 PWA (React 19, Tailwind 4)
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── (auth)/          # login, register
@@ -313,38 +317,47 @@ english-forge/
 │   │   │       ├── dashboard/
 │   │   │       ├── lessons/
 │   │   │       ├── learning-path/
-│   │   │       └── settings/
+│   │   │       ├── settings/
+│   │   │       └── vocab/
 │   │   ├── components/
-│   │   │   ├── layout/          # sidebar, mobile nav
-│   │   │   ├── conversation/
-│   │   │   ├── dashboard/
-│   │   │   ├── vocab/
-│   │   │   └── ui/              # badge, button, card, progress, skeleton, ...
+│   │   │   ├── layout/          # sidebar
+│   │   │   ├── ui/              # badge, button, card, input, select, tabs, textarea, ...
+│   │   │   └── service-worker-registrar.tsx
 │   │   └── lib/
-│   │       ├── api.ts
-│   │       ├── stt/             # web-speech.ts, whisper-wasm.ts
+│   │       ├── api.ts           # cliente REST tipado (auth, sessions, vocab, lessons, assessment, learningPath, dashboard, settings)
+│   │       ├── stt/             # web-speech.ts (única implementación STT cliente)
 │   │       ├── types.ts
 │   │       └── utils.ts
 │   ├── public/
 │   └── next-env.d.ts
 ├ backend/
 │   ├── app/
-│   │   ├── main.py
+│   │   ├── main.py              # lifespan: create_all + _COLUMNS_TO_ADD + _INDEXES_TO_ADD
+│   │   ├── config.py            # Settings (pydantic-settings), DATABASE_URL default SQLite
+│   │   ├── database.py / security.py / dependencies.py / utils.py
 │   │   ├── llm/
 │   │   │   ├── base.py              # interfaz ChatProvider
 │   │   │   ├── openai_compatible.py
-│   │   │   ├── anthropic.py
-│   │   │   └── router.py            # selección + fallback
+│   │   │   ├── anthropic_adapter.py
+│   │   │   ├── router.py            # selección + fallback + parse_llm_json (JSON tolerante)
+│   │   │   └── prompts.py           # system prompts + framework CEFR del learning path
 │   │   ├── integrations/
 │   │   │   ├── tts_personal_api.py    # POST /v1/speak + poll /v1/jobs/{id} contra tu personal-api
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
-│   │   │   └── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
-│   │   └── models/                  # SQLAlchemy
-│   │       ├── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
-│   │   ├── routers/                 # sessions, vocab, lessons, messages, assessment, ws, settings, tutor_profile, scenarios, dashboard, learning_paths
-│   │   └── prompts/                 # templates de system prompts por persona/escenario
+│   │   │   ├── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
+│   │   │   └── crypto.py              # cifrado Fernet de API keys
+│   │   ├── models/
+│   │   │   └── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, AssessmentMessage, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
+│   │   ├── schemas/                 # auth, session, vocab, settings
+│   │   ├── routers/                 # auth, sessions, messages, vocab, scenarios, settings, dashboard, lessons, ws, tutor_profile, assessment, learning_paths
+│   │   ├── lessons/                 # biblioteca estática de lecciones (fallback sin LLM)
+│   │   └── srs/
+│   │       └── sm2.py               # motor de repetición espaciada SM-2
+│   ├── alembic/                     # migraciones completas (opcional)
+│   ├── tests/                       # pytest: llm router, lecciones, assessment, learning paths
 │   └── requirements.txt
-└── README.md
+└── scripts/
+    └── clear_user_data.py
 ```
 
 ---
