@@ -55,8 +55,15 @@ def _ensure_new_columns_sync(sync_conn) -> None:
         existing = {c["name"] for c in inspector.get_columns(table)}
         for column_name, column_def in columns:
             if column_name not in existing:
-                sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
-                logger.info(f"Added missing column {table}.{column_name}")
+                # SAVEPOINT keeps the outer transaction usable when a
+                # concurrent instance's startup adds the same column first
+                # (duplicate-column would otherwise abort the whole tx).
+                try:
+                    with sync_conn.begin_nested():
+                        sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
+                    logger.info(f"Added missing column {table}.{column_name}")
+                except sa.exc.ProgrammingError:
+                    logger.info(f"Column {table}.{column_name} already added by a concurrent startup — skipping")
 
 
 # Partial unique indexes enforcing invariants that plain column adds can't
@@ -66,7 +73,20 @@ _INDEXES_TO_ADD: list[str] = [
     # guard in POST /api/assessment/start atomic (see start_assessment).
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_user_in_progress "
     "ON assessments (user_id) WHERE completed_at IS NULL",
+    # Only one active learning path per user — makes the deactivate+insert in
+    # POST /api/learning-paths/generate atomic (see _generate_path_for_user).
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_learning_paths_user_active "
+    "ON learning_paths (user_id) WHERE is_active",
 ]
+
+
+def _ensure_indexes_sync(sync_conn) -> None:
+    for index_sql in _INDEXES_TO_ADD:
+        try:
+            with sync_conn.begin_nested():
+                sync_conn.execute(text(index_sql))
+        except sa.exc.ProgrammingError:
+            logger.info(f"Index already created by a concurrent startup — skipping: {index_sql[:60]}...")
 
 
 def _validate_column_migration_metadata() -> None:
@@ -96,8 +116,7 @@ async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
-        for index_sql in _INDEXES_TO_ADD:
-            await conn.execute(text(index_sql))
+        await conn.run_sync(lambda sync_conn: _ensure_indexes_sync(sync_conn))
     logger.info("Database tables created/verified")
 
     if settings.APP_PIN:

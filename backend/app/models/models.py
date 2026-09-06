@@ -157,8 +157,12 @@ class Assessment(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="assessments")
+    # (created_at, id) — created_at uses func.now() (the transaction
+    # timestamp), so rows inserted in the same request can share a timestamp
+    # and flip order without the id tiebreaker.
     messages: Mapped[list["AssessmentMessage"]] = relationship(
-        back_populates="assessment", cascade="all, delete-orphan", order_by="AssessmentMessage.created_at"
+        back_populates="assessment", cascade="all, delete-orphan",
+        order_by="[AssessmentMessage.created_at, AssessmentMessage.id]",
     )
     learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="assessment")
 
