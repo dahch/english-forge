@@ -61,8 +61,8 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 
 ### 2.6 Pronunciación
 
-- Comparación fonética aproximada: se usa la confianza/alineamiento de Whisper + comparación de la transcripción esperada vs. obtenida como proxy de pronunciación (no hay modelo dedicado de scoring fonético, se documenta como limitación).
-- Opción de "repetir esta frase" con feedback de similitud.
+- Puntuación de lectura en voz alta (sección *speaking* del assessment) con métricas objetivas (`app/services/pronunciation.py`): WER de palabras + tasa de error fonémica (PER vía phonemizer/espeak-ng — sin espeak-ng se degrada a solo WER) + fluidez a partir de los word timestamps de Moonshine (compuesto 60/25/15). No hay modelo comercial dedicado de scoring fonético; el PER fonémico sobre la transcripción STT es la aproximación.
+- Cada ítem de *speaking* anuncia el punto fonético a practicar ("Focus: …") junto a la frase.
 
 ### 2.7 Fuera de alcance (explícitamente simplificado)
 
@@ -277,7 +277,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
-8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`_wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
+8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`, máquina de estados en `app/services/assessment_flow.py`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
 9. **Puntuación determinista**: el nivel final y la confianza **ya no los decide el LLM**. `listening` se puntúa por aciertos en los ítems (grading LLM por ítem con fallback por keywords), `pronunciation` con métricas objetivas por grabación (WER de palabras + PER fonémico vía phonemizer/espeak-ng + fluidez desde word timestamps de Moonshine; compuesto 60/25/15), y `grammar`/`vocabulary`/`fluency` con rúbrica LLM 0-100 sobre la transcripción. La agregación (`app/services/assessment_scoring.py`) mapea cada dimensión a banda CEFR (0-20 A1 … 86-100 C2), toma la mediana conservadora como nivel final y calcula la confianza a partir de cobertura de dimensiones, volumen de evidencia y dispersión. Strengths/weaknesses son etiquetas derivadas de dimensiones medidas — el LLM solo escribe resumen y recomendaciones, y nunca puede afirmar dimensiones sin evidencia.
 10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire) y devuelve HTTP 503 si la salida del LLM no tiene la forma esperada de un análisis.
 11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación y descarta envíos duplicados/desactualizados (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
@@ -348,6 +348,12 @@ english-forge/
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
 │   │   │   ├── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
 │   │   │   └── crypto.py              # cifrado Fernet de API keys
+│   │   ├── services/
+│   │   │   ├── assessment_flow.py     # máquina de estados de fases del assessment + análisis
+│   │   │   ├── assessment_bank.py     # bancos de ítems listening/speaking
+│   │   │   ├── assessment_scoring.py  # agregación determinista CEFR
+│   │   │   ├── pronunciation.py       # WER + PER fonémico + fluidez
+│   │   │   └── stt.py                 # STT compartido (semáforo global + fallback whisper)
 │   │   ├── models/
 │   │   │   └── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, AssessmentMessage, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
 │   │   ├── schemas/                 # auth, session, vocab, settings
@@ -356,7 +362,7 @@ english-forge/
 │   │   └── srs/
 │   │       └── sm2.py               # motor de repetición espaciada SM-2
 │   ├── alembic/                     # migraciones completas (opcional)
-│   ├── tests/                       # pytest: llm router, lecciones, assessment, learning paths
+│   ├── tests/                       # pytest: llm router, lecciones, assessment (lógica, flujo de fases, scoring), pronunciación, learning paths
 │   └── requirements.txt
 └── scripts/
     └── clear_user_data.py
