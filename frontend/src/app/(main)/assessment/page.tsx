@@ -12,7 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { api } from "@/lib/api"
 import type { Assessment, AssessmentMessage } from "@/lib/types"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
-import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2 } from "lucide-react"
+import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw } from "lucide-react"
 
 // Must match MAX_ASSESSMENT_EXCHANGES in backend/app/routers/assessment.py.
 const MAX_ASSESSMENT_QUESTIONS = 10
@@ -27,6 +27,7 @@ export default function AssessmentPage() {
   const [isListening, setIsListening] = useState(false)
   const [completed, setCompleted] = useState(false)
   const [generatingPath, setGeneratingPath] = useState(false)
+  const [reanalyzing, setReanalyzing] = useState(false)
   const sttRef = useRef<WebSpeechSTT | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -120,6 +121,21 @@ export default function AssessmentPage() {
     }
   }
 
+  const reanalyzeAssessment = async () => {
+    if (!assessment) return
+    setReanalyzing(true)
+    setError("")
+    try {
+      const a = await api.assessment.reanalyze(assessment.id)
+      setAssessment(a)
+      setMessages(a.messages)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to re-analyze assessment")
+    } finally {
+      setReanalyzing(false)
+    }
+  }
+
   const toggleListening = () => {
     if (isListening) {
       sttRef.current?.stop()
@@ -156,6 +172,14 @@ export default function AssessmentPage() {
           <div className="text-6xl font-bold text-primary">{assessment.estimated_level}</div>
           <p className="text-sm text-muted-foreground">Confidence: {Math.round((assessment.confidence || 0) * 100)}%</p>
         </div>
+
+        {error && (
+          <div className="flex items-center gap-2 p-3 rounded-md bg-destructive/10 text-destructive text-sm">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            <span className="flex-1">{error}</span>
+            <Button variant="ghost" size="sm" onClick={() => setError("")}>Dismiss</Button>
+          </div>
+        )}
 
         <Card>
           <CardHeader>
@@ -200,9 +224,14 @@ export default function AssessmentPage() {
           </CardContent>
         </Card>
 
-        <Button onClick={generatePath} disabled={generatingPath} className="w-full" size="lg">
+        <Button onClick={generatePath} disabled={generatingPath || reanalyzing} className="w-full" size="lg">
           {generatingPath ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Sparkles className="h-4 w-4 mr-1" />}
           {generatingPath ? "Generating path..." : "Generate My Learning Path"}
+        </Button>
+
+        <Button onClick={reanalyzeAssessment} disabled={generatingPath || reanalyzing} variant="outline" className="w-full">
+          {reanalyzing ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <RefreshCw className="h-4 w-4 mr-1" />}
+          {reanalyzing ? "Re-analyzing conversation..." : "Re-analyze Results"}
         </Button>
 
         <Button onClick={start} variant="outline" className="w-full">

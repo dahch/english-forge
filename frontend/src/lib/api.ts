@@ -238,6 +238,8 @@ export const api = {
       }),
     complete: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
+    reanalyze: (id: string) =>
+      request<Assessment>(`/api/assessment/${id}/reanalyze`, { method: "POST" }),
   },
 
   learningPath: {
