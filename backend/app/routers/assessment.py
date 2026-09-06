@@ -237,6 +237,26 @@ async def get_message_audio(
     return Response(content=audio, media_type="audio/mpeg")
 
 
+async def _read_limited(file: UploadFile, max_bytes: int) -> tuple[bytes, bool]:
+    """Read an upload in chunks, aborting as soon as it exceeds max_bytes.
+
+    Reading the whole body up-front would buffer unbounded data from a slow or
+    malformed client; chunking lets an oversize recording fail fast without
+    holding a greenlet on the remaining bytes.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > max_bytes:
+            return b"", True
+        chunks.append(chunk)
+    return b"".join(chunks), False
+
+
 @router.post("/{assessment_id}/recordings", response_model=RecordingResponse)
 async def upload_recording(
     assessment_id: str,
@@ -258,11 +278,11 @@ async def upload_recording(
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
 
-    audio = await file.read()
+    audio, too_large = await _read_limited(file, _MAX_RECORDING_BYTES)
+    if too_large:
+        raise HTTPException(status_code=413, detail="Recording too large (max 10MB)")
     if not audio:
         raise HTTPException(status_code=400, detail="Empty recording")
-    if len(audio) > _MAX_RECORDING_BYTES:
-        raise HTTPException(status_code=413, detail="Recording too large (max 10MB)")
 
     content_type = file.content_type or "audio/webm"
     stt = await transcribe_audio(audio, content_type)
@@ -357,6 +377,11 @@ async def reanalyze_assessment(
     # Each reanalyze triggers up to 3 LLM calls — throttle repeat clicks.
     # Per-process guard (single-worker deployments), not a distributed limit.
     now = datetime.now(timezone.utc)
+    # Bound the guard so a long-lived process doesn't grow it unbounded (one
+    # entry per assessment id, otherwise never evicted).
+    if len(_reanalyze_last) > 256:
+        cutoff = now - _REANALYZE_COOLDOWN
+        _reanalyze_last = {k: v for k, v in _reanalyze_last.items() if v >= cutoff}
     last = _reanalyze_last.get(assessment_id)
     if last and (now - last) < _REANALYZE_COOLDOWN:
         raise HTTPException(status_code=429, detail="Please wait a moment before re-analyzing again")
