@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -185,9 +186,26 @@ async def start_assessment(
     if existing:
         return existing
 
+    # The partial unique index (uq_assessments_user_in_progress, created at
+    # startup) makes this insert atomic: a double-click that passes the
+    # SELECT above still can't create a second in-progress row — the loser
+    # gets rolled back and re-selects the winner's row.
     assessment = Assessment(user_id=current_user.id)
-    db.add(assessment)
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(assessment)
+    except IntegrityError:
+        existing_result = await db.execute(
+            select(Assessment)
+            .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
+            .order_by(Assessment.started_at.desc())
+            .options(selectinload(Assessment.messages))
+            .limit(1)
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            return existing
+        raise
     await db.refresh(assessment)
 
     tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
