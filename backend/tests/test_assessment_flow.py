@@ -18,16 +18,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.llm.router import LLMRouter
-from app.models.models import Base, AssessmentMessage, User
+from app.models.models import Assessment, Base, AssessmentMessage, User
 from app.routers.assessment import (
-    MAX_ASSESSMENT_EXCHANGES,
-    MIN_ASSESSMENT_EXCHANGES,
     AssessmentMessageCreate,
     AssessmentResponse,
     assessment_message,
     complete_assessment,
     start_assessment,
 )
+from app.services.assessment_flow import MAX_ASSESSMENT_EXCHANGES, MIN_ASSESSMENT_EXCHANGES
 
 
 @pytest_asyncio.fixture
@@ -214,6 +213,40 @@ async def test_duplicate_item_submission_does_not_advance(db, user, monkeypatch)
     assert ok.phase == "listening"
     assert ok.messages[-1].kind == "listening"
     assert ok.messages[-1].text == LISTENING_ITEMS[2].tutor_text
+
+
+@pytest.mark.asyncio
+async def test_analysis_falls_back_when_llm_fails(db, user, monkeypatch):
+    """When every LLM attempt fails (e.g. a reasoning model returning empty
+    content), the analysis must still complete deterministically from the
+    measured evidence instead of raising RuntimeError — /complete can never
+    fail with a 503 for an LLM outage."""
+    from app.services.assessment_flow import analyze_assessment, reload_assessment
+
+    async def failing_complete(self, *args, **kwargs):
+        raise RuntimeError("All providers failed. Last error: Provider Firework AI returned empty content")
+
+    monkeypatch.setattr(LLMRouter, "complete_with_fallback", failing_complete)
+
+    assessment = Assessment(user_id=user.id, phase="speaking", section_step=0)
+    db.add(assessment)
+    await db.flush()
+    db.add(AssessmentMessage(assessment_id=assessment.id, role="assistant", text="Hello!", kind="chat"))
+    db.add(AssessmentMessage(
+        assessment_id=assessment.id, role="user", text="Because of the rain", kind="listening",
+        metrics=json.dumps({"item_id": "l1", "correct": 1, "source": "voice"}),
+    ))
+    await db.flush()
+
+    await analyze_assessment(db, user, assessment)
+
+    served = AssessmentResponse.model_validate(await reload_assessment(db, assessment.id))
+    assert served.estimated_level is not None
+    assert served.summary  # fallback summary present, never blank
+    assert served.dimension_scores["listening"] == 100.0
+    # LLM-scored dimensions stay unmeasured — never invented.
+    assert served.dimension_scores["grammar"] is None
+    assert served.recommendations  # fallback recommendation points to re-analyze
 
 
 @pytest.mark.asyncio

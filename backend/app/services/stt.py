@@ -18,7 +18,10 @@ from app.integrations.stt_whisper_server import STTWhisperServer
 logger = logging.getLogger(__name__)
 
 # One transcription at a time across the whole process. Clips are short
-# (≤30s), so worst-case queue wait stays a few seconds.
+# (≤30s), so worst-case queue wait stays a few seconds. NOTE: this is a
+# per-process guard — it assumes the documented single uvicorn worker; a
+# multi-worker deployment would need a cross-process lock to keep the
+# CPU-saturation guarantee.
 _STT_SEMAPHORE = asyncio.Semaphore(1)
 
 

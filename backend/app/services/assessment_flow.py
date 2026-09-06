@@ -48,7 +48,7 @@ from app.services.assessment_scoring import (
     mean_or_none,
     strengths_weaknesses,
 )
-from app.services.pronunciation import normalize_text, score_pronunciation
+from app.services.pronunciation import normalize_text, score_pronunciation_async
 from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
 logger = logging.getLogger(__name__)
@@ -317,7 +317,9 @@ async def _grade_listening_answer(
                 system_prompt="You grade English listening comprehension. Return valid JSON only.",
                 task="assessment",
                 temperature=0.0,
-                max_tokens=200,
+                # Reasoning models need headroom for thinking before the JSON
+                # answer — a tiny budget returns empty content.
+                max_tokens=1000,
             )
             parsed = parse_llm_json(result["content"])
             if isinstance(parsed.get("correct"), bool):
@@ -349,7 +351,12 @@ async def _handle_listening(
         return await _advance_to_speaking(db, current_user, assessment)
 
     # The client declares which item it is answering; a stale/duplicate
-    # submission (item no longer current) is dropped silently.
+    # submission (item no longer current) is dropped silently. NOTE: this
+    # check is not atomic — two concurrent /message calls for the same item
+    # could both pass before either inserts. Low risk in a single-user app
+    # (the real double-tap is sequential and caught here); a truly atomic
+    # guard would need a unique index on (assessment_id, item_id), which
+    # requires promoting item_id out of the metrics JSON column.
     if item_id is not None and item_id != item.id:
         assessment = await reload_assessment(db, assessment.id)
         return assessment, False
@@ -454,7 +461,7 @@ async def _handle_speaking(
 
     # Evidence integrity: ALWAYS recompute server-side from (item text,
     # transcript, STT word timestamps). The client only echoes the words.
-    metrics = score_pronunciation(item.text, text, words or None)
+    metrics = await score_pronunciation_async(item.text, text, words or None)
     db.add(_user_message(
         assessment.id, text, KIND_SPEAKING, source,
         metrics={"item_id": item.id, **metrics},
@@ -489,6 +496,15 @@ async def _handle_speaking(
 
 
 # --- Entry point -------------------------------------------------------------
+
+async def handle_start(db: AsyncSession, assessment: Assessment) -> Assessment:
+    """Seed a freshly-created (empty) assessment with the deterministic mic
+    check and return it eager-loaded. The caller is responsible for creating
+    the Assessment row and guarding against duplicates (partial unique index)."""
+    db.add(_assistant_message(assessment.id, _MIC_CHECK_TEXT, KIND_MIC_CHECK))
+    await db.flush()
+    return await reload_assessment(db, assessment.id)
+
 
 async def handle_message(
     db: AsyncSession,
@@ -545,6 +561,36 @@ async def ensure_message_audio(
 
 
 # --- Analysis ----------------------------------------------------------------
+
+def _fallback_analysis(
+    listening_dim: float | None,
+    pronunciation_dim: float | None,
+    n_listening: int,
+    n_speaking: int,
+) -> dict:
+    """Deterministic analysis used when the LLM is unavailable: the assessment
+    still completes with the level computed from the measured evidence instead
+    of failing the /complete request. "Re-analyze Results" retries the LLM."""
+    measured: list[str] = []
+    if listening_dim is not None:
+        measured.append(f"comprensión auditiva {listening_dim:.0f}/100 ({n_listening} preguntas)")
+    if pronunciation_dim is not None:
+        measured.append(f"pronunciación {pronunciation_dim:.0f}/100 ({n_speaking} grabaciones)")
+    evidence = " y ".join(measured) if measured else "no hubo evidencia objetiva suficiente"
+    return {
+        "grammar": None,
+        "vocabulary": None,
+        "fluency": None,
+        "recommendations": [
+            "Vuelve a intentar el análisis más tarde desde «Re-analyze Results»."
+        ],
+        "summary": (
+            "No se pudo generar el análisis detallado en este momento, pero tu nivel se calculó "
+            f"con la evidencia medida: {evidence}. "
+            "Puedes pulsar «Re-analyze Results» para repetir el análisis más tarde."
+        ),
+    }
+
 
 async def analyze_assessment(db: AsyncSession, current_user: User, assessment: Assessment) -> None:
     """Run the assessment analysis and persist the results (level, confidence,
@@ -610,6 +656,7 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
     llm = LLMRouter(db, current_user.id)
     raw_analysis = ""
     analysis_result = None
+    parsed: dict | None = None
     # Retry up to 3 times when the model returns empty content — smaller/flash
     # models occasionally produce blank responses for structured prompts.
     for attempt in range(3):
@@ -622,13 +669,13 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
                 system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
                 task="assessment",
                 temperature=0.3,
-                max_tokens=2048,
+                # Reasoning models burn tokens thinking before writing the
+                # JSON payload — 2048 left no room for the answer.
+                max_tokens=4096,
             )
         except Exception as e:
             logger.error(f"Assessment analysis LLM call attempt {attempt + 1}/3 failed for assessment {assessment.id}: {e}")
-            if attempt < 2:
-                continue
-            raise RuntimeError("Failed to analyze the assessment. Please try again.")
+            continue
 
         raw_analysis = analysis_result.get("content", "")
         logger.info(
@@ -636,28 +683,34 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
             f"(provider={analysis_result.get('provider', 'unknown')}, model={analysis_result.get('model', 'unknown')}, "
             f"attempt={attempt + 1}/3, length={len(raw_analysis)}): {raw_analysis[:1500]}"
         )
-        if raw_analysis.strip():
+        if not raw_analysis.strip():
+            logger.warning(f"Assessment analysis LLM returned empty content (attempt {attempt + 1}/3)")
+            continue
+
+        try:
+            parsed = parse_llm_json(raw_analysis)
+        except Exception as e:
+            logger.error(f"Assessment analysis JSON parsing failed for assessment {assessment.id}: {e}")
+            continue
+
+        # The parsed shape must actually look like an analysis — the legacy
+        # conversational fallback ({"reply": ...}) would otherwise silently save
+        # empty result cards (blank summary/strengths/weaknesses).
+        if parsed.get("summary"):
             break
-        logger.warning(f"Assessment analysis LLM returned empty content (attempt {attempt + 1}/3)")
-
-    if not raw_analysis.strip():
-        raise RuntimeError("Failed to analyze the assessment. Please try again.")
-
-    try:
-        parsed = parse_llm_json(raw_analysis)
-    except Exception as e:
-        logger.error(f"Assessment analysis JSON parsing failed for assessment {assessment.id}: {e}")
-        raise RuntimeError("Failed to analyze the assessment. Please try again.")
-
-    # The parsed shape must actually look like an analysis — the legacy
-    # conversational fallback ({"reply": ...}) would otherwise silently save
-    # empty result cards (blank summary/strengths/weaknesses).
-    if not parsed.get("summary"):
         logger.error(
             f"Assessment analysis for assessment {assessment.id} returned an unexpected shape: "
             f"keys={list(parsed.keys())}, raw={raw_analysis[:500]}"
         )
-        raise RuntimeError("Failed to analyze the assessment. Please try again.")
+        parsed = None
+
+    if parsed is None or not parsed.get("summary"):
+        # LLM unavailable or unusable after all attempts — complete with a
+        # deterministic analysis from the measured evidence instead of failing
+        # the /complete request with a 503 (the client would then retry in a
+        # loop, exhausting proxy connections).
+        logger.warning(f"Assessment {assessment.id}: LLM analysis unavailable, using deterministic fallback")
+        parsed = _fallback_analysis(listening_dim, pronunciation_dim, len(listening_correct), len(pron_scores))
 
     # --- Aggregation (deterministic) ---
     dimension_scores: dict[str, float | None] = {

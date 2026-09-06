@@ -22,29 +22,20 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import Assessment, AssessmentMessage, User
 from app.services.assessment_flow import (
-    MAX_ASSESSMENT_EXCHANGES,
-    MIN_ASSESSMENT_EXCHANGES,
     PHASE_MIC_CHECK,
-    _MIC_CHECK_TEXT,
-    _assistant_message,
     analyze_assessment,
     ensure_message_audio,
     expected_text_for,
     handle_message,
+    handle_start,
     reload_assessment,
-    wants_to_finish,
 )
-from app.services.pronunciation import score_pronunciation
+from app.services.pronunciation import score_pronunciation_async
 from app.services.stt import transcribe_audio
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/assessment", tags=["assessment"])
-
-# Re-exported for tests and backwards compatibility.
-_wants_to_finish = wants_to_finish
-MAX_EXCHANGES = MAX_ASSESSMENT_EXCHANGES
-MIN_EXCHANGES = MIN_ASSESSMENT_EXCHANGES
 
 # Reanalyze cost guard: cooldown between LLM analyses of the same assessment.
 _REANALYZE_COOLDOWN = timedelta(seconds=30)
@@ -211,10 +202,7 @@ async def start_assessment(
 
     # The first message is a deterministic mic check — no LLM round-trip. It
     # validates permissions/volume/STT before the interview starts.
-    db.add(_assistant_message(assessment.id, _MIC_CHECK_TEXT, "mic_check"))
-    await db.flush()
-
-    return await reload_assessment(db, assessment.id)
+    return await handle_start(db, assessment)
 
 
 @router.get("/{assessment_id}/messages/{message_id}/audio")
@@ -282,7 +270,7 @@ async def upload_recording(
     expected = expected_text_for(assessment.phase, assessment.section_step)
     metrics = None
     if expected and stt["text"].strip():
-        metrics = score_pronunciation(expected, stt["text"], stt["words"])
+        metrics = await score_pronunciation_async(expected, stt["text"], stt["words"])
     return RecordingResponse(transcript=stt["text"], words=stt["words"], metrics=metrics)
 
 
