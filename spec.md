@@ -24,6 +24,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 ## 2. Funcionalidades (paridad Praktika + mejoras)
 
 ### 2.1 Núcleo conversacional
+
 - **Chat de voz en tiempo real** con un tutor IA: STT → LLM (persona + motor de corrección) → TTS → reproducción.
 - **Escenarios de roleplay** predefinidos (entrevista de trabajo, pedir comida, hacer check-in en hotel, small talk, reunión de trabajo, llamada telefónica, etc.) y **escenarios personalizados** (el usuario describe la situación y el sistema genera el prompt del personaje).
 - **Modo "free talk"**: conversación abierta sobre cualquier tema, con corrección activa.
@@ -31,6 +32,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 - **Personas del tutor**: distintos acentos/personalidades (ES: "profesor estricto", "amigo casual", "coach de negocios"), cada una es solo un system prompt distinto.
 
 ### 2.2 Motor de corrección
+
 - Tras cada turno del usuario, el LLM devuelve (en JSON estructurado, además de la respuesta conversacional):
   - Transcripción "limpia" de lo que dijo.
   - Errores detectados (gramática, uso de palabras, naturalidad) con explicación breve en español.
@@ -40,25 +42,30 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 - **Resumen de sesión**: al terminar una conversación, pantalla con errores agrupados por categoría, puntuación de fluidez estimada y palabras nuevas para añadir al vocabulario.
 
 ### 2.3 Vocabulario y SRS
+
 - Banco de palabras/expresiones personal, alimentado automáticamente desde las conversaciones (o añadido manualmente).
 - Algoritmo de repetición espaciada tipo **SM-2** (igual que Anki) para repasos diarios.
 - Tarjetas con: palabra, definición, pronunciación (IPA + audio TTS), frase de ejemplo, frase generada por el usuario en su última práctica.
 - Modo "quiz" rápido (multiple choice / completar frase / escuchar y escribir).
 
 ### 2.4 Lecciones estructuradas
+
 - Generación de mini-lecciones de gramática/vocabulario bajo demanda por el LLM, basadas en los errores recurrentes del usuario ("veo que confundes present perfect vs past simple, aquí tienes una lección corta + 5 ejercicios").
 - Biblioteca local de lecciones fijas para temas base (tiempos verbales, phrasal verbs, preposiciones, etc.) como fallback sin necesitar LLM.
 
 ### 2.5 Progreso y gamificación
+
 - Dashboard: minutos hablados, palabras nuevas aprendidas, racha de días, nivel CEFR estimado (heurística basada en errores/complejidad de frases), gráfico de evolución.
 - Streaks y XP simple (sin presión monetizable, solo motivación personal).
 - Metas diarias configurables (ej. "10 min de conversación" o "20 tarjetas de repaso").
 
 ### 2.6 Pronunciación
+
 - Comparación fonética aproximada: se usa la confianza/alineamiento de Whisper + comparación de la transcripción esperada vs. obtenida como proxy de pronunciación (no hay modelo dedicado de scoring fonético, se documenta como limitación).
 - Opción de "repetir esta frase" con feedback de similitud.
 
 ### 2.7 Fuera de alcance (explícitamente simplificado)
+
 - Avatar animado / lipsync: **no es prioridad** (según lo indicado). Se deja un placeholder de avatar estático o un simple indicador de "hablando/escuchando", con arquitectura preparada por si luego se quiere añadir (Live2D / Ready Player Me) sin rehacer nada.
 - Multiusuario, pagos, onboarding comercial: no aplica (uso personal).
 
@@ -89,10 +96,10 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
                │
     ┌───────────┼─────────────────┬───────────────┐
     ▼           ▼                 ▼               ▼
- Postgres/    Pocket TTS      Proveedores LLM   Whisper local
- SQLite       (tu homelab)    (OpenAI, Anthropic, (opcional,
-  (progreso,                    DeepSeek, Fireworks, faster-whisper
-  vocab, hist.)                 endpoint custom)    en backend)
+ SQLite/    Pocket TTS      Proveedores LLM   Whisper local
+ SQLite     (tu homelab)    (OpenAI, Anthropic, (opcional,
+   (progreso,                    DeepSeek, Fireworks, faster-whisper
+   vocab, hist.)                 endpoint custom)    en backend)
 ```
 
 - **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend`, `db`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
@@ -134,7 +141,7 @@ providers:
     default_model: ${CUSTOM_MODEL}
 ```
 
-> Nota: no tengo certeza de qué API expone exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
+> Nota: no tengo certeza de qué API expande exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
 
 - Las claves se guardan **solo en el backend**, vía `.env` o pantalla de ajustes cifrada en la base de datos local (nunca se exponen al frontend).
 - Selector en la UI: qué proveedor/modelo usar por defecto para (a) conversación, (b) corrección, (c) generación de lecciones — pueden ser distintos (ej. modelo barato para corrección estructurada, modelo mejor para roleplay).
@@ -176,6 +183,8 @@ TTS_JOB_TIMEOUT_SECONDS=30
 ⚠️ **Importante sobre networking**: en tu `docker-compose.yml` de `personal-api`, el puerto se publica como `127.0.0.1:8003:8000` — eso solo es alcanzable desde el host, no desde otro contenedor. Para que el backend de EnglishForge le hable a `personal-api`, el contenedor de EnglishForge tiene que **unirse a la misma red externa `coolify`** y usar el nombre de servicio interno (`http://personal-api:8000`), no el puerto publicado en localhost.
 
 ⚠️ **Voces**: para practicar inglés lo lógico es usar voces en inglés, no las voces en español que ya usas para otras cosas. Antes de fijar una voz por defecto, hay que consultar `GET /v1/voices` en Pocket TTS (a través de `personal-api` si expone ese passthrough, o directo si el homelab lo permite) y confirmar el nombre exacto — no asumir que existe una voz concreta.
+
+---
 
 ## 6. STT — combinando lo que ya tienes (Moonshine) con opciones sin infraestructura
 
@@ -250,9 +259,9 @@ path_lessons(id, path_id, lesson_type, topic, description, content, order, compl
 provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
 ```
 
-> **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de
-> lecciones devueltas por el LLM, para que el path siempre pueda avanzar
-> aunque el LLM devuelva menos lecciones de las solicitadas.
+> **Nota sobre columnas adicionales**: `current_level` y `assessment_completed` en `users`, y `lessons_completed` en `progress_daily`, son columnas que pueden no estar presentes en bases de datos existentes. El backend incluye un mecanismo de **sincronización al inicio** (`_COLUMNS_TO_ADD` en `backend/app/main.py`) que se ejecuta en cada arranque y añade columnas faltantes con sus valores por defecto mediante `ALTER TABLE`. Esto es seguro porque cada columna solo se añade si está ausente (comprobada por el inspector). Además, se crean índices parciales únicos al inicio (`uq_assessments_user_in_progress` y `uq_learning_paths_user_active`) para garantizar invariantes como "solo un assessment en progreso por usuario" y "solo una learning path activa por usuario".
+
+> **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
 ---
 
@@ -265,7 +274,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
-8. **Señal `is_complete`**: tras el último mensaje del usuario, si el LLM incluye `is_complete: true` en la respuesta JSON, el cliente asume que la fase de evaluación terminó y debe llamar a `POST /api/assessment/{id}/complete`. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computes) y se propaga desde la respuesta del LLM (commit 005d371, 5c12cf2).
+8. **Señal `is_complete`**: tras el último mensaje del usuario, si el LLM incluye `is_complete: true` en la respuesta JSON, el cliente asume que la fase de evaluación terminó y debe llamar a `POST /api/assessment/{id}/complete`. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computes) y se propaga desde la respuesta del LLM.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -292,9 +301,9 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 
 ```
 english-forge/
-├── docker-compose.yml
-├── .env.example
-├── frontend/                # Next.js PWA
+├ docker-compose.yml
+├ .env.example
+├ frontend/                # Next.js PWA
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── (auth)/          # login, register
@@ -318,7 +327,7 @@ english-forge/
 │   │       └── utils.ts
 │   ├── public/
 │   └── next-env.d.ts
-├── backend/
+├ backend/
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── llm/
@@ -330,13 +339,15 @@ english-forge/
 │   │   │   ├── tts_personal_api.py    # POST /v1/speak + poll /v1/jobs/{id} contra tu personal-api
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
 │   │   │   └── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
-│   │   ├── models/                  # SQLAlchemy
-│   │   │   ├── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
+│   │   └── models/                  # SQLAlchemy
+│   │       ├── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
 │   │   ├── routers/                 # sessions, vocab, lessons, messages, assessment, ws, settings, tutor_profile, scenarios, dashboard, learning_paths
 │   │   └── prompts/                 # templates de system prompts por persona/escenario
 │   └── requirements.txt
 └── README.md
 ```
+
+---
 
 ## 10. Plan de fases
 
