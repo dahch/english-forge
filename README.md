@@ -143,9 +143,7 @@ npm run dev
 
 ### Database
 
-SQLite is used via SQLAlchemy's `DeclarativeBase`. Tables are created automatically with `Base.metadata.create_all()` on first app start. For column additions that may be missing from existing databases, a startup sync mechanism (`_COLUMNS_TO_ADD` in `backend/app/main.py`) runs on every app launch and adds any missing columns with their declared defaults. This is safe to run repeatedly since each column is only added if absent (guarded by an inspector check).
-
-Alembic is still available for full table migrations via `alembic revision --autogenerate -m "description"` and `alembic upgrade head`, but trivial column additions no longer require manual migration.
+SQLite is used via SQLAlchemy's `DeclarativeBase` as the primary database. Tables are created automatically with `Base.metadata.create_all()` on first app start. For column additions that may be missing from existing databases, a startup sync mechanism (`_COLUMNS_TO_ADD` in `backend/app/main.py`) runs on every app launch and adds any missing columns with their declared defaults. This is safe to run repeatedly since each column is only added if absent (guarded by an inspector check). Alembic is still available for full table migrations via `alembic revision --autogenerate -m "description"` and `alembic upgrade head` if needed.
 
 ## Environment Variables
 
@@ -154,7 +152,7 @@ See `.env.example` for the full list. Required:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing |
-| `DATABASE_URL` | Yes (Docker sets it) | PostgreSQL connection string |
+| `DATABASE_URL` | Yes (Docker sets it) | SQLite database URL (e.g. `sqlite:///./data.db`) |
 | At least one `*_API_KEY` | **Yes** | LLM provider key |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
