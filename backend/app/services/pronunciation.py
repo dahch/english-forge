@@ -138,7 +138,9 @@ def word_accuracy(expected: str, transcript: str) -> dict:
 
 # --- Phoneme-level scoring -------------------------------------------------
 
-_phoneme_cache: dict[str, str] = {}
+from collections import OrderedDict
+
+_phoneme_cache: OrderedDict[str, str] = OrderedDict()
 # The bank is small (~30 unique sentences) but the cache also serves arbitrary
 # user transcripts — bound it so a long-lived worker doesn't grow unbounded.
 _PHONEME_CACHE_MAX = 1024
@@ -149,6 +151,7 @@ def _phonemize(text: str) -> str | None:
         return None
     cached = _phoneme_cache.get(text)
     if cached is not None:
+        _phoneme_cache.move_to_end(text)  # LRU touch
         return cached
     try:
         result = _espeak_phonemize(text, language="en-us", backend="espeak", strip=True)
@@ -156,7 +159,7 @@ def _phonemize(text: str) -> str | None:
         return None
     result = result.strip()
     if len(_phoneme_cache) >= _PHONEME_CACHE_MAX:
-        _phoneme_cache.clear()
+        _phoneme_cache.popitem(last=False)  # evict the least-recently-used
     _phoneme_cache[text] = result
     return result
 
