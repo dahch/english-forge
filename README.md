@@ -89,7 +89,8 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 1. Set `PERSONAL_API_URL=http://personal-api:8000` in `.env`
 2. Set `TTS_DEFAULT_VOICE` to a valid voice name
-3. The backend automatically joins the `coolify` network
+3. `TTS_MODEL` pins the Pocket TTS model sent on every `/v1/speak` call (default `english_2026-04_24l`) — personal-api servers default to a Spanish model, so english-forge always sends the English one. Unknown model ids are ignored by Pocket TTS (hot-swap safe, and older personal-api servers ignore the field entirely).
+4. The backend automatically joins the `coolify` network
 
 **Note:** Verify available voices with `GET /v1/voices` on your Pocket TTS instance before setting the default.
 
@@ -104,7 +105,7 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
-**Note:** The conversation page uses Web Speech API in the browser. The assessment page records with MediaRecorder and transcribes server-side (Moonshine via personal-api, faster-whisper in-process fallback). The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet.
+**Note:** The conversation page uses Web Speech API in the browser. The assessment page records with MediaRecorder and transcribes server-side (Moonshine via personal-api, faster-whisper in-process fallback). The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
 
 ## Architecture
 
@@ -198,6 +199,8 @@ See `.env.example` for the full list. Required:
 | `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
+| `STT_LANGUAGE` | No (default: `en`) | Language hint sent on every personal-api `/v1/transcribe` call. `en` unlocks real Moonshine word timestamps (used by pronunciation fluency metrics); older personal-api servers ignore the field. |
+| `TTS_MODEL` | No (default: `english_2026-04_24l`) | Pocket TTS model id pinned on every `/v1/speak` call (personal-api defaults to a Spanish model). Unknown ids are ignored — hot-swap safe. |
 | `LLM_TIMEOUT_SECONDS` | No (default: `300`) | Per-request timeout for LLM providers. Reasoning models can take a while before producing output — keep generous, or unset to disable the timeout entirely. |
 
 LLM API keys are configured in the app's Settings UI (encrypted in the DB) — see the note under [LLM Providers](#llm-providers).

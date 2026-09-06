@@ -169,7 +169,7 @@ GET {PERSONAL_API_URL}/v1/jobs/{job_id}
 El `result` final, cuando `status == "finished"`, trae `{"audio_base64": "..."}` (o `{"error": "..."}` si Pocket devolvió JSON de error con status 200 — hay que revisarlo, no basta con el status HTTP).
 
 **Adaptador `TTSProvider` para EnglishForge** (`backend/app/integrations/tts_personal_api.py`):
-1. `POST /v1/speak` con `{text, voice}` → obtiene `job_id`.
+1. `POST /v1/speak` con `{text, voice, model}` → obtiene `job_id` (`model` fija el modelo de Pocket TTS — `TTS_MODEL`, por defecto `english_2026-04_24l`, ya que personal-api usa por defecto un modelo español; los ids desconocidos se ignoran).
 2. Poll a `GET /v1/jobs/{job_id}` cada ~500ms hasta `finished`/`failed`, con timeout total configurable (ej. 30s) — es un patrón **asíncrono por colas**, no una llamada síncrona directa, así que hay que diseñar la UI para mostrar "generando audio…" mientras se espera.
 3. Decodificar `audio_base64` → bytes → servir al frontend.
 
@@ -177,6 +177,7 @@ Config:
 ```
 PERSONAL_API_URL=http://personal-api:8000     # nombre de servicio en la red docker "coolify", NO 127.0.0.1:8003
 TTS_DEFAULT_VOICE=alba                          # una de las 8 voces builtin sin auth
+TTS_MODEL=english_2026-04_24l                   # modelo inglés de Pocket TTS, fijado en cada /v1/speak
 TTS_JOB_POLL_INTERVAL_MS=500
 TTS_JOB_TIMEOUT_SECONDS=30
 ```
@@ -193,13 +194,13 @@ Tu stack ya incluye un worker STT (`worker-stt`, cola `stt-jobs`) que llama a Mo
 
 1. **Vía tu `personal-api` + Moonshine** (mismo patrón de colas que TTS): el frontend graba el audio, lo manda al backend de EnglishForge, y este reenvía el archivo tal cual a `personal-api`. Contrato real confirmado:
    ```
-   POST {PERSONAL_API_URL}/v1/transcribe   multipart/form-data, campo "audio" (archivo)
+   POST {PERSONAL_API_URL}/v1/transcribe   multipart/form-data, campo "audio" (archivo) + campo "language" (STT_LANGUAGE, "en")
    → 200 {"job_id": "...", "status": "queued"}
 
    GET {PERSONAL_API_URL}/v1/jobs/{job_id}
-   → {"job_id": "...", "status": "queued|started|finished|failed", "result": {"text": "..."} }
+   → {"job_id": "...", "status": "queued|started|finished|failed", "result": {"text": "...", "words": [...] } }
    ```
-   `personal-api` es quien codifica el audio a base64 internamente antes de encolarlo — EnglishForge solo tiene que mandar el archivo de audio por multipart, igual que un `<input type="file">`, no un JSON con base64.
+   `personal-api` es quien codifica el audio a base64 internamente antes de encolarlo — EnglishForge solo tiene que mandar el archivo de audio por multipart, igual que un `<input type="file">`, no un JSON con base64. El campo `language=en` es lo que desbloquea los word timestamps reales de Moonshine para inglés (insumo de las métricas de fluidez); los servidores de personal-api antiguos ignoran ambos campos.
    - **Dato de capacidad real de tu homelab** (de los comentarios del propio `worker_stt.py`): Moonshine satura ~6 de 6 cores con solo 5 peticiones concurrentes, por eso `worker-stt` corre con una sola réplica. Esto refuerza la decisión de más abajo: no conviene depender de este modo para el turno conversacional en vivo (además de la latencia del polling, compite por el único worker con cualquier otra transcripción que esté corriendo en el homelab en ese momento).
 2. **Nativo del navegador/móvil** (`Web Speech API`): cero infraestructura, gratis, mejor latencia (no depende de colas), calidad variable según navegador.
 3. **Whisper embebido en cliente** (`whisper.cpp` WASM, modelo `tiny`/`base`): 100% offline en el navegador, útil si en algún momento no tienes el homelab accesible (fuera de la LAN/VPN).
@@ -279,7 +280,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
 8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`, máquina de estados en `app/services/assessment_flow.py`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
 9. **Puntuación determinista**: el nivel final y la confianza **ya no los decide el LLM**. `listening` se puntúa por aciertos en los ítems (grading LLM por ítem con fallback por keywords), `pronunciation` con métricas objetivas por grabación (WER de palabras + PER fonémico vía phonemizer/espeak-ng + fluidez desde word timestamps de Moonshine; compuesto 60/25/15), y `grammar`/`vocabulary`/`fluency` con rúbrica LLM 0-100 sobre la transcripción. La agregación (`app/services/assessment_scoring.py`) mapea cada dimensión a banda CEFR (0-20 A1 … 86-100 C2), toma la mediana conservadora como nivel final y calcula la confianza a partir de cobertura de dimensiones, volumen de evidencia y dispersión. Strengths/weaknesses son etiquetas derivadas de dimensiones medidas — el LLM solo escribe resumen y recomendaciones, y nunca puede afirmar dimensiones sin evidencia.
-10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire) y devuelve HTTP 503 si la salida del LLM no tiene la forma esperada de un análisis.
+10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire). Si el LLM falla o devuelve una forma inesperada, el análisis se completa con un fallback determinista construido desde la evidencia medida (nivel + scores de listening/pronunciation; grammar/vocabulary/fluency quedan sin medir) en lugar de fallar la petición — «Re-analyze Results» reintenta el LLM más tarde.
 11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación y descarta envíos duplicados/desactualizados (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
