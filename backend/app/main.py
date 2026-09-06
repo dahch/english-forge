@@ -73,9 +73,16 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     ],
     "assessment_messages": [
         ("kind", "VARCHAR(20) NOT NULL DEFAULT 'chat'"),
-        ("audio_url", "VARCHAR(500)"),
+        ("audio_url", "TEXT"),
         ("metrics", "TEXT"),
     ],
+    # NOTE: assessment_messages.created_at is not listed here — its default
+    # changed from SQLite func.now() (second precision, server-side) to a
+    # client-side microsecond default in the model. The column type is
+    # unchanged, so no DDL is needed; legacy rows keep server timestamps while
+    # new rows get microsecond precision. (created_at, id) ordering works for
+    # both — the microsecond default just removes the random-UUID tiebreak
+    # for same-second inserts.
 }
 
 

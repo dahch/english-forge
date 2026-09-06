@@ -69,9 +69,9 @@ def _install_llm(monkeypatch, *, listening_correct: bool = True):
     return calls
 
 
-async def _send(db, user, assessment_id, text, source="text", metrics=None):
+async def _send(db, user, assessment_id, text, source="text", words=None, item_id=None):
     return await assessment_message(
-        assessment_id, AssessmentMessageCreate(text=text, source=source, metrics=metrics), user, db
+        assessment_id, AssessmentMessageCreate(text=text, source=source, words=words, item_id=item_id), user, db
     )
 
 
@@ -126,12 +126,12 @@ async def test_full_flow(db, user, monkeypatch):
     # Pronunciation items carry the expected sentence + focus in the text.
     assert "Focus:" in resp.messages[-1].text
 
-    # Answer the whole speaking bank with client-computed metrics.
+    # Answer the whole speaking bank with the exact item text — the server
+    # must recompute the composite itself from (item text, transcript, words);
+    # there is no client-injected score anymore.
     for i in range(len(SPEAKING_ITEMS)):
-        resp = await _send(
-            db, user, resp.id, f"spoken sentence {i}", source="voice",
-            metrics={"composite": 70.0 + i},
-        )
+        item = SPEAKING_ITEMS[i]
+        resp = await _send(db, user, resp.id, item.text, source="voice", words=[])
         if i < len(SPEAKING_ITEMS) - 1:
             assert resp.phase == "speaking"
             assert resp.is_complete is False
@@ -146,9 +146,8 @@ async def test_full_flow(db, user, monkeypatch):
     assert result.completed_at is not None
     assert served.dimension_scores is not None
     assert served.dimension_scores["listening"] == 100.0
-    assert served.dimension_scores["pronunciation"] == pytest.approx(
-        sum(70.0 + i for i in range(len(SPEAKING_ITEMS))) / len(SPEAKING_ITEMS)
-    )
+    # Perfect read-aloud transcripts → composite 100 across the bank.
+    assert served.dimension_scores["pronunciation"] == 100.0
     assert served.estimated_level is not None
     assert 0.05 <= served.confidence <= 0.95
     # Strengths/weaknesses are labels of measured dimensions only.
@@ -178,3 +177,77 @@ async def test_max_cap_forces_transition(db, user, monkeypatch):
             break
         resp = await _send(db, user, resp.id, "some answer")
     assert resp.phase == "listening"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_item_submission_does_not_advance(db, user, monkeypatch):
+    """Sending two answers for the same banked item (double-click) must not
+    double-advance the section or corrupt the message history."""
+    from app.services.assessment_bank import LISTENING_ITEMS
+
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog")
+    # Reach the listening section (explicit finish wins before the min gate).
+    resp = await _send(db, user, resp.id, "stop")
+    assert resp.phase == "listening"
+    first_item = LISTENING_ITEMS[0]
+    second_item = LISTENING_ITEMS[1]
+
+    # Answer item 1 (client declares item_id, as the frontend does).
+    first = await _send(db, user, resp.id, "answer one", item_id=first_item.id)
+    assert first.phase == "listening"
+    assert first.messages[-1].kind == "listening"
+
+    # Sequential double-click: the second submission still references item 1
+    # while item 2 is current — it must be dropped, not treated as item 2's
+    # answer, and the history must not grow.
+    dup = await _send(db, user, resp.id, "answer one again", item_id=first_item.id)
+    assert dup.phase == "listening"
+    assert dup.messages[-1].text == second_item.tutor_text
+
+    user_listening = [m for m in dup.messages if m.role == "user" and m.kind == "listening"]
+    assert len(user_listening) == 1
+
+    # Answering the actual current item still works and advances.
+    ok = await _send(db, user, resp.id, "answer two", item_id=second_item.id)
+    assert ok.phase == "listening"
+    assert ok.messages[-1].kind == "listening"
+    assert ok.messages[-1].text == LISTENING_ITEMS[2].tutor_text
+
+
+@pytest.mark.asyncio
+async def test_pronunciation_metrics_always_recomputed(db, user, monkeypatch):
+    """Client-supplied scores are impossible: the composite is derived from
+    (item text, transcript, words) server-side. A garbage transcript with
+    fabricated 'perfect' data still scores low."""
+    from app.services.assessment_bank import LISTENING_ITEMS, SPEAKING_ITEMS
+
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog")
+    resp = await _send(db, user, resp.id, "stop")
+    # Answer all listening items correctly to reach the speaking section.
+    for i in range(len(LISTENING_ITEMS)):
+        resp = await _send(db, user, resp.id, f"listening answer {i}")
+    assert resp.phase == "speaking"
+
+    item = SPEAKING_ITEMS[0]
+    resp = await _send(
+        db, user, resp.id, "completely unrelated words", source="voice",
+        words=[{"word": "completely", "start": 0.0, "end": 0.5}, {"word": "unrelated", "start": 0.6, "end": 1.0}],
+    )
+    # The stored metrics must reflect the REAL match, not anything the client
+    # claimed (there is no way to claim anything anymore).
+    result = await db.execute(
+        select(AssessmentMessage).where(
+            AssessmentMessage.assessment_id == resp.id,
+            AssessmentMessage.role == "user",
+            AssessmentMessage.kind == "speaking",
+        )
+    )
+    stored = result.scalars().one()
+    payload = json.loads(stored.metrics)
+    assert payload["item_id"] == item.id
+    assert payload["composite"] < 50
+    assert payload["word_accuracy"] < 0.5

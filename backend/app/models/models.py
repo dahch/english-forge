@@ -157,8 +157,10 @@ class Assessment(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Multi-skill assessment sections: mic_check → conversation → listening →
     # speaking → (completed). The phase advances server-side as items are
-    # answered; the client renders the matching UI for each phase.
-    phase: Mapped[str] = mapped_column(String(20), nullable=False, default="mic_check")
+    # answered; the client renders the matching UI for each phase. Defaults to
+    # "conversation" so legacy rows (pre-v2) behave like a pure chat; new rows
+    # are always created explicitly as "mic_check" by start_assessment.
+    phase: Mapped[str] = mapped_column(String(20), nullable=False, default="conversation")
     # Index of the current item within the active phase (0-based). Items are
     # pre-banked per phase, so (phase, section_step) identifies the pending item.
     section_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -191,9 +193,11 @@ class AssessmentMessage(Base):
     # "speaking" (read-aloud item). Defaults to "chat" for legacy rows.
     kind: Mapped[str] = mapped_column(String(20), nullable=False, default="chat")
     # Assistant messages: cached TTS audio as a data URI (same pattern as
-    # conversation Messages). User messages leave this NULL — recordings are
+    # conversation Messages). A few seconds of MP3 base64 is tens of KB — Text,
+    # not VARCHAR(500). Not serialized in responses; the client always fetches
+    # the /audio endpoint. User messages leave this NULL — recordings are
     # transcribed and scored, the raw audio is never persisted.
-    audio_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    audio_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Per-message evidence captured at answer time, as JSON. For listening
     # answers: {"correct": 0|1, "reason": str}. For speaking answers:
     # {"word_accuracy": f, "phoneme_accuracy": f|null, "fluency": {...}}.

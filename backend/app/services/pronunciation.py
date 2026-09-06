@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from difflib import SequenceMatcher
 
 # phonemizer is optional at runtime: metrics degrade gracefully (no PER) when
 # espeak-ng is missing. Imported lazily so tests/CI without the system lib work.
@@ -140,6 +139,9 @@ def word_accuracy(expected: str, transcript: str) -> dict:
 # --- Phoneme-level scoring -------------------------------------------------
 
 _phoneme_cache: dict[str, str] = {}
+# The bank is small (~30 unique sentences) but the cache also serves arbitrary
+# user transcripts — bound it so a long-lived worker doesn't grow unbounded.
+_PHONEME_CACHE_MAX = 1024
 
 
 def _phonemize(text: str) -> str | None:
@@ -153,6 +155,8 @@ def _phonemize(text: str) -> str | None:
     except Exception:
         return None
     result = result.strip()
+    if len(_phoneme_cache) >= _PHONEME_CACHE_MAX:
+        _phoneme_cache.clear()
     _phoneme_cache[text] = result
     return result
 
@@ -258,8 +262,3 @@ def score_pronunciation(expected_text: str, transcript: str, words: list[dict] |
         "phonemizer_used": _PHONEMIZER_AVAILABLE,
         "timestamps_used": bool(words),
     }
-
-
-# Kept for the diff-based pairwise similarity used in tests.
-def _similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a, b).ratio()
