@@ -117,7 +117,7 @@ Change mode in Settings → Preferences → STT Mode.
                │
     ┌──────────┼──────────────┬──────────────┐
     ▼          ▼              ▼              ▼
- PostgreSQL  personal-api   LLM APIs    faster-whisper
+ SQLite     personal-api   LLM APIs    faster-whisper
  (primary)   (TTS/STT)     (OpenAI...)  (optional)
 ```
 
@@ -141,13 +141,11 @@ npm install
 npm run dev
 ```
 
-### Database Migrations
+### Database
 
-```bash
-cd backend
-alembic revision --autogenerate -m "description"
-alembic upgrade head
-```
+SQLite is used via SQLAlchemy's `DeclarativeBase`. Tables are created automatically with `Base.metadata.create_all()` on first app start. For column additions that may be missing from existing databases, a startup sync mechanism (`_COLUMNS_TO_ADD` in `backend/app/main.py`) runs on every app launch and adds any missing columns with their declared defaults. This is safe to run repeatedly since each column is only added if absent (guarded by an inspector check).
+
+Alembic is still available for full table migrations via `alembic revision --autogenerate -m "description"` and `alembic upgrade head`, but trivial column additions no longer require manual migration.
 
 ## Environment Variables
 
