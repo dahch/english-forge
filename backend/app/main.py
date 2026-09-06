@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 import sqlalchemy as sa
 from fastapi import FastAPI, Request
@@ -17,10 +18,29 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _validate_column_migration_metadata()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
+        await conn.run_sync(lambda sync_conn: _ensure_indexes_sync(sync_conn))
+    logger.info("Database tables created/verified")
+
+    if settings.APP_PIN:
+        logger.info("APP_PIN protection is enabled")
+
+    yield
+
+    await engine.dispose()
+
+
 app = FastAPI(
     title="EnglishForge API",
     description="Personal English practice app — BYOK, self-hosted, multi-user",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -67,7 +87,10 @@ def _ensure_new_columns_sync(sync_conn) -> None:
                     with sync_conn.begin_nested():
                         sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
                     logger.info(f"Added missing column {table}.{column_name}")
-                except sa.exc.ProgrammingError:
+                # SQLite raises OperationalError for duplicate columns, Postgres
+                # raises ProgrammingError — catch both so the race handling
+                # below actually fires on both dialects.
+                except (sa.exc.ProgrammingError, sa.exc.OperationalError):
                     if _column_exists(sync_conn, table, column_name):
                         logger.info(f"Column {table}.{column_name} already added by a concurrent startup — skipping")
                     else:
@@ -122,7 +145,10 @@ def _ensure_indexes_sync(sync_conn) -> None:
             with sync_conn.begin_nested():
                 sync_conn.execute(text(index_sql))
             logger.info(f"Verified index {index_name}")
-        except sa.exc.ProgrammingError:
+        # SQLite raises OperationalError for duplicate-column/UNIQUE-violation
+        # DDL, Postgres raises ProgrammingError — catch both so the race
+        # handling below actually fires on both dialects.
+        except (sa.exc.ProgrammingError, sa.exc.OperationalError):
             if _index_exists(sync_conn, table_name, index_name):
                 logger.info(f"Index {index_name} already created by a concurrent startup — skipping")
             else:
@@ -157,24 +183,6 @@ def _validate_column_migration_metadata() -> None:
                 logger.warning(
                     f"_COLUMNS_TO_ADD references column {table_name}.{column_name} which is missing from models.py — stale migration entry"
                 )
-
-
-@app.on_event("startup")
-async def startup():
-    _validate_column_migration_metadata()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
-        await conn.run_sync(lambda sync_conn: _ensure_indexes_sync(sync_conn))
-    logger.info("Database tables created/verified")
-
-    if settings.APP_PIN:
-        logger.info("APP_PIN protection is enabled")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await engine.dispose()
 
 
 @app.get("/api/health")
