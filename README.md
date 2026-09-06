@@ -7,6 +7,8 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 ## Features
 
 - **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2)
+- **CEFR Assessment** — Conversational placement test (up to 10 questions) that estimates your level, strengths, and weaknesses
+- **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets and automatic progression
 - **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
 - **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
 - **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with flashcards and quiz modes
@@ -33,7 +35,7 @@ cp .env.example .env
 
 # 3. Edit .env — at minimum set:
 #    - JWT_SECRET_KEY (generate: openssl rand -hex 32)
-#    - At least one LLM API key (e.g. OPENAI_API_KEY)
+#    (LLM API keys are added later in the app's Settings UI)
 nano .env
 
 # 4. Start everything
@@ -57,7 +59,7 @@ docker compose up -d
 
 ### LLM Providers
 
-Add providers through the Settings UI or configure defaults in `.env`. Each provider needs:
+Add providers through the Settings UI. Each provider needs:
 
 | Field | Description |
 |-------|-------------|
@@ -67,6 +69,8 @@ Add providers through the Settings UI or configure defaults in `.env`. Each prov
 | Model | Model name (e.g. `gpt-4.1-mini`) |
 | Protocol | `openai` (OpenAI-compatible) or `anthropic` |
 | Priority | Higher = tried first in fallback chain |
+
+**Note:** The `*_API_KEY` env vars in `.env.example` are currently **not** consumed by the LLM router — providers come exclusively from the Settings UI / `provider_configs` table (TBD).
 
 **Supported out of the box:**
 
@@ -100,12 +104,15 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
+**Note:** The conversation and assessment pages always use Web Speech API in the browser. The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet.
+
 ## Architecture
 
 ```
 ┌─────────────────────────────┐
-│  Frontend (Next.js 14+ PWA) │  port 3590
-│  shadcn/ui, dark theme      │
+│  Frontend (Next.js 16 PWA)  │  port 3590
+│  React 19, Tailwind 4,      │
+│  shadcn-style UI, dark      │
 └──────────────┬──────────────┘
                │ REST + WebSocket (JWT)
 ┌──────────────▼──────────────┐
@@ -113,12 +120,16 @@ Change mode in Settings → Preferences → STT Mode.
 │  JWT auth, multi-user       │
 │  LLM router (BYOK)          │
 │  SRS engine (SM-2)          │
+│  Assessment + learning path │
 └──────────────┬──────────────┘
                │
     ┌──────────┼──────────────┬──────────────┐
     ▼          ▼              ▼              ▼
- SQLite     personal-api   LLM APIs    faster-whisper
- (primary)   (TTS/STT)     (OpenAI...)  (optional)
+ SQLite      personal-api   LLM APIs    faster-whisper
+ (default)    (TTS/STT)     (OpenAI...)  (optional)
+    │
+    └─ PostgreSQL also supported (the bundled compose
+       stack ships a postgres:16 db service)
 ```
 
 ## Development
@@ -141,9 +152,31 @@ npm install
 npm run dev
 ```
 
+### Tests
+
+```bash
+cd backend
+python -m pytest
+```
+
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
+
 ### Database
 
-SQLite is used via SQLAlchemy's `DeclarativeBase` as the primary database. Tables are created automatically with `Base.metadata.create_all()` on first app start. For column additions that may be missing from existing databases, a startup sync mechanism (`_COLUMNS_TO_ADD` in `backend/app/main.py`) runs on every app launch and adds any missing columns with their declared defaults. This is safe to run repeatedly since each column is only added if absent (guarded by an inspector check). Alembic is still available for full table migrations via `alembic revision --autogenerate -m "description"` and `alembic upgrade head` if needed.
+SQLite is the default database (`sqlite+aiosqlite:///./data/englishforge.db`, set in `backend/app/config.py`). In Docker the file lives on the `backend_data` volume (`/app/data`). PostgreSQL is also supported via `DATABASE_URL` — note that `docker-compose.yml` currently still ships a `postgres:16-alpine` `db` service and `.env.example` points `DATABASE_URL` at it. **TBD:** the compose stack and the "SQLite default" haven't been fully reconciled yet — if you want SQLite in Docker, remove the `db` service and the `DATABASE_URL` from your `.env`; if you want PostgreSQL, keep them.
+
+Schema handling (no manual migrations needed for routine changes):
+
+- Tables are created with `Base.metadata.create_all()` on startup.
+- Columns added to existing tables after first deployment are applied by the startup sync in `backend/app/main.py` (`_COLUMNS_TO_ADD`), guarded by an inspector check so it's safe to run on every launch.
+- Partial unique indexes enforcing invariants (one in-progress assessment, one active learning path per user) are created at startup (`_INDEXES_TO_ADD`) — see ADR-007.
+- Alembic remains available for full table migrations: `alembic revision --autogenerate -m "description"` and `alembic upgrade head` (run from `backend/`).
+
+## Documentation
+
+- [`spec.md`](./spec.md) — product specification (domain, features, data model, integrations)
+- [`DESIGN.md`](./DESIGN.md) — technical design (architecture, layers, key flows)
+- [`ADR.md`](./ADR.md) — architecture decision records
 
 ## Environment Variables
 
@@ -151,11 +184,13 @@ See `.env.example` for the full list. Required:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing |
-| `DATABASE_URL` | Yes (Docker sets it) | SQLite database URL (e.g. `sqlite:///./data.db`) |
-| At least one `*_API_KEY` | **Yes** | LLM provider key |
+| `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing (also derives the Fernet key for API-key encryption when `SETTINGS_ENCRYPTION_KEY` is empty) |
+| `DATABASE_URL` | No (default: `sqlite+aiosqlite:///./data/englishforge.db`) | SQLAlchemy async URL. Use `postgresql+asyncpg://...` for PostgreSQL (the bundled compose stack's `.env.example` sets this). |
+| `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
+
+LLM API keys are configured in the app's Settings UI (encrypted in the DB) — see the note under [LLM Providers](#llm-providers).
 
 **Note on `.env` for Coolify**: The `docker-compose.yml` has `env_file:.env` marked as `required: false`. When deploying to Coolify, the `.env` file may be provided by the platform's environment configuration, so it's not strictly required in the compose file itself.
 
