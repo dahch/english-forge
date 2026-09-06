@@ -40,9 +40,9 @@ export default function LessonsPage() {
     }
   }
 
-  const checkExercise = async (index: number) => {
+  const checkExercise = async (index: number, answerOverride?: string) => {
     if (!activeLesson) return
-    const answer = exerciseAnswers[index] || ""
+    const answer = answerOverride ?? (exerciseAnswers[index] || "")
     if (!answer.trim()) return
 
     setChecking((prev) => ({ ...prev, [index]: true }))
@@ -151,22 +151,43 @@ export default function LessonsPage() {
           {activeLesson.exercises && activeLesson.exercises.length > 0 ? (
             activeLesson.exercises.map((ex, i) => {
               const result = exerciseResults[i]
+              const options = "options" in ex && Array.isArray(ex.options) ? ex.options : undefined
+              const isMultipleChoice = ex.type === "multiple_choice" && !!options?.length
               return (
                 <Card key={i}>
                   <CardContent className="p-4 space-y-3">
                     <p className="font-medium">{ex.question}</p>
                     {!result ? (
-                      <div className="flex gap-2">
-                        <Input
-                          placeholder="Your answer"
-                          value={exerciseAnswers[i] || ""}
-                          onChange={(e) => setExerciseAnswers((prev) => ({ ...prev, [i]: e.target.value }))}
-                          onKeyDown={(e) => e.key === "Enter" && checkExercise(i)}
-                        />
-                        <Button size="sm" onClick={() => checkExercise(i)} disabled={!exerciseAnswers[i] || checking[i]}>
-                          {checking[i] ? <Loader2 className="h-4 w-4 animate-spin" /> : "Check"}
-                        </Button>
-                      </div>
+                      isMultipleChoice ? (
+                        <div className="flex flex-wrap gap-2">
+                          {options!.map((opt) => (
+                            <Button
+                              key={opt}
+                              size="sm"
+                              variant={exerciseAnswers[i] === opt ? "default" : "outline"}
+                              disabled={checking[i]}
+                              onClick={() => {
+                                setExerciseAnswers((prev) => ({ ...prev, [i]: opt }))
+                                checkExercise(i, opt)
+                              }}
+                            >
+                              {opt}
+                            </Button>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="flex gap-2">
+                          <Input
+                            placeholder="Your answer"
+                            value={exerciseAnswers[i] || ""}
+                            onChange={(e) => setExerciseAnswers((prev) => ({ ...prev, [i]: e.target.value }))}
+                            onKeyDown={(e) => e.key === "Enter" && checkExercise(i)}
+                          />
+                          <Button size="sm" onClick={() => checkExercise(i)} disabled={!exerciseAnswers[i] || checking[i]}>
+                            {checking[i] ? <Loader2 className="h-4 w-4 animate-spin" /> : "Check"}
+                          </Button>
+                        </div>
+                      )
                     ) : (
                       <div className={`flex items-start gap-2 text-sm ${result.correct ? "text-green-400" : "text-destructive"}`}>
                         {result.correct ? <CheckCircle2 className="h-4 w-4 mt-0.5" /> : <XCircle className="h-4 w-4 mt-0.5" />}

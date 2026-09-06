@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
+import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -23,6 +24,7 @@ import {
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
 
 export default function DashboardPage() {
+  const router = useRouter()
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [cefr, setCefr] = useState<CEFRResult | null>(null)
   const [weekly, setWeekly] = useState<{ week: string; minutes: number; new_words: number; reviews: number; lessons: number }[]>([])
@@ -86,7 +88,7 @@ export default function DashboardPage() {
           Dashboard
         </h1>
         {!stats?.assessment_completed && (
-          <Button onClick={() => (window.location.href = "/assessment")}>
+          <Button onClick={() => router.push("/assessment")}>
             <Sparkles className="h-4 w-4 mr-1" />
             Take Assessment
           </Button>
@@ -139,7 +141,7 @@ export default function DashboardPage() {
               <p className="text-sm text-muted-foreground">
                 Complete the assessment to generate a personalized path from your current level to the next.
               </p>
-              <Button size="sm" onClick={() => (window.location.href = "/assessment")}>
+              <Button size="sm" onClick={() => router.push("/assessment")}>
                 <Sparkles className="h-4 w-4 mr-1" />
                 Start Assessment
               </Button>

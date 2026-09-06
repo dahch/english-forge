@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
+import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
@@ -20,6 +21,7 @@ const typeIcons: Record<string, string> = {
 }
 
 export default function LearningPathPage() {
+  const router = useRouter()
   const [path, setPath] = useState<LearningPath | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
@@ -28,6 +30,7 @@ export default function LearningPathPage() {
 
   const loadPath = async () => {
     setLoading(true)
+    setError("")
     try {
       const p = await api.learningPath.current()
       setPath(p)
@@ -57,7 +60,23 @@ export default function LearningPathPage() {
   }
 
   useEffect(() => {
-    loadPath()
+    // All setState calls happen after await — no synchronous cascading
+    // renders (loading already starts as true for the initial fetch).
+    let cancelled = false
+    async function load() {
+      try {
+        const p = await api.learningPath.current()
+        if (!cancelled) setPath(p)
+      } catch (err: unknown) {
+        if (cancelled) return
+        if (err instanceof ApiError && err.status === 404) setPath(null)
+        else setError(err instanceof Error ? err.message : "Failed to load learning path")
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
   }, [])
 
   const completeLesson = async (lesson: PathLesson) => {
@@ -117,7 +136,7 @@ export default function LearningPathPage() {
           </div>
         )}
         <div className="flex gap-2 justify-center">
-          <Button onClick={() => (window.location.href = "/assessment")}>
+          <Button onClick={() => router.push("/assessment")}>
             Go to Assessment
           </Button>
           <Button variant="outline" onClick={generatePath}>
@@ -129,7 +148,8 @@ export default function LearningPathPage() {
     )
   }
 
-  const percent = Math.round(path.lessons_completed / path.lessons_required * 100)
+  // Clamp — paths created before the lesson-cap fix could exceed 100%.
+  const percent = Math.min(100, Math.round(path.lessons_completed / path.lessons_required * 100))
   const canAdvance = path.lessons_completed >= path.lessons_required
 
   return (

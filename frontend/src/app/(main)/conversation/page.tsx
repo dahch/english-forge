@@ -26,6 +26,12 @@ import {
   Loader2,
 } from "lucide-react"
 
+// Module-level so the React compiler lint doesn't see Date.now() called
+// in component scope (it's impure — but this only runs in event handlers).
+function makeTempMessageId() {
+  return `temp-${Date.now()}`
+}
+
 export default function ConversationPage() {
   const [user, setUser] = useState<User | null>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
@@ -51,6 +57,24 @@ export default function ConversationPage() {
       sttRef.current?.stop()
     }
   }, [])
+
+  // Load a session's messages into the chat view.
+  const loadSession = async (sessionId: string) => {
+    setLoading(true)
+    try {
+      const [s, msgs] = await Promise.all([api.sessions.get(sessionId), api.sessions.messages(sessionId)])
+      setSession(s)
+      setMessages(msgs)
+      setCefrLevel((s.cefr_level as CEFRLevel) || "B1")
+      setSummary(null)
+      setActiveSessionId(s.id)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to load session")
+      setActiveSessionId(null)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   // Initial load: user profile, scenarios, and active/recent session
   useEffect(() => {
@@ -90,23 +114,6 @@ export default function ConversationPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
-  const loadSession = async (sessionId: string) => {
-    setLoading(true)
-    try {
-      const [s, msgs] = await Promise.all([api.sessions.get(sessionId), api.sessions.messages(sessionId)])
-      setSession(s)
-      setMessages(msgs)
-      setCefrLevel((s.cefr_level as CEFRLevel) || "B1")
-      setSummary(null)
-      setActiveSessionId(s.id)
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to load session")
-      setActiveSessionId(null)
-    } finally {
-      setLoading(false)
-    }
-  }
-
   const startSession = async () => {
     setError("")
     try {
@@ -142,7 +149,7 @@ export default function ConversationPage() {
   const sendMessage = async () => {
     if (!session || !inputText.trim() || loading) return
     const text = inputText.trim()
-    const tempId = `temp-${Date.now()}`
+    const tempId = makeTempMessageId()
 
     const userMsg: Message = {
       id: tempId,

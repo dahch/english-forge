@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
+import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
@@ -17,6 +18,7 @@ import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2 } from 
 const MAX_ASSESSMENT_QUESTIONS = 10
 
 export default function AssessmentPage() {
+  const router = useRouter()
   const [assessment, setAssessment] = useState<Assessment | null>(null)
   const [messages, setMessages] = useState<AssessmentMessage[]>([])
   const [inputText, setInputText] = useState("")
@@ -108,7 +110,7 @@ export default function AssessmentPage() {
     setError("")
     try {
       await api.learningPath.generate(assessment.id)
-      window.location.href = "/learning-path"
+      router.push("/learning-path")
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to generate learning path")
     } finally {

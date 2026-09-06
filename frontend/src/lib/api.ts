@@ -106,6 +106,8 @@ export interface LessonExercise {
   question: string
   type: string
   explanation: string
+  // multiple_choice only
+  options?: string[]
 }
 
 export interface ExerciseCheckResult {
@@ -290,5 +292,6 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify(data),
       }),
+    clearData: () => request<{ message: string }>("/api/settings/clear-data", { method: "DELETE" }),
   },
 }

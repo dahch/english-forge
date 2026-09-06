@@ -127,7 +127,7 @@ export interface DashboardStats {
   current_level: string
   assessment_completed: boolean
   last_assessment: {
-    estimated_level: string
+    estimated_level: string | null
     confidence: number
     completed_at: string
   } | null

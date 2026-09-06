@@ -10,7 +10,7 @@ import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
 import type { ProviderConfig, TutorProfile } from "@/lib/types"
-import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle } from "lucide-react"
+import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
 
 const PERSONALITY_PRESETS = [
   "friendly",
@@ -39,7 +39,10 @@ export default function SettingsPage() {
   const [tutorSaved, setTutorSaved] = useState(false)
   const [customPersonality, setCustomPersonality] = useState(false)
   const [error, setError] = useState("")
+  const [success, setSuccess] = useState("")
   const [showAddProvider, setShowAddProvider] = useState(false)
+  const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const [newProvider, setNewProvider] = useState({
     provider_name: "",
     api_key: "",
@@ -117,6 +120,23 @@ export default function SettingsPage() {
     }
   }
 
+  const clearData = async () => {
+    setClearing(true)
+    setError("")
+    try {
+      await api.settings.clearData()
+      setSuccess("All data cleared successfully. Refreshing...")
+      setTimeout(() => {
+        window.location.reload()
+      }, 1500)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to clear data")
+    } finally {
+      setClearing(false)
+      setShowClearConfirm(false)
+    }
+  }
+
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
       <h1 className="text-2xl font-bold flex items-center gap-2">
@@ -129,6 +149,13 @@ export default function SettingsPage() {
           <AlertCircle className="h-4 w-4" />
           {error}
           <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setError("")}>Dismiss</Button>
+        </div>
+      )}
+
+      {success && (
+        <div className="flex items-center gap-2 p-3 rounded-md bg-green-600/10 text-green-400 text-sm">
+          <CheckCircle2 className="h-4 w-4" />
+          {success}
         </div>
       )}
 
@@ -396,6 +423,53 @@ export default function SettingsPage() {
             <Save className="h-4 w-4 mr-1" />
             Save Preferences
           </Button>
+        </CardContent>
+      </Card>
+
+      <Card className="border-destructive/50">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-destructive">
+            <Database className="h-5 w-5" />
+            Clear All Data
+          </CardTitle>
+          <CardDescription>
+            Delete all your learning data (sessions, messages, vocabulary, assessments, lessons, progress).
+            Your account and provider configurations will be preserved.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {showClearConfirm ? (
+            <div className="space-y-3">
+              <p className="text-sm text-destructive font-medium">
+                Are you sure? This action cannot be undone.
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  variant="destructive"
+                  onClick={clearData}
+                  disabled={clearing}
+                >
+                  <Trash2 className="h-4 w-4 mr-1" />
+                  {clearing ? "Clearing..." : "Yes, Clear All Data"}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setShowClearConfirm(false)}
+                  disabled={clearing}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <Button
+              variant="destructive"
+              onClick={() => setShowClearConfirm(true)}
+            >
+              <Trash2 className="h-4 w-4 mr-1" />
+              Clear All Data
+            </Button>
+          )}
         </CardContent>
       </Card>
     </div>
