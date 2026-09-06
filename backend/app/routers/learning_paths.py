@@ -80,18 +80,18 @@ Distribute lesson types realistically:
 Use the learner's weaknesses and recommendations to prioritize topics.
 
 Return ONLY valid JSON in this exact format:
-{
+{{
   "path_title": "...",
   "description": "...",
   "lessons": [
-    {
+    {{
       "lesson_type": "vocabulary|grammar|conversation|listening|reading|writing",
       "topic": "Specific topic name",
       "description": "What the learner will practice and why",
       "order": 1
-    }
+    }}
   ]
-}
+}}
 
 Lessons should be ordered from easier to harder within the target level. Make topics concrete and practical."""
 
