@@ -1,0 +1,44 @@
+{
+  "title": "Present Perfect vs Past Simple",
+  "topic": "grammar",
+  "level": "B1",
+  "explanation": "Use Past Simple for completed actions at a specific time in the past (yesterday, last week, in 2020). Use Present Perfect for actions that happened at an unspecified time, or actions that started in the past and continue to the present. Key signal words: Past Simple → yesterday, ago, last, in+past year. Present Perfect → ever, never, just, already, yet, since, for.",
+  "examples": [
+    "I went to Paris last summer. (Past Simple — specific time)",
+    "I have been to Paris three times. (Present Perfect — unspecified when)",
+    "She lived in London for 5 years. (She doesn't live there now)",
+    "She has lived in London for 5 years. (She still lives there)"
+  ],
+  "exercises": [
+    {
+      "question": "I ___ (see) that movie yesterday.",
+      "type": "fill_blank",
+      "answer": "saw",
+      "explanation": "'Yesterday' indicates a specific past time → Past Simple."
+    },
+    {
+      "question": "She ___ (visit) Japan three times.",
+      "type": "fill_blank",
+      "answer": "has visited",
+      "explanation": "Unspecified time, life experience → Present Perfect."
+    },
+    {
+      "question": "They ___ (move) to this house in 2019.",
+      "type": "fill_blank",
+      "answer": "moved",
+      "explanation": "'In 2019' is a specific past time → Past Simple."
+    },
+    {
+      "question": "I ___ (never / eat) sushi before.",
+      "type": "fill_blank",
+      "answer": "have never eaten",
+      "explanation": "'Never' + life experience → Present Perfect."
+    },
+    {
+      "question": "He ___ (live) here since 2015. (still lives here)",
+      "type": "fill_blank",
+      "answer": "has lived",
+      "explanation": "'Since 2015' + still true → Present Perfect."
+    }
+  ]
+}

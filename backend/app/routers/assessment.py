@@ -1,11 +1,17 @@
+"""HTTP adapter for the multi-skill placement assessment.
+
+All domain logic (phase state machine, grading, pronunciation scoring,
+analysis) lives in app.services.assessment_flow — this module only maps HTTP
+bodies to that service and back.
+"""
+
 from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -14,63 +20,63 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.llm.prompts import ASSESSMENT_ANALYSIS_PROMPT, ASSESSMENT_SYSTEM_PROMPT, build_tutor_persona
-from app.llm.router import LLMRouter, parse_llm_json
-from app.models.models import Assessment, AssessmentMessage, Setting, User
-from app.utils import get_tutor_profile_dict
+from app.models.models import Assessment, AssessmentMessage, User
+from app.services.assessment_flow import (
+    PHASE_MIC_CHECK,
+    analyze_assessment,
+    ensure_message_audio,
+    expected_text_for,
+    handle_message,
+    handle_start,
+    reload_assessment,
+)
+from app.services.pronunciation import score_pronunciation_async
+from app.services.stt import transcribe_audio
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 
-MAX_ASSESSMENT_EXCHANGES = 10
-
-_CEFR_LEVELS = {"A1", "A2", "B1", "B2", "C1", "C2"}
-
 # Reanalyze cost guard: cooldown between LLM analyses of the same assessment.
 _REANALYZE_COOLDOWN = timedelta(seconds=30)
 _reanalyze_last: dict[str, datetime] = {}
 
-# End requests are only honored in short, standalone utterances ("I'm done",
-# "let's finish"). A bare substring match would force-finish the session when
-# the student merely mentions these words ("I'm done with work for today").
-_END_WORDS_RE = re.compile(r"\b(finish|end|stop|terminar|basta|done)\b", re.IGNORECASE)
-
-
-def _wants_to_finish(text: str) -> bool:
-    stripped = text.strip().strip(".!?,;:¡¿")
-    return len(stripped.split()) <= 4 and bool(_END_WORDS_RE.search(stripped))
-
-
-def _coerce_json_list(value) -> str:
-    """Serialize a value as a JSON list, unwrapping double-encoded strings.
-
-    The LLM sometimes returns a JSON-encoded string where a list is expected;
-    storing that raw string would double-encode on the second json.dumps and
-    render as [] in the response. Returns '[]' for anything unusable.
-    """
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except Exception:
-            value = []
-    if not isinstance(value, list):
-        value = [value] if value else []
-    return json.dumps([str(item) for item in value])
+# Maximum accepted recording upload (30s of opus/webm is well under this).
+_MAX_RECORDING_BYTES = 10 * 1024 * 1024
 
 
 class AssessmentMessageCreate(BaseModel):
     # max_length keeps a single turn from writing unbounded text to the DB.
     text: str = Field(..., min_length=1, max_length=2000)
+    # "voice" when the text came from /recordings (STT), "text" when typed.
+    source: str = Field("text", pattern="^(text|voice)$")
+    # STT word timestamps echoed back from /recordings — the ONLY client input
+    # to pronunciation scoring. The server recomputes all metrics itself.
+    words: list[dict] | None = None
+    # The banked item the client believes it is answering; the server drops
+    # submissions that don't match the current item (stale/duplicate).
+    item_id: str | None = None
 
 
 class AssessmentMessageResponse(BaseModel):
     id: str
     role: str
     text: str
+    kind: str
+    metrics: dict | None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("metrics", mode="before")
+    @classmethod
+    def parse_metrics(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
 
 
 class AssessmentResponse(BaseModel):
@@ -83,9 +89,11 @@ class AssessmentResponse(BaseModel):
     weaknesses: list[str] | None
     recommendations: list[str] | None
     summary: str | None
+    phase: str | None
+    dimension_scores: dict | None
     messages: list[AssessmentMessageResponse]
-    # Transient signal: the conversation phase is over and the client should
-    # call /complete. Defaults to False for endpoints that don't compute it.
+    # Transient signal: every section is done and the client should call
+    # /complete. Defaults to False for endpoints that don't compute it.
     is_complete: bool = False
 
     model_config = {"from_attributes": True}
@@ -100,6 +108,16 @@ class AssessmentResponse(BaseModel):
                 return []
         return v
 
+    @field_validator("dimension_scores", mode="before")
+    @classmethod
+    def parse_dimension_scores(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
+
 
 class AssessmentResult(BaseModel):
     estimated_level: str
@@ -110,16 +128,12 @@ class AssessmentResult(BaseModel):
     summary: str
 
 
-# Serializable responses touch the `messages` relationship — it must be
-# eagerly loaded, otherwise Pydantic triggers a lazy load outside the
-# greenlet context (MissingGreenlet) during response validation.
-async def _get_assessment_with_messages(db: AsyncSession, assessment_id: str) -> Assessment:
-    result = await db.execute(
-        select(Assessment)
-        .where(Assessment.id == assessment_id)
-        .options(selectinload(Assessment.messages))
-    )
-    return result.scalar_one()
+class RecordingResponse(BaseModel):
+    transcript: str
+    words: list[dict]
+    # Pronunciation metrics the server computed — informational; the client
+    # echoes `words` back on /message and the server recomputes from scratch.
+    metrics: dict | None = None
 
 
 @router.get("/current", response_model=AssessmentResponse)
@@ -167,7 +181,7 @@ async def start_assessment(
     # startup) makes this insert atomic: a double-click that passes the
     # SELECT above still can't create a second in-progress row — the loser
     # gets rolled back and re-selects the winner's row.
-    assessment = Assessment(user_id=current_user.id)
+    assessment = Assessment(user_id=current_user.id, phase=PHASE_MIC_CHECK)
     try:
         async with db.begin_nested():
             db.add(assessment)
@@ -184,36 +198,100 @@ async def start_assessment(
             response.status_code = 200
             return existing
         raise
-    await db.refresh(assessment)
-
-    tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-    persona = build_tutor_persona(tutor_profile)
-
-    prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nThis is the start of the assessment. Greet the student and ask your first question. Return question_count=1 and is_complete=false."
-
-    llm = LLMRouter(db, current_user.id)
-    try:
-        result = await llm.complete_with_fallback(
-            messages=[],
-            system_prompt=prompt,
-            task="assessment",
-            temperature=0.7,
-            max_tokens=500,
-        )
-        parsed = parse_llm_json(result["content"])
-    except Exception as e:
-        logger.error(f"Assessment start failed: {e}")
-        parsed = {"reply": "Hi! I'm your English tutor. Let's start with a simple question: what do you like to do in your free time?", "question_count": 1, "is_complete": False}
-
-    assistant_msg = AssessmentMessage(
-        assessment_id=assessment.id,
-        role="assistant",
-        text=parsed.get("reply", ""),
-    )
-    db.add(assistant_msg)
     await db.flush()
 
-    return await _get_assessment_with_messages(db, assessment.id)
+    # The first message is a deterministic mic check — no LLM round-trip. It
+    # validates permissions/volume/STT before the interview starts.
+    return await handle_start(db, assessment)
+
+
+@router.get("/{assessment_id}/messages/{message_id}/audio")
+async def get_message_audio(
+    assessment_id: str,
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Assessment).where(
+            Assessment.id == assessment_id, Assessment.user_id == current_user.id
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    msg_result = await db.execute(
+        select(AssessmentMessage).where(
+            AssessmentMessage.id == message_id,
+            AssessmentMessage.assessment_id == assessment_id,
+        )
+    )
+    msg = msg_result.scalar_one_or_none()
+    if not msg or msg.role != "assistant":
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    audio = await ensure_message_audio(db, current_user, assessment, msg)
+    if not audio:
+        raise HTTPException(status_code=503, detail="Audio generation is unavailable right now")
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+async def _read_limited(file: UploadFile, max_bytes: int) -> tuple[bytes, bool]:
+    """Read an upload in chunks, aborting as soon as it exceeds max_bytes.
+
+    Reading the whole body up-front would buffer unbounded data from a slow or
+    malformed client; chunking lets an oversize recording fail fast without
+    holding a greenlet on the remaining bytes.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await file.read(64 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > max_bytes:
+            return b"", True
+        chunks.append(chunk)
+    return b"".join(chunks), False
+
+
+@router.post("/{assessment_id}/recordings", response_model=RecordingResponse)
+async def upload_recording(
+    assessment_id: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Transcribe a student recording (Moonshine via personal-api, in-process
+    whisper as fallback) and, when the phase has an expected text, score
+    pronunciation deterministically. Recordings are never persisted."""
+    result = await db.execute(
+        select(Assessment).where(
+            Assessment.id == assessment_id,
+            Assessment.user_id == current_user.id,
+            Assessment.completed_at.is_(None),
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+
+    audio, too_large = await _read_limited(file, _MAX_RECORDING_BYTES)
+    if too_large:
+        raise HTTPException(status_code=413, detail="Recording too large (max 10MB)")
+    if not audio:
+        raise HTTPException(status_code=400, detail="Empty recording")
+
+    content_type = file.content_type or "audio/webm"
+    stt = await transcribe_audio(audio, content_type)
+
+    expected = expected_text_for(assessment.phase, assessment.section_step)
+    metrics = None
+    if expected and stt["text"].strip():
+        metrics = await score_pronunciation_async(expected, stt["text"], stt["words"])
+    return RecordingResponse(transcript=stt["text"], words=stt["words"], metrics=metrics)
 
 
 @router.post("/{assessment_id}/message", response_model=AssessmentResponse)
@@ -232,205 +310,22 @@ async def assessment_message(
     if assessment.completed_at:
         raise HTTPException(status_code=400, detail="Assessment already completed")
 
-    user_msg = AssessmentMessage(assessment_id=assessment.id, role="user", text=body.text)
-    db.add(user_msg)
-    await db.flush()
-
-    # Load previous messages — id as a tiebreaker because created_at uses
-    # func.now() (the transaction timestamp), so the user message and the
-    # assistant reply inserted in the same request can share a timestamp.
-    msg_result = await db.execute(
-        select(AssessmentMessage)
-        .where(AssessmentMessage.assessment_id == assessment_id)
-        .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
-    )
-    messages = msg_result.scalars().all()
-
-    messages_for_llm = [{"role": m.role, "content": m.text} for m in messages]
-
-    # Assistant messages map 1:1 to questions asked — the greeting message
-    # embeds question 1 (see ASSESSMENT_SYSTEM_PROMPT rules 1-2), so the
-    # count below is exact and the 10-question cap is enforced server-side.
-    questions_asked = sum(1 for m in messages if m.role == "assistant")
-
-    # Server-side completion triggers: the 10-question cap, or the student
-    # explicitly asking to finish. Both mean there is nothing left to ask, so
-    # short-circuit before the LLM round-trip and go straight to the closing.
-    server_complete = questions_asked >= MAX_ASSESSMENT_EXCHANGES or _wants_to_finish(body.text)
-
-    parsed = None
-    if not server_complete:
-        tutor_profile = await get_tutor_profile_dict(db, current_user.id) or {"name": "Sarah", "personality": "friendly"}
-        persona = build_tutor_persona(tutor_profile)
-
-        prompt = f"{persona}\n\n{ASSESSMENT_SYSTEM_PROMPT}\n\nYou have asked {questions_asked} questions so far. The maximum is {MAX_ASSESSMENT_EXCHANGES}. Return is_complete=true if you have reached the maximum or if the student wants to finish."
-
-        llm = LLMRouter(db, current_user.id)
-        for attempt in range(3):
-            try:
-                result = await llm.complete_with_fallback(
-                    messages=messages_for_llm,
-                    system_prompt=prompt,
-                    task="assessment",
-                    temperature=0.7,
-                    max_tokens=500,
-                )
-                candidate = parse_llm_json(result["content"])
-                if candidate.get("reply", "").strip():
-                    parsed = candidate
-                    break
-                logger.warning(f"Assessment LLM returned empty reply (attempt {attempt + 1}/3)")
-            except Exception as e:
-                logger.error(f"Assessment message attempt {attempt + 1} failed: {e}")
-    else:
-        parsed = {
-            "reply": "Thank you so much for the chat! Let's see your results now.",
-            "question_count": questions_asked,
-            "is_complete": True,
-        }
-
-    if not parsed:
-        # LLM failed and this isn't a server-forced stop — can't continue the
-        # conversation, so fall back to the closing message.
-        parsed = {"reply": "Thank you! That was a great chat. We'll look at your results now.", "question_count": questions_asked, "is_complete": True}
-
-    # When the model wraps up on its own it is instructed to close with the
-    # "results now" line — keep its actual farewell instead of overwriting it.
-    # Only server-forced stops (and the fallback above) guarantee that text.
-    is_complete = server_complete or bool(parsed.get("is_complete"))
-
-    assistant_msg = AssessmentMessage(
-        assessment_id=assessment.id,
-        role="assistant",
-        text=parsed.get("reply", ""),
-    )
-    db.add(assistant_msg)
-    await db.flush()
-
-    assessment = await _get_assessment_with_messages(db, assessment.id)
-    response = AssessmentResponse.model_validate(assessment)
-    response.is_complete = is_complete
-    return response
-
-
-async def _analyze_assessment(db: AsyncSession, current_user: User, assessment: Assessment) -> None:
-    """Run the LLM analysis over the assessment conversation and persist the
-    results (level, confidence, strengths, weaknesses, recommendations, summary).
-    Shared by POST /{id}/complete and POST /{id}/reanalyze."""
-    msg_result = await db.execute(
-        select(AssessmentMessage)
-        .where(AssessmentMessage.assessment_id == assessment.id)
-        .order_by(AssessmentMessage.created_at, AssessmentMessage.id)
-    )
-    messages = msg_result.scalars().all()
-
-    if len(messages) < 2:
-        raise HTTPException(status_code=400, detail="Assessment has too few messages to evaluate")
-
-    conversation_text = "\n".join(f"{m.role.upper()}: {m.text}" for m in messages)
-
-    llm = LLMRouter(db, current_user.id)
-    raw_analysis = ""
-    analysis_result = None
-    # Retry up to 3 times when the model returns empty content — smaller/flash
-    # models occasionally produce blank responses for structured prompts.
-    for attempt in range(3):
-        try:
-            analysis_result = await llm.complete_with_fallback(
-                messages=[{"role": "user", "content": f"{ASSESSMENT_ANALYSIS_PROMPT}\n\nCONVERSATION:\n{conversation_text}"}],
-                system_prompt="You are a CEFR assessor. Analyze the conversation and return valid JSON only.",
-                task="assessment",
-                temperature=0.3,
-                max_tokens=2048,
-            )
-        except Exception as e:
-            logger.error(f"Assessment analysis LLM call attempt {attempt + 1}/3 failed for assessment {assessment.id}: {e}")
-            if attempt < 2:
-                continue
-            raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
-
-        raw_analysis = analysis_result.get("content", "")
-        logger.info(
-            f"Assessment analysis raw response for assessment {assessment.id} "
-            f"(provider={analysis_result.get('provider', 'unknown')}, model={analysis_result.get('model', 'unknown')}, "
-            f"attempt={attempt + 1}/3, length={len(raw_analysis)}): {raw_analysis[:1500]}"
-        )
-        if raw_analysis.strip():
-            break
-        logger.warning(f"Assessment analysis LLM returned empty content (attempt {attempt + 1}/3)")
-
-    if not raw_analysis.strip():
-        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
-
     try:
-        parsed = parse_llm_json(raw_analysis)
-    except Exception as e:
-        logger.error(f"Assessment analysis JSON parsing failed for assessment {assessment.id}: {e}")
-        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
-
-    # The parsed shape must actually look like an analysis — the legacy
-    # conversational fallback ({"reply": ...}) would otherwise silently save
-    # empty result cards (blank summary/strengths/weaknesses).
-    if not (parsed.get("estimated_level") or parsed.get("summary")):
-        logger.error(
-            f"Assessment analysis for assessment {assessment.id} returned an unexpected shape: "
-            f"keys={list(parsed.keys())}, raw={raw_analysis[:500]}"
+        assessment, is_complete = await handle_message(
+            db,
+            current_user,
+            assessment,
+            text=body.text,
+            source=body.source,
+            words=body.words,
+            item_id=body.item_id,
         )
-        raise HTTPException(status_code=503, detail="Failed to analyze the assessment. Please try again.")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    logger.info(
-        f"Assessment analysis parsed for assessment {assessment.id}: "
-        f"keys={list(parsed.keys())}, estimated_level={parsed.get('estimated_level')}, "
-        f"confidence={parsed.get('confidence')}"
-    )
-
-    raw_level = str(parsed.get("estimated_level") or "").strip().upper()
-    if raw_level not in _CEFR_LEVELS:
-        # LLM returned null/garbage — fall back to the user's preferred CEFR
-        # level (from settings) so we don't demote them or crash on the NOT
-        # NULL VARCHAR(2) column.
-        cefr_setting = await db.execute(
-            select(Setting).where(Setting.user_id == current_user.id, Setting.key == "default_cefr")
-        )
-        preferred = cefr_setting.scalar_one_or_none()
-        preferred_level = (preferred.value or "").strip().upper() if preferred else ""
-        raw_level = (
-            preferred_level
-            if preferred_level in _CEFR_LEVELS
-            else current_user.current_level
-            if current_user.current_level in _CEFR_LEVELS
-            else "A1"
-        )
-        logger.warning(
-            f"Assessment {assessment.id} returned invalid level '{parsed.get('estimated_level')}', "
-            f"falling back to {raw_level}"
-        )
-    assessment.estimated_level = raw_level
-    try:
-        confidence = float(parsed.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        confidence = 0.5
-    assessment.confidence = min(1.0, max(0.0, confidence))
-    # Coerce double-encoded strings back to lists — the LLM occasionally
-    # wraps an array in a JSON string, which would otherwise double-encode
-    # and render as [] in the response.
-    assessment.strengths = _coerce_json_list(parsed.get("strengths"))
-    assessment.weaknesses = _coerce_json_list(parsed.get("weaknesses"))
-    assessment.recommendations = _coerce_json_list(parsed.get("recommendations"))
-    assessment.summary = parsed.get("summary", "")
-
-    # Update user level and mark assessment completed
-    current_user.current_level = assessment.estimated_level
-    current_user.assessment_completed = True
-
-    await db.flush()
-
-    logger.info(
-        f"Assessment {assessment.id} analysis persisted for user {current_user.id}: "
-        f"level={assessment.estimated_level}, confidence={assessment.confidence}, "
-        f"strengths={len(json.loads(assessment.strengths or '[]'))}, "
-        f"weaknesses={len(json.loads(assessment.weaknesses or '[]'))}"
-    )
+    resp = AssessmentResponse.model_validate(assessment)
+    resp.is_complete = is_complete
+    return resp
 
 
 @router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
@@ -449,14 +344,28 @@ async def complete_assessment(
         # Idempotent re-complete: return the stored result. Must re-select with
         # eager loading — serializing the bare ORM object would lazy-load
         # `messages` outside the greenlet (MissingGreenlet → 500).
-        return await _get_assessment_with_messages(db, assessment.id)
+        return await reload_assessment(db, assessment.id)
 
-    await _analyze_assessment(db, current_user, assessment)
+    # Evidence integrity: an assessment that never left the mic check has no
+    # measured evidence at all. Reject /complete so a bare start→complete can't
+    # lock in a default level from an empty analysis.
+    if assessment.phase == PHASE_MIC_CHECK:
+        raise HTTPException(
+            status_code=400,
+            detail="Answer the mic check before finishing the assessment",
+        )
+
+    try:
+        await analyze_assessment(db, current_user, assessment)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     assessment.completed_at = datetime.now(timezone.utc)
     await db.flush()
 
-    return await _get_assessment_with_messages(db, assessment.id)
+    return await reload_assessment(db, assessment.id)
 
 
 @router.post("/{assessment_id}/reanalyze", response_model=AssessmentResponse)
@@ -468,6 +377,11 @@ async def reanalyze_assessment(
     # Each reanalyze triggers up to 3 LLM calls — throttle repeat clicks.
     # Per-process guard (single-worker deployments), not a distributed limit.
     now = datetime.now(timezone.utc)
+    # Bound the guard so a long-lived process doesn't grow it unbounded (one
+    # entry per assessment id, otherwise never evicted).
+    if len(_reanalyze_last) > 256:
+        cutoff = now - _REANALYZE_COOLDOWN
+        _reanalyze_last = {k: v for k, v in _reanalyze_last.items() if v >= cutoff}
     last = _reanalyze_last.get(assessment_id)
     if last and (now - last) < _REANALYZE_COOLDOWN:
         raise HTTPException(status_code=429, detail="Please wait a moment before re-analyzing again")
@@ -485,6 +399,11 @@ async def reanalyze_assessment(
     # Re-run the LLM analysis over the stored conversation — refreshes the
     # summary/strengths/weaknesses/recommendations (and estimated level) in
     # place, e.g. when the original analysis saved empty results.
-    await _analyze_assessment(db, current_user, assessment)
+    try:
+        await analyze_assessment(db, current_user, assessment)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
-    return await _get_assessment_with_messages(db, assessment.id)
+    return await reload_assessment(db, assessment.id)

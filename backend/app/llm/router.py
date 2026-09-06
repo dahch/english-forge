@@ -77,28 +77,52 @@ class LLMRouter:
 
         last_error: Exception | None = None
         for provider in self._providers:
-            try:
-                result = await provider.complete(
-                    messages=messages,
-                    system_prompt=system_prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                if not result.get("content"):
-                    # 200 with empty content (reasoning models can burn the
-                    # token budget on thinking, or return text only in
-                    # reasoning_content). Fail loudly so the next provider is
-                    # tried instead of persisting blank output.
-                    raise ValueError(
-                        f"Provider {provider.provider_name} returned empty content"
+            # Reasoning models can burn the whole token budget on thinking and
+            # return HTTP 200 with empty content (usually finish_reason=
+            # "length"). One retry with a bigger budget usually recovers the
+            # real answer before the next provider is tried.
+            budget = max_tokens
+            for attempt in range(2):
+                try:
+                    result = await provider.complete(
+                        messages=messages,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_tokens=budget,
                     )
-                result["provider"] = provider.provider_name
-                result["model"] = provider.model_name
-                return result
-            except Exception as e:
-                logger.warning(f"Provider {provider.provider_name} failed: {e}")
-                last_error = e
-                continue
+                except Exception as e:
+                    logger.warning(f"Provider {provider.provider_name} failed: {e}")
+                    last_error = e
+                    break
+
+                if result.get("content"):
+                    result["provider"] = provider.provider_name
+                    result["model"] = provider.model_name
+                    return result
+
+                # Empty content with finish_reason="length" means a reasoning
+                # model burned the whole budget on thinking before writing the
+                # answer — one retry with a bigger budget usually recovers it.
+                # Any OTHER empty content won't be fixed by more tokens, so it
+                # fails the provider immediately (no wasted spend before the
+                # next provider is tried).
+                if attempt == 0 and result.get("finish_reason") == "length":
+                    budget = max(budget * 4, 4096)
+                    logger.warning(
+                        f"Provider {provider.provider_name} returned empty content "
+                        f"(finish_reason=length) — retrying with max_tokens={budget}"
+                    )
+                    continue
+
+                # Empty content that wasn't a length-limit (or still empty after
+                # the budget bump) — fail loudly so the next provider is tried
+                # instead of persisting blank output.
+                last_error = ValueError(
+                    f"Provider {provider.provider_name} returned empty content "
+                    f"(finish_reason={result.get('finish_reason')})"
+                )
+                logger.warning(f"Provider {provider.provider_name} failed: {last_error}")
+                break
 
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 

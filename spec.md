@@ -52,6 +52,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 
 - Generación de mini-lecciones de gramática/vocabulario bajo demanda por el LLM, basadas en los errores recurrentes del usuario ("veo que confundes present perfect vs past simple, aquí tienes una lección corta + 5 ejercicios").
 - Biblioteca local de lecciones fijas para temas base (tiempos verbales, phrasal verbs, preposiciones, etc.) como fallback sin necesitar LLM.
+- Las lecciones del **learning path** se abren como lecciones interactivas: el contenido (explicación, ejemplos y 3–5 ejercicios de completar/opción múltiple) se genera bajo demanda en la primera apertura — personalizado con las debilidades medidas del assessment — y los ejercicios se corrigen en el servidor (las respuestas correctas nunca viajan al frontend).
 
 ### 2.5 Progreso y gamificación
 
@@ -61,8 +62,8 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 
 ### 2.6 Pronunciación
 
-- Comparación fonética aproximada: se usa la confianza/alineamiento de Whisper + comparación de la transcripción esperada vs. obtenida como proxy de pronunciación (no hay modelo dedicado de scoring fonético, se documenta como limitación).
-- Opción de "repetir esta frase" con feedback de similitud.
+- Puntuación de lectura en voz alta (sección *speaking* del assessment) con métricas objetivas (`app/services/pronunciation.py`): WER de palabras + tasa de error fonémica (PER vía phonemizer/espeak-ng — sin espeak-ng se degrada a solo WER) + fluidez a partir de los word timestamps de Moonshine (compuesto 60/25/15). No hay modelo comercial dedicado de scoring fonético; el PER fonémico sobre la transcripción STT es la aproximación.
+- Cada ítem de *speaking* anuncia el punto fonético a practicar ("Focus: …") junto a la frase.
 
 ### 2.7 Fuera de alcance (explícitamente simplificado)
 
@@ -169,7 +170,7 @@ GET {PERSONAL_API_URL}/v1/jobs/{job_id}
 El `result` final, cuando `status == "finished"`, trae `{"audio_base64": "..."}` (o `{"error": "..."}` si Pocket devolvió JSON de error con status 200 — hay que revisarlo, no basta con el status HTTP).
 
 **Adaptador `TTSProvider` para EnglishForge** (`backend/app/integrations/tts_personal_api.py`):
-1. `POST /v1/speak` con `{text, voice}` → obtiene `job_id`.
+1. `POST /v1/speak` con `{text, voice, model}` → obtiene `job_id` (`model` fija el modelo de Pocket TTS — `TTS_MODEL`, por defecto `english_2026-04_24l`, ya que personal-api usa por defecto un modelo español; los ids desconocidos se ignoran).
 2. Poll a `GET /v1/jobs/{job_id}` cada ~500ms hasta `finished`/`failed`, con timeout total configurable (ej. 30s) — es un patrón **asíncrono por colas**, no una llamada síncrona directa, así que hay que diseñar la UI para mostrar "generando audio…" mientras se espera.
 3. Decodificar `audio_base64` → bytes → servir al frontend.
 
@@ -177,6 +178,7 @@ Config:
 ```
 PERSONAL_API_URL=http://personal-api:8000     # nombre de servicio en la red docker "coolify", NO 127.0.0.1:8003
 TTS_DEFAULT_VOICE=alba                          # una de las 8 voces builtin sin auth
+TTS_MODEL=english_2026-04_24l                   # modelo inglés de Pocket TTS, fijado en cada /v1/speak
 TTS_JOB_POLL_INTERVAL_MS=500
 TTS_JOB_TIMEOUT_SECONDS=30
 ```
@@ -193,13 +195,13 @@ Tu stack ya incluye un worker STT (`worker-stt`, cola `stt-jobs`) que llama a Mo
 
 1. **Vía tu `personal-api` + Moonshine** (mismo patrón de colas que TTS): el frontend graba el audio, lo manda al backend de EnglishForge, y este reenvía el archivo tal cual a `personal-api`. Contrato real confirmado:
    ```
-   POST {PERSONAL_API_URL}/v1/transcribe   multipart/form-data, campo "audio" (archivo)
+   POST {PERSONAL_API_URL}/v1/transcribe   multipart/form-data, campo "audio" (archivo) + campo "language" (STT_LANGUAGE, "en")
    → 200 {"job_id": "...", "status": "queued"}
 
    GET {PERSONAL_API_URL}/v1/jobs/{job_id}
-   → {"job_id": "...", "status": "queued|started|finished|failed", "result": {"text": "..."} }
+   → {"job_id": "...", "status": "queued|started|finished|failed", "result": {"text": "...", "words": [...] } }
    ```
-   `personal-api` es quien codifica el audio a base64 internamente antes de encolarlo — EnglishForge solo tiene que mandar el archivo de audio por multipart, igual que un `<input type="file">`, no un JSON con base64.
+   `personal-api` es quien codifica el audio a base64 internamente antes de encolarlo — EnglishForge solo tiene que mandar el archivo de audio por multipart, igual que un `<input type="file">`, no un JSON con base64. El campo `language=en` es lo que desbloquea los word timestamps reales de Moonshine para inglés (insumo de las métricas de fluidez); los servidores de personal-api antiguos ignoran ambos campos.
    - **Dato de capacidad real de tu homelab** (de los comentarios del propio `worker_stt.py`): Moonshine satura ~6 de 6 cores con solo 5 peticiones concurrentes, por eso `worker-stt` corre con una sola réplica. Esto refuerza la decisión de más abajo: no conviene depender de este modo para el turno conversacional en vivo (además de la latencia del polling, compite por el único worker con cualquier otra transcripción que esté corriendo en el homelab en ese momento).
 2. **Nativo del navegador/móvil** (`Web Speech API`): cero infraestructura, gratis, mejor latencia (no depende de colas), calidad variable según navegador.
 3. **Whisper embebido en cliente** (`whisper.cpp` WASM, modelo `tiny`/`base`): 100% offline en el navegador, útil si en algún momento no tienes el homelab accesible (fuera de la LAN/VPN).
@@ -242,10 +244,10 @@ settings(id, user_id, key, value, UNIQUE (key, user_id))
 tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, updated_at)
 
 -- assessments table (no created_at — ordering uses started_at + id)
-assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary)
+assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, phase, section_step, dimension_scores)
 
 -- assessment_messages table
-assessment_messages(id, assessment_id, role, text, created_at)
+assessment_messages(id, assessment_id, role, text, kind, audio_url, metrics, item_id, created_at)
 
 -- generated_lessons table
 generated_lessons(id, user_id, title, topic, level, explanation, examples, exercises, based_on_errors, completed, completed_at, created_at)
@@ -264,7 +266,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 
 > **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
-> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto (`{focus, lesson_type}`) mediante un `field_validator` y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path.
+> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path. El objeto arranca como metadatos (`{focus, lesson_type}`); `explanation`, `examples` y `exercises` se generan bajo demanda (lazy, idempotente) la primera vez que se abre la lección (`POST /api/learning-paths/{path_id}/lessons/{lesson_id}/generate`), y cada ejercicio se corrige en el servidor (`POST .../exercise`) — las respuestas correctas nunca se exponen al listado, solo vía el endpoint de corrección.
 
 ---
 
@@ -277,8 +279,10 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 5. `reply` se manda a `personal-api` (`POST /v1/speak`) → se hace poll a `/v1/jobs/{job_id}` hasta tener el audio → se reproduce (la UI muestra un estado breve "generando audio…" mientras espera).
 6. `corrections` y `new_vocab` se guardan y se muestran de forma no intrusiva (bubble discreta, sin interrumpir el audio).
 7. Al finalizar sesión: resumen, nuevas tarjetas SRS creadas automáticamente, actualización de progreso/racha.
-8. **Señal `is_complete`**: tras cada mensaje del usuario, el backend marca la evaluación como completa si (a) el **servidor** detecta el fin — se alcanzó el tope de 10 preguntas (`MAX_ASSESSMENT_EXCHANGES`) o `_wants_to_finish()` reconoce una petición de cierre en un enunciado corto — o (b) el LLM incluye `is_complete: true` en su respuesta JSON. Cuando `is_complete` llega `true` en la respuesta, el cliente debe llamar a `POST /api/assessment/{id}/complete`, que ejecuta el análisis final con reintento de hasta 3 intentos del LLM. El campo `is_complete` se añade transitoriamente a `AssessmentResponse` (por defecto `False` para endpoints que no lo computan).
-9. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen — útil si el análisis original guardó resultados vacíos o degradados). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire) y devuelve HTTP 503 si la salida del LLM no tiene la forma esperada de un análisis (la forma conversacional de fallback se rechaza en vez de persistir tarjetas vacías).
+8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`, máquina de estados en `app/services/assessment_flow.py`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
+9. **Puntuación determinista**: el nivel final y la confianza **ya no los decide el LLM**. `listening` se puntúa por aciertos en los ítems (grading LLM por ítem con fallback por keywords), `pronunciation` con métricas objetivas por grabación (WER de palabras + PER fonémico vía phonemizer/espeak-ng + fluidez desde word timestamps de Moonshine; compuesto 60/25/15), y `grammar`/`vocabulary`/`fluency` con rúbrica LLM 0-100 sobre la transcripción. La agregación (`app/services/assessment_scoring.py`) mapea cada dimensión a banda CEFR (0-20 A1 … 86-100 C2), toma la mediana conservadora como nivel final y calcula la confianza a partir de cobertura de dimensiones, volumen de evidencia y dispersión. Strengths/weaknesses son etiquetas derivadas de dimensiones medidas — el LLM solo escribe resumen y recomendaciones, y nunca puede afirmar dimensiones sin evidencia.
+10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire). Si el LLM falla o devuelve una forma inesperada, el análisis se completa con un fallback determinista construido desde la evidencia medida (nivel + scores de listening/pronunciation; grammar/vocabulary/fluency quedan sin medir) en lugar de fallar la petición — «Re-analyze Results» reintenta el LLM más tarde.
+11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación — descartando además los timestamps que no se corresponden con el transcript, de modo que la fluidez no se puede fabricar — y descarta envíos duplicados/desactualizados de forma atómica vía el índice único parcial sobre `(assessment_id, item_id)` (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -346,6 +350,12 @@ english-forge/
 │   │   │   ├── stt_personal_api.py    # idem, contra la cola stt-jobs / Moonshine
 │   │   │   ├── stt_whisper_server.py  # faster-whisper local, alternativa sin depender de colas
 │   │   │   └── crypto.py              # cifrado Fernet de API keys
+│   │   ├── services/
+│   │   │   ├── assessment_flow.py     # máquina de estados de fases del assessment + análisis
+│   │   │   ├── assessment_bank.py     # bancos de ítems listening/speaking
+│   │   │   ├── assessment_scoring.py  # agregación determinista CEFR
+│   │   │   ├── pronunciation.py       # WER + PER fonémico + fluidez
+│   │   │   └── stt.py                 # STT compartido (semáforo global + fallback whisper)
 │   │   ├── models/
 │   │   │   └── models.py            # User, TutorProfile, Scenario, Session, Message, Correction, VocabItem, Assessment, AssessmentMessage, GeneratedLesson, LearningPath, PathLesson, ProgressDaily, Setting, ProviderConfig
 │   │   ├── schemas/                 # auth, session, vocab, settings
@@ -354,7 +364,7 @@ english-forge/
 │   │   └── srs/
 │   │       └── sm2.py               # motor de repetición espaciada SM-2
 │   ├── alembic/                     # migraciones completas (opcional)
-│   ├── tests/                       # pytest: llm router, lecciones, assessment, learning paths
+│   ├── tests/                       # pytest: llm router, lecciones, assessment (lógica, flujo de fases, scoring), pronunciación, learning paths
 │   └── requirements.txt
 └── scripts/
     └── clear_user_data.py
@@ -379,8 +389,8 @@ english-forge/
 **Phase 4 — Progreso y lecciones** ✅
 - Dashboard, streaks, estimación CEFR heurística.
 - Generación de mini-lecciones basadas en errores recurrentes (CRUD de lecciones generadas, endpoint `/api/lessons/generate`).
-- Learning paths con progression automática.
-- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005).
+- Learning paths con progresión automática y lecciones interactivas cuyo contenido se genera bajo demanda (lazy) con corrección server-side.
+- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005/014).
 
 **Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).

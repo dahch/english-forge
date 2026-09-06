@@ -231,8 +231,13 @@ export default function ConversationPage() {
     }
     audioRef.current = audio
     setPlayingAudioId(msgId)
-    audio.play().catch(() => {
+    audio.play().catch((err: unknown) => {
       setPlayingAudioId(null)
+      // Autoplay policy: play() right after the awaited send can outlive the
+      // click's transient activation (NotAllowedError) — especially on the
+      // first message while TTS warms up. The per-message play button works
+      // with a fresh gesture, so no error banner for that case.
+      if (err instanceof DOMException && err.name === "NotAllowedError") return
       setError("Could not play audio")
     })
   }

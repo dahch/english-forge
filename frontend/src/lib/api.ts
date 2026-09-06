@@ -6,9 +6,11 @@ import type {
   GeneratedLesson,
   LearningPath,
   Message,
+  PathLessonDetail,
   ProviderConfig,
   QuizQuestion,
   QuizResult,
+  RecordingResult,
   Scenario,
   Session,
   SessionSummary,
@@ -76,8 +78,11 @@ function handleUnauthorized(): never {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
+  // FormData bodies must not carry a JSON Content-Type — the browser sets
+  // its own multipart boundary header.
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...((options.headers as Record<string, string>) || {}),
   }
   if (token) {
@@ -100,6 +105,25 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (res.status === 204) return undefined as T
   return res.json()
+}
+
+// Fetch a non-JSON resource (e.g. an audio blob) with the same auth header,
+// API base prefix and 401 handling as `request`. Used by the assessment audio
+// player, which needs the raw bytes rather than a parsed JSON body.
+export async function fetchBlob(path: string): Promise<Blob> {
+  const token = getToken()
+  const headers: Record<string, string> = {}
+  if (token) headers["Authorization"] = `Bearer ${token}`
+
+  const res = await fetch(`${API_BASE}${path}`, { headers })
+
+  if (res.status === 401) {
+    return handleUnauthorized()
+  }
+  if (!res.ok) {
+    throw new ApiError(res.statusText || "Request failed", res.status)
+  }
+  return res.blob()
 }
 
 export interface LessonExercise {
@@ -198,7 +222,9 @@ export const api = {
         body: JSON.stringify({ quality }),
       }),
     due: (limit: number = 20) => request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
-    generateQuiz: (count: number = 5) => request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
+    // Backend route is POST (GET would 405) with count as a query param.
+    generateQuiz: (count: number = 5) =>
+      request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`, { method: "POST" }),
     checkQuiz: (vocab_item_id: string, answer: string) =>
       request<QuizResult>("/api/vocab/quiz/check", {
         method: "POST",
@@ -231,11 +257,24 @@ export const api = {
   assessment: {
     current: () => request<Assessment>("/api/assessment/current"),
     start: () => request<Assessment>("/api/assessment/start", { method: "POST" }),
-    send: (id: string, text: string) =>
+    // words = STT word timestamps echoed from uploadRecording; item_id = the
+    // banked item this answer addresses. The backend recomputes pronunciation
+    // metrics itself and never trusts client scores.
+    send: (id: string, text: string, source: "text" | "voice" = "text", words?: { word: string; start: number; end: number }[] | null, itemId?: string | null) =>
       request<Assessment>(`/api/assessment/${id}/message`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, source, words: words ?? null, item_id: itemId ?? null }),
       }),
+    // Upload a recording for STT (Moonshine/whisper) and, when the phase has
+    // an expected text, pronunciation scoring.
+    uploadRecording: (id: string, blob: Blob) => {
+      const form = new FormData()
+      form.append("file", blob, "answer.webm")
+      return request<RecordingResult>(`/api/assessment/${id}/recordings`, {
+        method: "POST",
+        body: form,
+      })
+    },
     complete: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
     reanalyze: (id: string) =>
@@ -248,6 +287,17 @@ export const api = {
       request<LearningPath>("/api/learning-paths/generate", {
         method: "POST",
         body: JSON.stringify(assessmentId ? { assessment_id: assessmentId } : {}),
+      }),
+    // Lazy, idempotent: returns the lesson with its interactive content,
+    // generating explanation/examples/exercises on first open.
+    lessonDetail: (pathId: string, lessonId: string) =>
+      request<PathLessonDetail>(`/api/learning-paths/${pathId}/lessons/${lessonId}/generate`, {
+        method: "POST",
+      }),
+    checkLessonExercise: (pathId: string, lessonId: string, exerciseIndex: number, answer: string) =>
+      request<ExerciseCheckResult>(`/api/learning-paths/${pathId}/lessons/${lessonId}/exercise`, {
+        method: "POST",
+        body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
       }),
     completeLesson: (pathId: string, lessonId: string, completed: boolean = true) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, {

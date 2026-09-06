@@ -64,6 +64,28 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     "progress_daily": [
         ("lessons_completed", "INTEGER NOT NULL DEFAULT 0"),
     ],
+    # Assessment v2: multi-skill sections (audio listening + pronunciation).
+    # Legacy rows (pre-v2) map to 'conversation' — they were pure chat.
+    "assessments": [
+        ("phase", "VARCHAR(20) NOT NULL DEFAULT 'conversation'"),
+        ("section_step", "INTEGER NOT NULL DEFAULT 0"),
+        ("dimension_scores", "TEXT"),
+    ],
+    "assessment_messages": [
+        ("kind", "VARCHAR(20) NOT NULL DEFAULT 'chat'"),
+        ("audio_url", "TEXT"),
+        ("metrics", "TEXT"),
+        # item_id backs the uq_assessment_messages_user_item unique index
+        # (one answer per banked item, enforced atomically).
+        ("item_id", "VARCHAR(36)"),
+    ],
+    # NOTE: assessment_messages.created_at is not listed here — its default
+    # changed from SQLite func.now() (second precision, server-side) to a
+    # client-side microsecond default in the model. The column type is
+    # unchanged, so no DDL is needed; legacy rows keep server timestamps while
+    # new rows get microsecond precision. (created_at, id) ordering works for
+    # both — the microsecond default just removes the random-UUID tiebreak
+    # for same-second inserts.
 }
 
 
@@ -128,6 +150,17 @@ _INDEXES_TO_ADD: list[tuple[str, str, str]] = [
         "learning_paths",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_learning_paths_user_active "
         "ON learning_paths (user_id) WHERE is_active",
+    ),
+    # One answer per banked item per assessment (user answers only). Makes the
+    # stale/duplicate guard in the listening/speaking handlers atomic: two
+    # concurrent /message calls for the same item can't both insert — the loser
+    # hits IntegrityError and is dropped. See _handle_listening/_handle_speaking.
+    (
+        "uq_assessment_messages_user_item",
+        "assessment_messages",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessment_messages_user_item "
+        "ON assessment_messages (assessment_id, item_id) "
+        "WHERE role = 'user' AND item_id IS NOT NULL",
     ),
 ]
 

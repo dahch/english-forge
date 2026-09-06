@@ -1,6 +1,7 @@
 import pytest
 
-from app.llm.router import _extract_balanced_objects, _repair_json, _strip_code_fences, parse_lesson_json, parse_llm_json
+from app.llm.openai_compatible import _extract_content
+from app.llm.router import LLMRouter, _extract_balanced_objects, _repair_json, _strip_code_fences, parse_lesson_json, parse_llm_json
 
 
 class TestParseLessonJson:
@@ -137,3 +138,127 @@ class TestParseLlmJson:
     def test_always_returns_dict(self):
         for content in ('{"a": 1}', '[1, 2]', 'prose only', ''):
             assert isinstance(parse_llm_json(content), dict)
+
+
+class TestExtractContent:
+    def test_content_present(self):
+        data = {"choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}], "usage": {}}
+        content, finish = _extract_content(data, "test-provider")
+        assert content == "hi"
+        assert finish == "stop"
+
+    def test_reasoning_content_never_used_as_content(self):
+        # Reasoning models return their chain-of-thought in reasoning_content
+        # when the budget ran out. It must NOT leak as content — the router
+        # retries with a bigger budget instead.
+        data = {
+            "choices": [{
+                "message": {"role": "assistant", "content": None, "reasoning_content": '{"correct": true}'},
+                "finish_reason": "length",
+            }],
+            "usage": {"completion_tokens": 200},
+        }
+        content, finish = _extract_content(data, "test-provider")
+        assert content is None
+        assert finish == "length"
+
+    def test_empty_content_stays_empty(self):
+        data = {"choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "length"}], "usage": {}}
+        content, finish = _extract_content(data, "test-provider")
+        assert content is None
+        assert finish == "length"
+
+    def test_blank_reasoning_content_ignored(self):
+        data = {"choices": [{"message": {"content": "", "reasoning_content": "   "}, "finish_reason": "stop"}], "usage": {}}
+        content, _ = _extract_content(data, "test-provider")
+        assert content == ""
+
+    def test_missing_choices(self):
+        content, finish = _extract_content({}, "test-provider")
+        assert content is None
+        assert finish is None
+
+
+class _ScriptedProvider:
+    """ChatProvider stub returning queued results (or raising) per call, and
+    recording the max_tokens budget of each request."""
+
+    def __init__(self, results, name: str = "scripted"):
+        self._results = list(results)
+        self._name = name
+        self.calls: list[int] = []
+
+    @property
+    def provider_name(self) -> str:
+        return self._name
+
+    @property
+    def model_name(self) -> str:
+        return "test-model"
+
+    async def complete(self, messages, system_prompt, *, temperature=0.7, max_tokens=2048, response_format=None):
+        self.calls.append(max_tokens)
+        outcome = self._results.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class TestCompleteWithFallback:
+    @pytest.mark.asyncio
+    async def test_retries_with_bigger_budget_on_length(self):
+        # Reasoning model burns the budget thinking → empty content with
+        # finish_reason="length". The router retries the same provider once
+        # with a larger budget before moving on.
+        provider = _ScriptedProvider([
+            {"content": None, "finish_reason": "length", "usage": {}},
+            {"content": '{"ok": true}', "finish_reason": "stop", "usage": {}},
+        ])
+        router = LLMRouter(None, "user")
+        router._providers = [provider]
+
+        result = await router.complete_with_fallback(messages=[], system_prompt="s", max_tokens=200)
+        assert result["content"] == '{"ok": true}'
+        assert result["provider"] == "scripted"
+        assert provider.calls == [200, 4096]
+
+    @pytest.mark.asyncio
+    async def test_empty_content_without_length_moves_on_without_retry(self):
+        # Empty content with a non-length finish_reason means the provider
+        # produced nothing — more tokens won't help, so it's failed after a
+        # single call (no budget bump) and the next provider is tried.
+        failing = _ScriptedProvider([
+            {"content": None, "finish_reason": "stop", "usage": {}},
+        ], name="failing")
+        ok = _ScriptedProvider([{"content": "fine", "finish_reason": "stop", "usage": {}}], name="ok")
+        router = LLMRouter(None, "user")
+        router._providers = [failing, ok]
+
+        result = await router.complete_with_fallback(messages=[], system_prompt="s")
+        assert result["content"] == "fine"
+        assert result["provider"] == "ok"
+        # Failing provider was called once, at the default budget, no retry.
+        assert failing.calls == [2048]
+
+    @pytest.mark.asyncio
+    async def test_retry_exhausted_moves_to_next_provider(self):
+        first = _ScriptedProvider([
+            {"content": None, "finish_reason": "length", "usage": {}},
+            {"content": None, "finish_reason": "length", "usage": {}},
+        ], name="first")
+        second = _ScriptedProvider([{"content": "ok", "finish_reason": "stop", "usage": {}}], name="second")
+        router = LLMRouter(None, "user")
+        router._providers = [first, second]
+
+        result = await router.complete_with_fallback(messages=[], system_prompt="s", max_tokens=200)
+        assert result["provider"] == "second"
+        assert first.calls == [200, 4096]
+
+    @pytest.mark.asyncio
+    async def test_all_providers_failing_raises(self):
+        provider = _ScriptedProvider([{"content": None, "finish_reason": "stop", "usage": {}}], name="only")
+        router = LLMRouter(None, "user")
+        router._providers = [provider]
+
+        with pytest.raises(RuntimeError, match="All providers failed"):
+            await router.complete_with_fallback(messages=[], system_prompt="s")

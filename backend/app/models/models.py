@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from sqlalchemy import (
     Boolean,
@@ -155,6 +155,20 @@ class Assessment(Base):
     weaknesses: Mapped[str | None] = mapped_column(Text, nullable=True)
     recommendations: Mapped[str | None] = mapped_column(Text, nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Multi-skill assessment sections: mic_check → conversation → listening →
+    # speaking → (completed). The phase advances server-side as items are
+    # answered; the client renders the matching UI for each phase. Defaults to
+    # "conversation" so legacy rows (pre-v2) behave like a pure chat; new rows
+    # are always created explicitly as "mic_check" by start_assessment.
+    phase: Mapped[str] = mapped_column(String(20), nullable=False, default="conversation")
+    # Index of the current item within the active phase (0-based). Items are
+    # pre-banked per phase, so (phase, section_step) identifies the pending item.
+    section_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Deterministic per-dimension scores (0-100), computed at analysis time
+    # from real evidence (listening item grading, pronunciation metrics) plus
+    # LLM-rubric conversation dims. JSON: {grammar, vocabulary, fluency,
+    # listening, pronunciation} — missing keys mean "not assessed".
+    dimension_scores: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="assessments")
     # (created_at, id) — created_at uses func.now() (the transaction
@@ -174,7 +188,33 @@ class AssessmentMessage(Base):
     assessment_id: Mapped[str] = mapped_column(String(36), ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # Message kind within the section flow: "chat" (tutor conversation),
+    # "mic_check" (read-aloud calibration), "listening" (audio-only item),
+    # "speaking" (read-aloud item). Defaults to "chat" for legacy rows.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="chat")
+    # Assistant messages: cached TTS audio as a data URI (same pattern as
+    # conversation Messages). A few seconds of MP3 base64 is tens of KB — Text,
+    # not VARCHAR(500). Not serialized in responses; the client always fetches
+    # the /audio endpoint. User messages leave this NULL — recordings are
+    # transcribed and scored, the raw audio is never persisted.
+    audio_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per-message evidence captured at answer time, as JSON. For listening
+    # answers: {"correct": 0|1, "reason": str}. For speaking answers:
+    # {"word_accuracy": f, "phoneme_accuracy": f|null, "fluency": {...}}.
+    metrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The banked item this message answers (user listening/speaking answers
+    # only; assistant item prompts leave it NULL). Promoted out of the metrics
+    # JSON so the partial unique index on (assessment_id, item_id) enforces the
+    # one-answer-per-item invariant atomically at the DB (see main.py). Nullable
+    # because chat/mic_check answers have no item.
+    item_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Client-side default with microsecond precision: phase transitions insert
+    # a user answer and the next item in the same request, and SQLite's
+    # func.now() only has second precision — the (created_at, id) order_by
+    # would then tiebreak on a random UUID and shuffle the messages.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
 
     assessment: Mapped["Assessment"] = relationship(back_populates="messages")
 
