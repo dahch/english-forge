@@ -9,6 +9,7 @@ import type {
   ProviderConfig,
   QuizQuestion,
   QuizResult,
+  RecordingResult,
   Scenario,
   Session,
   SessionSummary,
@@ -38,6 +39,10 @@ function getToken(): string | null {
   if (typeof window === "undefined") return null
   return localStorage.getItem("ef_token")
 }
+
+// Exported for components that need authenticated non-JSON fetches (e.g. the
+// assessment audio player, which streams audio blobs).
+export { getToken }
 
 export function setToken(token: string) {
   localStorage.setItem("ef_token", token)
@@ -76,8 +81,11 @@ function handleUnauthorized(): never {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
+  // FormData bodies must not carry a JSON Content-Type — the browser sets
+  // its own multipart boundary header.
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...((options.headers as Record<string, string>) || {}),
   }
   if (token) {
@@ -231,11 +239,21 @@ export const api = {
   assessment: {
     current: () => request<Assessment>("/api/assessment/current"),
     start: () => request<Assessment>("/api/assessment/start", { method: "POST" }),
-    send: (id: string, text: string) =>
+    send: (id: string, text: string, source: "text" | "voice" = "text", metrics?: Record<string, unknown> | null) =>
       request<Assessment>(`/api/assessment/${id}/message`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, source, metrics: metrics ?? null }),
       }),
+    // Upload a recording for STT (Moonshine/whisper) and, when the phase has
+    // an expected text, pronunciation scoring.
+    uploadRecording: (id: string, blob: Blob) => {
+      const form = new FormData()
+      form.append("file", blob, "answer.webm")
+      return request<RecordingResult>(`/api/assessment/${id}/recordings`, {
+        method: "POST",
+        body: form,
+      })
+    },
     complete: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
     reanalyze: (id: string) =>

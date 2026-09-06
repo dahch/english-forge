@@ -9,13 +9,98 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Skeleton } from "@/components/ui/skeleton"
+import { AudioButton } from "@/components/assessment/audio-button"
 import { api } from "@/lib/api"
-import type { Assessment, AssessmentMessage } from "@/lib/types"
-import { WebSpeechSTT } from "@/lib/stt/web-speech"
-import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw } from "lucide-react"
+import { startRecording, type RecorderHandle } from "@/lib/recorder"
+import type { Assessment, AssessmentMessage, DimensionScores } from "@/lib/types"
+import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw, Ear, BookOpen } from "lucide-react"
 
-// Must match MAX_ASSESSMENT_EXCHANGES in backend/app/routers/assessment.py.
+// Must match backend/app/routers/assessment.py.
 const MAX_ASSESSMENT_QUESTIONS = 10
+const MIN_ASSESSMENT_EXCHANGES = 6
+
+const PHASE_LABELS: Record<string, string> = {
+  mic_check: "Mic check",
+  conversation: `Conversation (min ${MIN_ASSESSMENT_EXCHANGES}, max ${MAX_ASSESSMENT_QUESTIONS})`,
+  listening: "Listening — audio only",
+  speaking: "Pronunciation — read aloud",
+}
+
+const DIMENSION_LABELS: Record<string, string> = {
+  grammar: "Grammar",
+  vocabulary: "Vocabulary",
+  fluency: "Fluency",
+  listening: "Listening",
+  pronunciation: "Pronunciation",
+}
+
+// A single chat bubble. Extracted as a component so the "reveal listening
+// item text" state is per-message (hooks can't live inside a .map callback).
+function MessageBubble({
+  msg,
+  index,
+  lastAnsweredIndex,
+  assessmentId,
+}: {
+  msg: AssessmentMessage
+  index: number
+  lastAnsweredIndex: number
+  assessmentId: string
+}) {
+  const isUser = msg.role === "user"
+  const isListeningItem = !isUser && msg.kind === "listening"
+
+  // Audio-only items stay hidden until the student has answered (any later
+  // user message exists). A manual reveal is the accessibility fallback.
+  const [revealed, setRevealed] = useState(!isListeningItem)
+  const hidden = isListeningItem && index > lastAnsweredIndex && !revealed
+
+  if (isUser) {
+    const source = (msg.metrics as { source?: string } | null)?.source
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] rounded-2xl px-4 py-2 bg-primary text-primary-foreground">
+          {source === "voice" && (
+            <span className="mr-2 inline-flex items-center text-xs opacity-70">
+              <Mic className="h-3 w-3 mr-1 inline" />
+              voice
+            </span>
+          )}
+          <p className="text-sm whitespace-pre-wrap inline">{msg.text}</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex justify-start">
+      <div
+        className={`max-w-[80%] rounded-2xl px-4 py-2 ${
+          isListeningItem ? "bg-primary/10 border border-primary/40" : "bg-secondary"
+        }`}
+      >
+        {hidden ? (
+          <div className="flex items-center gap-2">
+            <Ear className="h-4 w-4 text-primary shrink-0" />
+            <span className="text-sm text-muted-foreground italic">
+              Audio-only question — press play and answer with your voice
+            </span>
+            <Button variant="ghost" size="sm" className="h-6 text-xs" onClick={() => setRevealed(true)}>
+              Show text
+            </Button>
+          </div>
+        ) : (
+          <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+        )}
+        {(msg.kind === "chat" || isListeningItem || msg.kind === "mic_check") && (
+          <div className="flex items-center gap-1 mt-1">
+            <AudioButton assessmentId={assessmentId} messageId={msg.id} disabled={hidden} />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
 
 export default function AssessmentPage() {
   const router = useRouter()
@@ -24,16 +109,24 @@ export default function AssessmentPage() {
   const [inputText, setInputText] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
-  const [isListening, setIsListening] = useState(false)
   const [completed, setCompleted] = useState(false)
   const [generatingPath, setGeneratingPath] = useState(false)
   const [reanalyzing, setReanalyzing] = useState(false)
-  const sttRef = useRef<WebSpeechSTT | null>(null)
+
+  // Voice recording state (MediaRecorder → /recordings → editable transcript)
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordElapsed, setRecordElapsed] = useState(0)
+  const [transcribing, setTranscribing] = useState(false)
+  const recorderRef = useRef<RecorderHandle | null>(null)
+  // Metrics from the last uploaded recording, attached to the next send.
+  const pendingMetricsRef = useRef<Record<string, unknown> | null>(null)
+  const lastSourceRef = useRef<"text" | "voice">("text")
+
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     return () => {
-      sttRef.current?.stop()
+      recorderRef.current?.stop().catch(() => {})
     }
   }, [])
 
@@ -47,10 +140,7 @@ export default function AssessmentPage() {
         const a = await api.assessment.current()
         setAssessment(a)
         setMessages(a.messages)
-        // If the assessment is already completed, show the results screen
-        if (a.completed_at) {
-          setCompleted(true)
-        }
+        if (a.completed_at) setCompleted(true)
       } catch {
         // No assessment found, user will start manually
       }
@@ -58,16 +148,34 @@ export default function AssessmentPage() {
     resume()
   }, [])
 
+  const applyResponse = (a: Assessment) => {
+    setAssessment(a)
+    setMessages(a.messages)
+    return a
+  }
+
   const start = async () => {
     setLoading(true)
     setError("")
     try {
-      const a = await api.assessment.start()
-      setAssessment(a)
-      setMessages(a.messages)
+      applyResponse(await api.assessment.start())
       setCompleted(false)
+      setInputText("")
+      pendingMetricsRef.current = null
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start assessment")
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const completeAssessment = async (id: string) => {
+    setLoading(true)
+    try {
+      applyResponse(await api.assessment.complete(id))
+      setCompleted(true)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to complete assessment")
     } finally {
       setLoading(false)
     }
@@ -76,14 +184,17 @@ export default function AssessmentPage() {
   const sendMessage = async () => {
     if (!assessment || !inputText.trim() || loading) return
     const text = inputText.trim()
+    const source = lastSourceRef.current
+    const metrics = pendingMetricsRef.current
     setInputText("")
+    pendingMetricsRef.current = null
+    lastSourceRef.current = "text"
     setLoading(true)
     setError("")
 
     try {
-      const a = await api.assessment.send(assessment.id, text)
-      setMessages(a.messages)
-      if (a.is_complete) {
+      const a = applyResponse(await api.assessment.send(assessment.id, text, source, metrics))
+      if (a.is_complete && !a.completed_at) {
         await completeAssessment(a.id)
       }
     } catch (err: unknown) {
@@ -94,16 +205,45 @@ export default function AssessmentPage() {
     }
   }
 
-  const completeAssessment = async (id: string) => {
-    setLoading(true)
+  const toggleRecording = async () => {
+    if (isRecording) {
+      const handle = recorderRef.current
+      recorderRef.current = null
+      setIsRecording(false)
+      if (!handle || !assessment) return
+      setTranscribing(true)
+      setError("")
+      try {
+        const blob = await handle.stop()
+        const result = await api.assessment.uploadRecording(assessment.id, blob)
+        pendingMetricsRef.current = result.metrics
+        lastSourceRef.current = "voice"
+        setInputText((prev) => (prev.trim() ? prev : result.transcript))
+        if (!result.transcript.trim()) {
+          setError("We couldn't hear anything — check your microphone or type your answer.")
+        }
+      } catch (err: unknown) {
+        setError(
+          err instanceof Error && err.message === "Microphone permission denied"
+            ? "Microphone permission denied. You can type your answer instead."
+            : "Transcription failed — you can type your answer instead."
+        )
+      } finally {
+        setTranscribing(false)
+        setRecordElapsed(0)
+      }
+      return
+    }
+
+    setError("")
     try {
-      const a = await api.assessment.complete(id)
-      setAssessment(a)
-      setCompleted(true)
+      recorderRef.current = await startRecording({
+        maxSeconds: 30,
+        onTick: setRecordElapsed,
+      })
+      setIsRecording(true)
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to complete assessment")
-    } finally {
-      setLoading(false)
+      setError(err instanceof Error ? err.message : "Could not start recording")
     }
   }
 
@@ -126,9 +266,7 @@ export default function AssessmentPage() {
     setReanalyzing(true)
     setError("")
     try {
-      const a = await api.assessment.reanalyze(assessment.id)
-      setAssessment(a)
-      setMessages(a.messages)
+      applyResponse(await api.assessment.reanalyze(assessment.id))
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to re-analyze assessment")
     } finally {
@@ -136,33 +274,20 @@ export default function AssessmentPage() {
     }
   }
 
-  const toggleListening = () => {
-    if (isListening) {
-      sttRef.current?.stop()
-      setIsListening(false)
-      return
+  const phase = assessment?.phase ?? "conversation"
+  const assistantCount = messages.filter((m) => m.role === "assistant" && m.kind === "chat").length
+  const lastAnsweredIndex = (() => {
+    // Index of the last user message — listening item texts before it can be revealed.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") return i
     }
-    const stt = new WebSpeechSTT()
-    if (!stt.isAvailable()) {
-      setError("Web Speech API not available. Try Chrome or Edge.")
-      return
-    }
-    stt.onResult((text) => {
-      setInputText(text)
-      setIsListening(false)
-    })
-    stt.onError((msg) => {
-      setIsListening(false)
-      setError(msg)
-    })
-    sttRef.current = stt
-    stt.start()
-    setIsListening(true)
-  }
-
-  const assistantCount = messages.filter((m) => m.role === "assistant").length
+    return -1
+  })()
 
   if (completed && assessment) {
+    const dims: [string, number][] = Object.entries(
+      (assessment.dimension_scores ?? {}) as DimensionScores
+    ).filter(([, v]) => typeof v === "number") as [string, number][]
     return (
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         <div className="text-center space-y-2">
@@ -181,6 +306,26 @@ export default function AssessmentPage() {
           </div>
         )}
 
+        {dims.length > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Skill breakdown</CardTitle>
+              <CardDescription>Measured from the conversation, listening items and spoken recordings.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {dims.map(([dim, score]) => (
+                <div key={dim}>
+                  <div className="flex justify-between text-sm mb-1">
+                    <span>{DIMENSION_LABELS[dim] ?? dim}</span>
+                    <span className="text-muted-foreground">{Math.round(score)}/100</span>
+                  </div>
+                  <Progress value={score} />
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        )}
+
         <Card>
           <CardHeader>
             <CardTitle>Summary</CardTitle>
@@ -197,7 +342,7 @@ export default function AssessmentPage() {
             </CardHeader>
             <CardContent>
               <ul className="list-disc list-inside text-sm">
-                {assessment.strengths?.map((s, i) => <li key={i}>{s}</li>) || <li className="text-muted-foreground">None detected</li>}
+                {assessment.strengths?.map((s, i) => <li key={i}>{DIMENSION_LABELS[s] ?? s}</li>) || <li className="text-muted-foreground">None detected</li>}
               </ul>
             </CardContent>
           </Card>
@@ -207,7 +352,7 @@ export default function AssessmentPage() {
             </CardHeader>
             <CardContent>
               <ul className="list-disc list-inside text-sm">
-                {assessment.weaknesses?.map((w, i) => <li key={i}>{w}</li>) || <li className="text-muted-foreground">None detected</li>}
+                {assessment.weaknesses?.map((w, i) => <li key={i}>{DIMENSION_LABELS[w] ?? w}</li>) || <li className="text-muted-foreground">None detected</li>}
               </ul>
             </CardContent>
           </Card>
@@ -249,7 +394,12 @@ export default function AssessmentPage() {
           <Sparkles className="h-12 w-12 text-primary mx-auto" />
           <h1 className="text-2xl font-bold">Initial Assessment</h1>
           <p className="text-muted-foreground">
-            Have a 10-minute conversation with your tutor. We&apos;ll analyze your English level (A1-C2) and build a personalized learning path.
+            A ~10 minute voice conversation with your tutor: an interview, audio-only
+            listening questions and read-aloud pronunciation items. We&apos;ll measure
+            your real level (A1-C2) and build a personalized learning path.
+          </p>
+          <p className="text-sm text-muted-foreground flex items-center justify-center gap-2">
+            <Mic className="h-4 w-4" /> Microphone recommended — typing works as a fallback.
           </p>
           <Button onClick={start} size="lg" disabled={loading}>
             {loading ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Mic className="h-4 w-4 mr-1" />}
@@ -271,15 +421,28 @@ export default function AssessmentPage() {
       <div className="flex items-center justify-between p-4 border-b">
         <div className="flex items-center gap-2">
           <h1 className="font-semibold">Assessment</h1>
-          <Badge variant="secondary">{Math.min(assistantCount, MAX_ASSESSMENT_QUESTIONS)} / {MAX_ASSESSMENT_QUESTIONS}</Badge>
+          <Badge variant="secondary">{PHASE_LABELS[phase] ?? phase}</Badge>
+          {phase === "conversation" && (
+            <Badge variant="outline">{Math.min(assistantCount, MAX_ASSESSMENT_QUESTIONS)} / {MAX_ASSESSMENT_QUESTIONS}</Badge>
+          )}
         </div>
-        <Button variant="outline" size="sm" onClick={() => completeAssessment(assessment.id)} disabled={loading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => completeAssessment(assessment.id)}
+          disabled={loading}
+          title={
+            phase === "conversation" && assistantCount < MIN_ASSESSMENT_EXCHANGES
+              ? `At least ${MIN_ASSESSMENT_EXCHANGES} exchanges are recommended for a reliable level — finishing now lowers the confidence.`
+              : undefined
+          }
+        >
           Finish & See Results
         </Button>
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 mx-4 mt-2 p-3 rounded-md bg-destructive/10 text-destructive text-sm">
+        <div className="flex items-center gap-2 p-3 rounded-md bg-destructive/10 text-destructive text-sm mx-4 mt-2">
           <AlertCircle className="h-4 w-4 shrink-0" />
           <span className="flex-1">{error}</span>
           <Button variant="ghost" size="sm" onClick={() => setError("")}>Dismiss</Button>
@@ -288,14 +451,16 @@ export default function AssessmentPage() {
 
       <ScrollArea className="flex-1 p-4">
         <div className="max-w-2xl mx-auto space-y-4">
-          {messages.map((msg) => (
-            <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[80%] rounded-2xl px-4 py-2 ${msg.role === "user" ? "bg-primary text-primary-foreground" : "bg-secondary"}`}>
-                <p className="text-sm">{msg.text}</p>
-              </div>
-            </div>
+          {messages.map((msg, i) => (
+            <MessageBubble
+              key={msg.id}
+              msg={msg}
+              index={i}
+              lastAnsweredIndex={lastAnsweredIndex}
+              assessmentId={assessment.id}
+            />
           ))}
-          {loading && (
+          {(loading || transcribing) && (
             <div className="flex justify-start">
               <div className="bg-secondary rounded-2xl px-4 py-2">
                 <div className="flex gap-1">
@@ -311,27 +476,66 @@ export default function AssessmentPage() {
       </ScrollArea>
 
       <div className="border-t p-4">
-        <div className="max-w-2xl mx-auto flex gap-2">
-          <Button variant={isListening ? "destructive" : "outline"} size="icon" onClick={toggleListening} disabled={loading}>
-            {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-          </Button>
-          <Textarea
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault()
-                sendMessage()
+        <div className="max-w-2xl mx-auto space-y-2">
+          {(phase === "mic_check" || phase === "speaking" || phase === "listening") && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              {phase === "listening" ? <Ear className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
+              {phase === "listening"
+                ? "Answer with your voice (or type) — replay the audio as many times as you need."
+                : phase === "speaking"
+                  ? "Press record, read the sentence aloud, then send — we score pronunciation from the recording."
+                  : "Press record and read the sentence aloud to check your microphone."}
+            </div>
+          )}
+          <div className="flex gap-2">
+            <Button
+              variant={isRecording ? "destructive" : "outline"}
+              size="icon"
+              onClick={toggleRecording}
+              disabled={loading || transcribing}
+              title={isRecording ? "Stop recording" : "Record your answer"}
+            >
+              {transcribing ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : isRecording ? (
+                <MicOff className="h-4 w-4" />
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+            </Button>
+            <Textarea
+              value={inputText}
+              onChange={(e) => {
+                setInputText(e.target.value)
+                if (lastSourceRef.current === "voice" && pendingMetricsRef.current) {
+                  // The transcript was edited — pronunciation metrics computed
+                  // from the recording no longer match. Drop them; the server
+                  // recomputes WER/PER from the edited text.
+                  pendingMetricsRef.current = null
+                  lastSourceRef.current = "text"
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault()
+                  sendMessage()
+                }
+              }}
+              placeholder={
+                isRecording
+                  ? `Recording… ${recordElapsed.toFixed(0)}s (max 30s)`
+                  : transcribing
+                    ? "Transcribing your answer…"
+                    : "Type your answer, or press the mic to record."
               }
-            }}
-            placeholder={isListening ? "Listening..." : "Type your answer..."}
-            disabled={loading || isListening}
-            className="flex-1 min-h-[80px] max-h-[200px]"
-            rows={3}
-          />
-          <Button onClick={sendMessage} disabled={loading || !inputText.trim()} size="icon">
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-          </Button>
+              disabled={loading || isRecording || transcribing}
+              className="flex-1 min-h-[80px] max-h-[200px]"
+              rows={3}
+            />
+            <Button onClick={sendMessage} disabled={loading || isRecording || transcribing || !inputText.trim()} size="icon">
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            </Button>
+          </div>
         </div>
       </div>
     </div>

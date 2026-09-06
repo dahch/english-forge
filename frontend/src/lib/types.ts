@@ -161,13 +161,30 @@ export interface QuizResult {
   explanation: string
 }
 
-// Assessment chat messages — unlike conversation Messages they carry no
-// session_id/audio_url (see backend AssessmentMessageResponse).
+// Assessment chat messages. `kind` drives the section UI: "chat" (tutor
+// conversation), "mic_check" (read-aloud calibration), "listening" (audio-only
+// item — text hidden until answered), "speaking" (read-aloud item). Only
+// assistant messages carry audio_url (a fetch-with-auth endpoint, not a data
+// URI — see AudioButton). metrics holds per-answer evidence (listening grade
+// or pronunciation WER/PER/fluency composite).
 export interface AssessmentMessage {
   id: string
   role: string
   text: string
+  kind: string
+  audio_url: string | null
+  metrics: Record<string, unknown> | null
   created_at: string
+}
+
+// Dimension scores (0-100) computed deterministically at analysis time.
+// Missing keys mean the dimension was not assessed.
+export type DimensionScores = {
+  grammar?: number
+  vocabulary?: number
+  fluency?: number
+  listening?: number
+  pronunciation?: number
 }
 
 export interface Assessment {
@@ -180,8 +197,19 @@ export interface Assessment {
   weaknesses: string[] | null
   recommendations: string[] | null
   summary: string | null
+  phase: string | null
+  dimension_scores: DimensionScores | null
   messages: AssessmentMessage[]
   is_complete?: boolean
+}
+
+// Result of POST /assessment/{id}/recordings — STT transcript with Moonshine
+// word timestamps (when personal-api exposes them) and optional pronunciation
+// metrics computed against the item's expected text.
+export interface RecordingResult {
+  transcript: string
+  words: { word: string; start: number; end: number }[]
+  metrics: Record<string, unknown> | null
 }
 
 export interface LearningPath {
