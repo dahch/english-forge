@@ -48,10 +48,10 @@ def build_tutor_persona(tutor_profile: dict | None = None) -> str:
     if not tutor_profile:
         return "You are an English language tutor named Sarah, friendly and encouraging."
 
-    name = tutor_profile.get("name", "Sarah")
+    name = tutor_profile.get("name") or "Sarah"
     age = tutor_profile.get("age")
     gender = tutor_profile.get("gender")
-    personality = tutor_profile.get("personality", "friendly")
+    personality = tutor_profile.get("personality") or "friendly"
 
     age_clause = f" You are {age} years old." if age else ""
     gender_clause = f" You identify as {gender}." if gender else ""
@@ -66,7 +66,7 @@ def build_tutor_persona(tutor_profile: dict | None = None) -> str:
         persona_text = personas[personality]
     else:
         # Free-text personality from the Settings page — use it verbatim.
-        persona_text = f"{personality}. Let this shape how you speak and correct the student"
+        persona_text = f"{personality}. Let this shape how you speak and correct the student."
 
     return f"You are an English language tutor named {name}.{age_clause}{gender_clause} Your personality is {persona_text}"
 

@@ -143,3 +143,70 @@ def parse_llm_json(content: str) -> dict[str, Any]:
         "corrections": corrections,
         "new_vocab": new_vocab,
     }
+
+
+def _strip_code_fences(text: str) -> str:
+    return re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text.strip())
+
+
+def _repair_json(text: str) -> str:
+    # Common LLM JSON issues: smart quotes and trailing commas.
+    text = (
+        text.replace("\u201c", '"').replace("\u201d", '"')
+        .replace("\u2018", "'").replace("\u2019", "'")
+    )
+    return re.sub(r",\s*([}\]])", r"\1", text)
+
+
+def _extract_balanced_objects(text: str) -> list[str]:
+    """Extract balanced {...} blocks from text, respecting string literals.
+
+    Unlike a greedy regex, this handles prose containing braces and nested
+    objects (e.g. exercise dicts inside a lesson object).
+    """
+    blocks: list[str] = []
+    depth = 0
+    start: int | None = None
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocks.append(text[start:i + 1])
+                start = None
+    return blocks
+
+
+def parse_lesson_json(content: str) -> dict[str, Any]:
+    """Extract a lesson JSON object from an LLM response.
+
+    Unlike parse_llm_json — which silently falls back to a conversational
+    dict — this raises ValueError when no lesson-shaped object can be parsed,
+    so callers fail loudly instead of persisting an empty lesson.
+    """
+    cleaned = _strip_code_fences(content)
+    candidates = [cleaned, *_extract_balanced_objects(cleaned)]
+    for text in candidates:
+        for attempt in (text, _repair_json(text)):
+            try:
+                data = json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and ("exercises" in data or "title" in data):
+                return data
+    raise ValueError("No lesson JSON found in LLM response")
