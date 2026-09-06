@@ -56,3 +56,41 @@
 - **Consequences**:
   - Pros: Zero-downtime schema upgrades; migrations run automatically on app restart; no manual Alembic revision needed for trivial column additions; safe to run in production.
   - Cons: Does not handle data migration or schema renames; only adds columns with defaults (no complex ALTER logic); if a column definition changes, the sync must be re-evaluated.
+
+## ADR-007: Partial Unique Indexes at Startup for Invariants
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The assessment and learning path subsystems need to enforce that each user has at most one in-progress assessment and at most one active learning path. Previously these were only guarded by application-level checks (SELECT-before-INSERT), which are vulnerable to race conditions from double-clicks or concurrent requests.
+- **Decision**: Added `_INDEXES_TO_ADD` list in `backend/app/main.py` containing two partial unique indexes created via `CREATE UNIQUE INDEX IF NOT EXISTS` on every startup:
+  - `uq_assessments_user_in_progress` on `assessments (user_id) WHERE completed_at IS NULL` — ensures only one in-progress assessment per user
+  - `uq_learning_paths_user_active` on `learning_paths (user_id) WHERE is_active` — ensures only one active learning path per user
+  The startup sync wrapper uses `begin_nested()` savepoints so that if a concurrent instance adds the index first, the second instance gracefully skips it rather than failing.
+- **Consequences**:
+  - Pros: Race-condition-free atomic start-assessment and generate-path operations; idempotent startup; no need for application-level locking beyond what the index provides.
+  - Cons: Index creation adds a brief startup latency; index name must be coordinated with application logic; if the index definition changes, the startup sync must be updated.
+
+## ADR-008: Lesson LLM Output Normalization
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The LLM generating lessons can return various JSON irregularities: double-encoded strings, non-list values where lists are expected, exercises missing required keys. The previous code assumed well-formed JSON and would crash or persist broken data.
+- **Decision**: Added `normalize_llm_lesson()` function in `backend/app/routers/lessons.py` that coerces LLM output into the expected shapes:
+  - Double-encoded JSON strings are parsed back to their original type
+  - Non-list values where lists are expected are converted to lists (or wrapped in a single-element list)
+  - Exercises missing `question` keys are dropped
+  - All exercise `question` values are stripped and validated as non-empty
+  - A new `_serialize_generated_lesson()` function strips `answer` fields from exercises (ADR-003/005 contract), keeping only `question`, `type`, `options`, and `explanation` — the `answer` field is only available via the exercise check endpoint.
+- **Consequences**:
+  - Pros: Robustness against malformed LLM output; never persists unusable lessons; answers never leak to frontend; consistent exercise format across library and generated lessons.
+  - Cons: Additional processing layer; some valid LLM variations may still not map perfectly (callers should handle empty exercises gracefully).
+
+## ADR-009: Assessment Early-Finish Detection
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The assessment system needed a reliable way to detect when a student wants to end the assessment early, without false-triggering on common words like "finished" or "done" that appear in normal conversation.
+- **Decision**: Replaced simple word-boundary regex (`_END_REQUEST_RE = re.compile(r"\b(finish|end|stop|terminar|done)\b", re.IGNORECASE)`) with a contextual check (`_wants_to_finish()`) that:
+  - Strips trailing punctuation (`.,!?;:¡¿`) from the user's text
+  - Only triggers on short utterances (≤4 words after stripping), preventing matches on phrases like "I'm done with work for today"
+  - Uses a curated set of end-request words: `finish|end|stop|terminar|basta|done`
+- **Consequences**:
+  - Pros: Greatly reduced false positives from normal conversation; still catches intentional early-finish requests.
+  - Cons: Slightly more restrictive; users with very short "basta" or "done" utterances are correctly handled; edge case of "basta" in longer sentences may need future refinement.
