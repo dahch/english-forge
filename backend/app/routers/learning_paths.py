@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.llm.prompts import LEARNING_PATH_GENERATION_PROMPT, LEVEL_LESSONS_REQUIRED, NEXT_LEVEL
 from app.llm.router import LLMRouter, parse_llm_json
 from app.models.models import Assessment, LearningPath, PathLesson, User
 from app.utils import bump_daily_lessons
@@ -20,81 +21,6 @@ from app.utils import bump_daily_lessons
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/learning-paths", tags=["learning-paths"])
-
-
-# Lessons required per CEFR jump — based on realistic Cambridge English estimates.
-LEVEL_LESSONS_REQUIRED = {
-    "A1": 18,
-    "A2": 22,
-    "B1": 28,
-    "B2": 22,
-    "C1": 12,
-    "C2": 10,
-}
-
-NEXT_LEVEL = {
-    "A1": "A2",
-    "A2": "B1",
-    "B1": "B2",
-    "B2": "C1",
-    "C1": "C2",
-    "C2": None,
-}
-
-
-# Topic focus per CEFR jump — interpolated into the generation prompt so the
-# lesson counts always match LEVEL_LESSONS_REQUIRED (single source of truth).
-LEVEL_FOCUS = {
-    "A1": "focused on fundamentals (basic tenses, everyday vocabulary, simple questions)",
-    "A2": "with concentrated grammar (present perfect, conditionals type 1, modals, common phrasal verbs)",
-    "B1": "— the densest level (conditionals 2/3, passive voice, reported speech, complex connectors, abstract vocabulary)",
-    "B2": "focused on refinement (collocations, idioms, formal/informal register, nuance)",
-    "C1": "— almost no new grammar, just polishing naturalness, cultural references, irony, and precision",
-}
-
-
-LESSON_TYPES = ["vocabulary", "grammar", "conversation", "listening", "reading", "writing"]
-
-
-_LEARNING_PATH_FRAMEWORK = "\n".join(
-    f"- {level}→{NEXT_LEVEL[level]}: {LEVEL_LESSONS_REQUIRED[level]} lessons {LEVEL_FOCUS[level]}."
-    for level, nxt in NEXT_LEVEL.items()
-    if nxt is not None
-)
-
-LEARNING_PATH_GENERATION_PROMPT = f"""You are an expert English curriculum designer and CEFR specialist. You are creating a personalized learning path for an adult English learner.
-
-The learner has just completed a placement assessment.
-
-Use the following CEFR framework for the learning path:
-{_LEARNING_PATH_FRAMEWORK}
-
-Each lesson should be one of these types: vocabulary, grammar, conversation, listening, reading, writing.
-
-Distribute lesson types realistically:
-- conversation: 40%
-- grammar: 25%
-- vocabulary: 20%
-- listening: 10%
-- reading/writing: 5%
-
-Use the learner's weaknesses and recommendations to prioritize topics.
-
-Return ONLY valid JSON in this exact format:
-{{
-  "path_title": "...",
-  "description": "...",
-  "lessons": [
-    {{
-      "lesson_type": "vocabulary|grammar|conversation|listening|reading|writing",
-      "topic": "Specific topic name",
-      "description": "What the learner will practice and why",
-      "order": 1
-    }}
-  ]
-}}
-
-Lessons should be ordered from easier to harder within the target level. Make topics concrete and practical."""
 
 
 class PathLessonResponse(BaseModel):
@@ -220,14 +146,38 @@ async def _generate_path_for_user(
             temperature=0.5,
             max_tokens=2500,
         )
-        parsed = parse_llm_json(result["content"])
     except Exception as e:
-        logger.error(f"Learning path generation failed: {e}")
+        logger.error(f"Learning path LLM call failed for user {current_user.id}: {e}")
         # Generic detail — raw exception text can leak provider URLs/keys.
         raise HTTPException(status_code=503, detail="Failed to generate the learning path. Please try again.")
 
+    raw_content = result.get("content", "")
+    provider_used = result.get("provider", "unknown")
+    model_used = result.get("model", "unknown")
+    logger.info(
+        f"Learning path raw LLM response for user {current_user.id} "
+        f"(provider={provider_used}, model={model_used}, length={len(raw_content)}): "
+        f"{raw_content[:2000]}"
+    )
+
+    try:
+        parsed = parse_llm_json(raw_content)
+    except Exception as e:
+        logger.error(f"Learning path JSON parsing failed for user {current_user.id}: {e}")
+        raise HTTPException(status_code=503, detail="Failed to parse the generated learning path. Please try again.")
+
+    logger.info(
+        f"Learning path parsed result for user {current_user.id}: "
+        f"keys={list(parsed.keys())}, path_title={parsed.get('path_title')}, "
+        f"lessons_count={len(parsed.get('lessons', []))}"
+    )
+
     lessons_data = parsed.get("lessons", [])
     if not lessons_data:
+        logger.error(
+            f"Generated learning path has no lessons for user {current_user.id}. "
+            f"Parsed keys: {list(parsed.keys())}"
+        )
         raise HTTPException(status_code=500, detail="Generated learning path has no lessons")
 
     # Keep counters and stored lessons consistent in both directions:
@@ -236,8 +186,12 @@ async def _generate_path_for_user(
     lessons_data = lessons_data[:lessons_required]
     lessons_required = len(lessons_data)
 
-    await _deactivate_current_paths(db, current_user.id)
-
+    # The partial unique index (uq_learning_paths_user_active, created at
+    # startup) allows only one active path per user. Deactivation and insert
+    # must live in the SAME savepoint: if a concurrent /generate slips a new
+    # active row in between, this insert loses the race and the whole savepoint
+    # rolls back — including the deactivations below — so the loser can safely
+    # re-select and return the winner's path without orphaning it.
     path = LearningPath(
         user_id=current_user.id,
         assessment_id=assessment.id if assessment else None,
@@ -247,12 +201,9 @@ async def _generate_path_for_user(
         lessons_completed=0,
         is_active=True,
     )
-    # The partial unique index (uq_learning_paths_user_active, created at
-    # startup) allows only one active path per user — a concurrent /generate
-    # that passed the deactivate step can't create a second active row.
-    # The loser rolls back and re-selects the winner's path.
     try:
         async with db.begin_nested():
+            await _deactivate_current_paths(db, current_user.id)
             db.add(path)
     except IntegrityError:
         existing = await _get_active_path(db, current_user.id)
@@ -275,6 +226,11 @@ async def _generate_path_for_user(
         db.add(path_lesson)
 
     await db.flush()
+
+    logger.info(
+        f"Generated learning path {path.id} for user {current_user.id}: "
+        f"{path.current_level}->{path.target_level}, {len(lessons_data)} lessons"
+    )
 
     return await _get_path_with_lessons(db, path.id)
 
