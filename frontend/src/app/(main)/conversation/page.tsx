@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -24,6 +24,7 @@ import {
   ChevronUp,
   History,
   Loader2,
+  Square,
 } from "lucide-react"
 
 // Module-level so the React compiler lint doesn't see Date.now() called
@@ -48,13 +49,19 @@ export default function ConversationPage() {
   const [recentSessions, setRecentSessions] = useState<Session[]>([])
   const [showHistory, setShowHistory] = useState(false)
   const [pageLoading, setPageLoading] = useState(true)
+  const [playingAudioId, setPlayingAudioId] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sttRef = useRef<WebSpeechSTT | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
 
-  // Stop recognition when leaving the page
+  // Stop recognition and audio when leaving the page
   useEffect(() => {
     return () => {
       sttRef.current?.stop()
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current = null
+      }
     }
   }, [])
 
@@ -172,7 +179,7 @@ export default function ConversationPage() {
         return [...withoutTemp, turn.user_message, turn.assistant_message]
       })
       if (turn.audio_url) {
-        playAudio(turn.audio_url)
+        playAudio(turn.assistant_message.id, turn.audio_url)
       }
     } catch (err: unknown) {
       setMessages((prev) => prev.filter((m) => m.id !== tempId))
@@ -210,9 +217,32 @@ export default function ConversationPage() {
     setIsListening(true)
   }
 
-  const playAudio = (url: string) => {
+  const playAudio = (msgId: string, url: string) => {
+    // Stop any currently playing audio before starting a new one
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
     const audio = new Audio(url)
-    audio.play().catch(() => setError("Could not play audio"))
+    audio.onended = () => setPlayingAudioId(null)
+    audio.onerror = () => {
+      setPlayingAudioId(null)
+      setError("Could not play audio")
+    }
+    audioRef.current = audio
+    setPlayingAudioId(msgId)
+    audio.play().catch(() => {
+      setPlayingAudioId(null)
+      setError("Could not play audio")
+    })
+  }
+
+  const stopAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
+    setPlayingAudioId(null)
   }
 
   const toggleCorrections = (msgId: string) => {
@@ -412,13 +442,21 @@ export default function ConversationPage() {
           </span>
         </div>
         <div className="flex gap-2">
+          {playingAudioId && (
+            <Button variant="outline" size="sm" onClick={stopAudio} className="gap-1">
+              <Square className="h-4 w-4" />
+              Stop Audio
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={newSession}>
             New
           </Button>
-          <Button variant="destructive" size="sm" onClick={endSession} disabled={loading}>
-            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <StopCircle className="h-4 w-4 mr-1" />}
-            End Session
-          </Button>
+          {!session.ended_at && (
+            <Button variant="destructive" size="sm" onClick={endSession} disabled={loading}>
+              {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <StopCircle className="h-4 w-4 mr-1" />}
+              End Session
+            </Button>
+          )}
         </div>
       </div>
 
@@ -481,11 +519,20 @@ export default function ConversationPage() {
                 )}
                 {msg.audio_url && (
                   <button
-                    onClick={() => playAudio(msg.audio_url!)}
+                    onClick={() => playingAudioId === msg.id ? stopAudio() : playAudio(msg.id, msg.audio_url!)}
                     className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
                   >
-                    <Volume2 className="h-3 w-3" />
-                    Play audio
+                    {playingAudioId === msg.id ? (
+                      <>
+                        <Square className="h-3 w-3" />
+                        Stop audio
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="h-3 w-3" />
+                        Play audio
+                      </>
+                    )}
                   </button>
                 )}
               </div>
@@ -512,19 +559,25 @@ export default function ConversationPage() {
             variant={isListening ? "destructive" : "outline"}
             size="icon"
             onClick={toggleListening}
-            disabled={loading}
+            disabled={loading || !!session.ended_at}
           >
             {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </Button>
-          <Input
+          <Textarea
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage()}
-            placeholder={isListening ? "Listening..." : "Type your message..."}
-            disabled={loading || isListening}
-            className="flex-1"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault()
+                sendMessage()
+              }
+            }}
+            placeholder={session.ended_at ? "This session has ended. Start a new one to continue." : isListening ? "Listening..." : "Type your message..."}
+            disabled={loading || isListening || !!session.ended_at}
+            className="flex-1 min-h-[80px] max-h-[200px]"
+            rows={3}
           />
-          <Button onClick={sendMessage} disabled={loading || !inputText.trim()} size="icon">
+          <Button onClick={sendMessage} disabled={loading || !inputText.trim() || !!session.ended_at} size="icon">
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
           </Button>
         </div>

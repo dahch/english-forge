@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
@@ -44,12 +44,14 @@ export default function AssessmentPage() {
     async function resume() {
       try {
         const a = await api.assessment.current()
-        if (!a.completed_at) {
-          setAssessment(a)
-          setMessages(a.messages)
+        setAssessment(a)
+        setMessages(a.messages)
+        // If the assessment is already completed, show the results screen
+        if (a.completed_at) {
+          setCompleted(true)
         }
       } catch {
-        // No in-progress assessment, user will start manually
+        // No assessment found, user will start manually
       }
     }
     resume()
@@ -202,6 +204,11 @@ export default function AssessmentPage() {
           {generatingPath ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Sparkles className="h-4 w-4 mr-1" />}
           {generatingPath ? "Generating path..." : "Generate My Learning Path"}
         </Button>
+
+        <Button onClick={start} variant="outline" className="w-full">
+          <Mic className="h-4 w-4 mr-1" />
+          Retake Assessment
+        </Button>
       </div>
     )
   }
@@ -279,13 +286,19 @@ export default function AssessmentPage() {
           <Button variant={isListening ? "destructive" : "outline"} size="icon" onClick={toggleListening} disabled={loading}>
             {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
           </Button>
-          <Input
+          <Textarea
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault()
+                sendMessage()
+              }
+            }}
             placeholder={isListening ? "Listening..." : "Type your answer..."}
             disabled={loading || isListening}
-            className="flex-1"
+            className="flex-1 min-h-[80px] max-h-[200px]"
+            rows={3}
           />
           <Button onClick={sendMessage} disabled={loading || !inputText.trim()} size="icon">
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
