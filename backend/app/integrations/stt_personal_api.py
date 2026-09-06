@@ -34,6 +34,10 @@ class STTPersonalAPI(STTProvider):
     def __init__(self):
         settings = get_settings()
         self._base_url = settings.PERSONAL_API_URL.rstrip("/")
+        # Language hint for Moonshine: "en" produces real word timestamps
+        # (the basis of the pronunciation fluency metrics). personal-api
+        # <= old servers ignore the extra form field — backward safe.
+        self._language = settings.STT_LANGUAGE
         self._poll_interval = settings.TTS_JOB_POLL_INTERVAL_MS / 1000.0
         self._timeout = settings.TTS_JOB_TIMEOUT_SECONDS
 
@@ -56,6 +60,7 @@ class STTPersonalAPI(STTProvider):
             resp = await client.post(
                 f"{self._base_url}/v1/transcribe",
                 files={"audio": ("audio.wav", audio_bytes, content_type)},
+                data={"language": self._language},
             )
             resp.raise_for_status()
             data = resp.json()

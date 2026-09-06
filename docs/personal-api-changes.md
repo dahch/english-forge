@@ -1,5 +1,16 @@
 # Cambios externos requeridos por Assessment v2
 
+> **Estado: IMPLEMENTADO (2026-09-06).** Los tres repos ya tienen el contrato:
+> - **moonshine** `4e208da` — moonshine-voice `>=0.1.5` (CPU-only ONNX), `/transcribe` acepta `language` opcional (default `es`), word timestamps reales para `en`, degradación sin 500, transcribers cacheados por idioma. Modelo español fijado (`base-es`) para evitar cambio silencioso de default.
+> - **personal-api-workers** `639bbc7` — `tasks.transcribe(audio_base64, language="es")` propaga idioma y normaliza `words` (nunca falla el job); `tasks.synthesize(text, voice, model=None)` con hot-swap de modelo; 12 tests pytest.
+> - **personal-api** `443ce1a` — `/v1/transcribe` acepta form field `language`; `/v1/speak` acepta `model`; `/v1/jobs/{id}` intacto (`words` aditivo).
+>
+> **Lo que english-forge envía siempre** (configurable en `backend/app/config.py`):
+> - `/v1/transcribe` → `language=en` (`STT_LANGUAGE`) — desbloquea los word timestamps reales.
+> - `/v1/speak` → `model=english_2026-04_24l` (`TTS_MODEL`) — fija el modelo inglés de Pocket TTS.
+> Ambos campos son opcionales en personal-api → retrocompatible con servidores viejos (los ignoran).
+> Tests de contrato: `backend/tests/test_personal_api_payloads.py`.
+
 El scoring de pronunciación de english-forge necesita **word timestamps** del
 STT (Moonshine). La transcripción ya funciona con personal-api tal como está;
 sin timestamps el assessment pierde únicamente las métricas de fluidez (pausas

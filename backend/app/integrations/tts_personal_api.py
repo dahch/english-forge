@@ -35,6 +35,9 @@ class TTSPersonalAPI(TTSProvider):
         settings = get_settings()
         self._base_url = settings.PERSONAL_API_URL.rstrip("/")
         self._default_voice = settings.TTS_DEFAULT_VOICE
+        # Pocket TTS model pinned on every request (personal-api <= old
+        # servers ignore the extra JSON field — backward safe).
+        self._model = settings.TTS_MODEL
         self._poll_interval = settings.TTS_JOB_POLL_INTERVAL_MS / 1000.0
         self._timeout = settings.TTS_JOB_TIMEOUT_SECONDS
 
@@ -47,7 +50,7 @@ class TTSPersonalAPI(TTSProvider):
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{self._base_url}/v1/speak",
-                json={"text": text, "voice": voice},
+                json={"text": text, "voice": voice, "model": self._model},
             )
             resp.raise_for_status()
             data = resp.json()
