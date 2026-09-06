@@ -12,7 +12,7 @@ import { AudioButton } from "@/components/assessment/audio-button"
 import { api } from "@/lib/api"
 import { startRecording, type RecorderHandle } from "@/lib/recorder"
 import type { Assessment, AssessmentMessage, DimensionScores } from "@/lib/types"
-import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw, Ear, BookOpen } from "lucide-react"
+import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw, Ear } from "lucide-react"
 
 // Must match backend/app/routers/assessment.py.
 const MAX_ASSESSMENT_QUESTIONS = 10
@@ -124,8 +124,16 @@ export default function AssessmentPage() {
   // never accepted from the client.
   const pendingWordsRef = useRef<{ word: string; start: number; end: number }[] | null>(null)
   const lastSourceRef = useRef<"text" | "voice">("text")
+  // Render mirror of lastSourceRef — refs can't be read during render, and
+  // the voice-only phases need to enable Send only for voice transcripts.
+  const [hasVoiceTranscript, setHasVoiceTranscript] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Phases where typing would defeat the measurement (mic check + read-aloud
+  // pronunciation): the input is voice-only and the STT transcript read-only.
+  const phase = assessment?.phase ?? "conversation"
+  const voiceOnlyPhase = phase === "mic_check" || phase === "speaking"
 
   useEffect(() => {
     return () => {
@@ -166,6 +174,7 @@ export default function AssessmentPage() {
       setInputText("")
       pendingWordsRef.current = null
       lastSourceRef.current = "text"
+      setHasVoiceTranscript(false)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to start assessment")
     } finally {
@@ -202,6 +211,7 @@ export default function AssessmentPage() {
     setInputText("")
     pendingWordsRef.current = null
     lastSourceRef.current = "text"
+    setHasVoiceTranscript(false)
     setLoading(true)
     setError("")
 
@@ -229,14 +239,24 @@ export default function AssessmentPage() {
       pendingWordsRef.current = result.words
       lastSourceRef.current = "voice"
       setInputText((prev) => (prev.trim() ? prev : result.transcript))
+      setHasVoiceTranscript(result.transcript.trim().length > 0)
       if (!result.transcript.trim()) {
-        setError("We couldn't hear anything — check your microphone or type your answer.")
+        setError(
+          voiceOnlyPhase
+            ? "We couldn't hear anything — check your microphone and try recording again."
+            : "We couldn't hear anything — check your microphone or type your answer."
+        )
       }
     } catch (err: unknown) {
+      const denied = err instanceof Error && err.message === "Microphone permission denied"
       setError(
-        err instanceof Error && err.message === "Microphone permission denied"
-          ? "Microphone permission denied. You can type your answer instead."
-          : "Transcription failed — you can type your answer instead."
+        voiceOnlyPhase
+          ? denied
+            ? "Microphone permission denied — this answer needs your voice."
+            : "Transcription failed — try recording again."
+          : denied
+            ? "Microphone permission denied. You can type your answer instead."
+            : "Transcription failed — you can type your answer instead."
       )
     } finally {
       setTranscribing(false)
@@ -257,7 +277,7 @@ export default function AssessmentPage() {
         // answer would hit /recordings twice.
         await handle.stop()
       } catch {
-        setError("Recording failed — you can type your answer instead.")
+        setError(voiceOnlyPhase ? "Recording failed — try again." : "Recording failed — you can type your answer instead.")
         setRecordElapsed(0)
       }
       return
@@ -288,7 +308,16 @@ export default function AssessmentPage() {
       await api.learningPath.generate(assessment.id)
       router.push("/learning-path")
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to generate learning path")
+      // The backend may have finished generating even when the response was
+      // lost (e.g. the dev server restarting kills the proxy mid-flight) —
+      // the path row is already persisted. Recover via /current instead of
+      // dead-ending on an error the user can't act on.
+      try {
+        await api.learningPath.current()
+        router.push("/learning-path")
+      } catch {
+        setError(err instanceof Error ? err.message : "Failed to generate learning path")
+      }
     } finally {
       setGeneratingPath(false)
     }
@@ -307,7 +336,6 @@ export default function AssessmentPage() {
     }
   }
 
-  const phase = assessment?.phase ?? "conversation"
   const assistantCount = messages.filter((m) => m.role === "assistant" && m.kind === "chat").length
   const lastAnsweredIndex = (() => {
     // Index of the last user message — listening item texts before it can be revealed.
@@ -512,12 +540,12 @@ export default function AssessmentPage() {
         <div className="max-w-2xl mx-auto space-y-2">
           {(phase === "mic_check" || phase === "speaking" || phase === "listening") && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              {phase === "listening" ? <Ear className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
+              {phase === "listening" ? <Ear className="h-3 w-3 shrink-0" /> : <Mic className="h-3 w-3 shrink-0" />}
               {phase === "listening"
                 ? "Answer with your voice (or type) — replay the audio as many times as you need."
                 : phase === "speaking"
-                  ? "Press record, read the sentence aloud, then send — we score pronunciation from the recording."
-                  : "Press record and read the sentence aloud to check your microphone."}
+                  ? "Voice only — press record, read the sentence aloud, then send it as it comes out. It doesn't need to be perfect: we're measuring how you speak."
+                  : "Voice only — press record, read the sentence aloud, then send it as it comes out. No need to be perfect; that's exactly what we're checking."}
             </div>
           )}
           <div className="flex gap-2">
@@ -559,13 +587,26 @@ export default function AssessmentPage() {
                   ? `Recording… ${recordElapsed.toFixed(0)}s (max 30s)`
                   : transcribing
                     ? "Transcribing your answer…"
-                    : "Type your answer, or press the mic to record."
+                    : voiceOnlyPhase
+                      ? "Recording only — press the mic and speak. Typing is disabled here."
+                      : "Type your answer, or press the mic to record."
               }
+              readOnly={voiceOnlyPhase}
               disabled={loading || isRecording || transcribing}
               className="flex-1 min-h-[80px] max-h-[200px]"
               rows={3}
             />
-            <Button onClick={sendMessage} disabled={loading || isRecording || transcribing || !inputText.trim()} size="icon">
+            <Button
+              onClick={sendMessage}
+              disabled={
+                loading ||
+                isRecording ||
+                transcribing ||
+                !inputText.trim() ||
+                (voiceOnlyPhase && !hasVoiceTranscript)
+              }
+              size="icon"
+            >
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>

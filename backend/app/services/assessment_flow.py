@@ -206,7 +206,9 @@ async def _build_next_question(
                 system_prompt=prompt,
                 task="assessment",
                 temperature=0.7,
-                max_tokens=500,
+                # Reasoning models burn tokens thinking before the visible
+                # reply — 500 left them no room and produced empty content.
+                max_tokens=1200,
             )
             parsed = parse_llm_json(result["content"])
             if parsed.get("reply", "").strip():
@@ -524,6 +526,10 @@ async def handle_message(
     done and the client should call /complete.
     """
     phase = assessment.phase or PHASE_CONVERSATION
+    # Evidence integrity: mic check and read-aloud items measure the student's
+    # voice — a typed answer would bypass the STT/pronunciation measurement.
+    if phase in (PHASE_MIC_CHECK, PHASE_SPEAKING) and source != "voice":
+        raise ValueError("This answer needs your voice — press the mic, record, then send.")
     if phase == PHASE_MIC_CHECK:
         return await _handle_mic_check(db, current_user, assessment, text, source)
     if phase == PHASE_CONVERSATION:

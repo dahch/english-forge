@@ -68,7 +68,7 @@ def _install_llm(monkeypatch, *, listening_correct: bool = True):
     return calls
 
 
-async def _send(db, user, assessment_id, text, source="text", words=None, item_id=None):
+async def _send(db, user, assessment_id, text, source="voice", words=None, item_id=None):
     return await assessment_message(
         assessment_id, AssessmentMessageCreate(text=text, source=source, words=words, item_id=item_id), user, db
     )
@@ -176,6 +176,26 @@ async def test_max_cap_forces_transition(db, user, monkeypatch):
             break
         resp = await _send(db, user, resp.id, "some answer")
     assert resp.phase == "listening"
+
+
+@pytest.mark.asyncio
+async def test_voice_required_in_voice_measured_phases(db, user, monkeypatch):
+    """Typed answers are rejected in mic_check/speaking — typing would bypass
+    the STT/pronunciation measurement. The client hides the keyboard; this is
+    the server-side backstop."""
+    from fastapi import HTTPException
+
+    _install_llm(monkeypatch)
+    resp = await start_assessment(Response(), user, db)
+    assert resp.phase == "mic_check"
+
+    with pytest.raises(HTTPException) as exc:
+        await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog", source="text")
+    assert exc.value.status_code == 400
+
+    # A voice answer still works and moves the interview forward.
+    resp = await _send(db, user, resp.id, "The quick brown fox jumps over the lazy dog")
+    assert resp.phase == "conversation"
 
 
 @pytest.mark.asyncio
