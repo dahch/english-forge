@@ -103,6 +103,9 @@ def parse_llm_json(content: str) -> dict[str, Any]:
     keeps assessment messages working when the model returns prose while also
     handling structured outputs (assessment analysis, learning paths) that may be
     wrapped in ```json fences or accompanied by explanatory text.
+
+    Always returns a dict — a top-level JSON array (e.g. a bare lessons list) is
+    wrapped as {"items": [...]} so callers never crash on a non-dict shape.
     """
     cleaned = _strip_code_fences(content).strip()
 
@@ -110,12 +113,18 @@ def parse_llm_json(content: str) -> dict[str, Any]:
         data = json.loads(cleaned)
         if isinstance(data, dict):
             return data
+        if isinstance(data, list):
+            return {"items": data}
     except json.JSONDecodeError:
         pass
 
     # Try repaired JSON (smart quotes, trailing commas) on the whole response.
     try:
-        return json.loads(_repair_json(cleaned))
+        data = json.loads(_repair_json(cleaned))
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list):
+            return {"items": data}
     except json.JSONDecodeError:
         pass
 
