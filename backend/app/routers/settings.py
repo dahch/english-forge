@@ -4,7 +4,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -231,61 +231,126 @@ async def clear_user_data(
     generated lessons, learning paths, progress entries, and settings.
     """
     user_id = current_user.id
+    deleted_counts: dict[str, int] = {}
 
-    # Delete in order to respect foreign key constraints
-    # Messages and corrections (via session cascade)
-    await db.execute(
-        select(Message).where(Message.session_id.in_(
-            select(Session.id).where(Session.user_id == user_id)
-        ))
-    )
-    await db.execute(
-        select(Correction).where(Correction.message_id.in_(
-            select(Message.id).where(Message.session_id.in_(
+    # Delete children before parents to respect foreign key constraints.
+    # ORM cascade rules only apply when loading/deleting objects through the
+    # session identity map; bulk deletes bypass those cascades, so we must
+    # delete in the correct SQL order.
+
+    # Corrections reference messages.
+    deleted_counts["corrections"] = (
+        await db.execute(
+            delete(Correction)
+            .where(Correction.message_id.in_(
+                select(Message.id).where(Message.session_id.in_(
+                    select(Session.id).where(Session.user_id == user_id)
+                ))
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Vocab items may reference messages.
+    deleted_counts["vocab_items"] = (
+        await db.execute(
+            delete(VocabItem).where(VocabItem.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Assessment messages reference assessments.
+    deleted_counts["assessment_messages"] = (
+        await db.execute(
+            delete(AssessmentMessage)
+            .where(AssessmentMessage.assessment_id.in_(
+                select(Assessment.id).where(Assessment.user_id == user_id)
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Path lessons reference learning paths.
+    deleted_counts["path_lessons"] = (
+        await db.execute(
+            delete(PathLesson)
+            .where(PathLesson.path_id.in_(
+                select(LearningPath.id).where(LearningPath.user_id == user_id)
+            ))
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Messages reference sessions.
+    deleted_counts["messages"] = (
+        await db.execute(
+            delete(Message)
+            .where(Message.session_id.in_(
                 select(Session.id).where(Session.user_id == user_id)
             ))
-        ))
-    )
+            .execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Sessions
-    await db.execute(select(Session).where(Session.user_id == user_id))
+    # Sessions reference users and scenarios.
+    deleted_counts["sessions"] = (
+        await db.execute(
+            delete(Session).where(Session.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Vocab items
-    await db.execute(select(VocabItem).where(VocabItem.user_id == user_id))
+    # Learning paths reference users (and assessments with SET NULL).
+    deleted_counts["learning_paths"] = (
+        await db.execute(
+            delete(LearningPath).where(LearningPath.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Scenarios
-    await db.execute(select(Scenario).where(Scenario.user_id == user_id))
+    # Assessments reference users.
+    deleted_counts["assessments"] = (
+        await db.execute(
+            delete(Assessment).where(Assessment.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Assessment messages and assessments
-    await db.execute(
-        select(AssessmentMessage).where(AssessmentMessage.assessment_id.in_(
-            select(Assessment.id).where(Assessment.user_id == user_id)
-        ))
-    )
-    await db.execute(select(Assessment).where(Assessment.user_id == user_id))
+    # Generated lessons reference users.
+    deleted_counts["generated_lessons"] = (
+        await db.execute(
+            delete(GeneratedLesson).where(GeneratedLesson.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Generated lessons
-    await db.execute(select(GeneratedLesson).where(GeneratedLesson.user_id == user_id))
+    # Scenarios reference users.
+    deleted_counts["scenarios"] = (
+        await db.execute(
+            delete(Scenario).where(Scenario.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Path lessons and learning paths
-    await db.execute(
-        select(PathLesson).where(PathLesson.path_id.in_(
-            select(LearningPath.id).where(LearningPath.user_id == user_id)
-        ))
-    )
-    await db.execute(select(LearningPath).where(LearningPath.user_id == user_id))
+    # Progress entries reference users.
+    deleted_counts["progress_daily"] = (
+        await db.execute(
+            delete(ProgressDaily).where(ProgressDaily.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Progress entries
-    await db.execute(select(ProgressDaily).where(ProgressDaily.user_id == user_id))
+    # Settings reference users (but NOT provider configs).
+    deleted_counts["settings"] = (
+        await db.execute(
+            delete(Setting).where(Setting.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
 
-    # Settings (but NOT provider configs)
-    await db.execute(select(Setting).where(Setting.user_id == user_id))
-
-    # Reset user level and assessment status
+    # Reset user level and assessment status so the frontend starts fresh.
     current_user.current_level = "B1"
     current_user.assessment_completed = False
 
     await db.commit()
 
-    logger.info(f"Cleared all data for user {user_id}")
-    return {"message": "All user data cleared successfully"}
+    logger.info(
+        f"Cleared all data for user {user_id}: "
+        + ", ".join(f"{table}={count}" for table, count in deleted_counts.items())
+    )
+    return {
+        "message": "All user data cleared successfully",
+        "deleted": deleted_counts,
+    }
