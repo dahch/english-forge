@@ -202,7 +202,8 @@ export interface PathLesson {
   lesson_type: string
   topic: string
   description: string
-  content: string | null
+  // Backend JSON-parses the stored content column, so it arrives as an object.
+  content: { focus: string; lesson_type: string } | null
   order: number
   completed: boolean
   completed_at: string | null
