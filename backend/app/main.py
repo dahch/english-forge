@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+import sqlalchemy as sa
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -47,8 +48,6 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
 
 
 def _ensure_new_columns_sync(sync_conn) -> None:
-    import sqlalchemy as sa
-
     inspector = sa.inspect(sync_conn)
     for table, columns in _COLUMNS_TO_ADD.items():
         if not inspector.has_table(table):
@@ -58,6 +57,16 @@ def _ensure_new_columns_sync(sync_conn) -> None:
             if column_name not in existing:
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
                 logger.info(f"Added missing column {table}.{column_name}")
+
+
+# Partial unique indexes enforcing invariants that plain column adds can't
+# express. IF NOT EXISTS makes repeated startups idempotent.
+_INDEXES_TO_ADD: list[str] = [
+    # Only one in-progress assessment per user — makes the duplicate-start
+    # guard in POST /api/assessment/start atomic (see start_assessment).
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_user_in_progress "
+    "ON assessments (user_id) WHERE completed_at IS NULL",
+]
 
 
 def _validate_column_migration_metadata() -> None:
@@ -87,6 +96,8 @@ async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
+        for index_sql in _INDEXES_TO_ADD:
+            await conn.execute(text(index_sql))
     logger.info("Database tables created/verified")
 
     if settings.APP_PIN:

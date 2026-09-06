@@ -6,7 +6,7 @@ from sqlalchemy import case, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import ProgressDaily, TutorProfile
+from app.models.models import ProgressDaily, Setting, TutorProfile
 
 
 async def bump_daily_lessons(db: AsyncSession, user_id: str, delta: int = 1) -> None:
@@ -55,3 +55,24 @@ async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:
         "personality": profile.personality,
         "voice": profile.voice,
     }
+
+
+async def resolve_tts_voice(db: AsyncSession, user_id: str) -> str | None:
+    """Resolve the voice used when the tutor speaks.
+
+    Priority: tutor profile voice > settings tts_voice > None (the TTS engine
+    then falls back to TTS_DEFAULT_VOICE from the environment).
+    """
+    result = await db.execute(select(TutorProfile).where(TutorProfile.user_id == user_id))
+    profile = result.scalar_one_or_none()
+    if profile and profile.voice:
+        return profile.voice
+
+    result = await db.execute(
+        select(Setting).where(Setting.user_id == user_id, Setting.key == "tts_voice")
+    )
+    setting = result.scalar_one_or_none()
+    if setting and setting.value:
+        return setting.value
+
+    return None
