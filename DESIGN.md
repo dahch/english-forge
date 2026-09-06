@@ -45,8 +45,8 @@ graph TB
 
 `Base.metadata.create_all()` never alters existing tables, so the lifespan runs two idempotent syncs:
 
-1. **Columns** — `_COLUMNS_TO_ADD` adds missing columns inside `begin_nested()` savepoints: the original trio (`users.current_level`, `users.assessment_completed`, `progress_daily.lessons_completed`) plus the assessment v2 columns (`assessments.phase`/`section_step`/`dimension_scores` and `assessment_messages.kind`/`audio_url`/`metrics`). Concurrent-startup races are detected and skipped, real failures are logged loudly.
-2. **Indexes** — `_INDEXES_TO_ADD` creates partial unique indexes enforcing cross-request invariants (one in-progress assessment / one active learning path per user), making the corresponding application guards atomic (ADR-007).
+1. **Columns** — `_COLUMNS_TO_ADD` adds missing columns inside `begin_nested()` savepoints: the original trio (`users.current_level`, `users.assessment_completed`, `progress_daily.lessons_completed`) plus the assessment v2 columns (`assessments.phase`/`section_step`/`dimension_scores` and `assessment_messages.kind`/`audio_url`/`metrics`/`item_id` — the item id backing the one-answer-per-item unique index). Concurrent-startup races are detected and skipped, real failures are logged loudly.
+2. **Indexes** — `_INDEXES_TO_ADD` creates partial unique indexes enforcing cross-request invariants (one in-progress assessment / one active learning path per user; one answer per banked assessment item via `uq_assessment_messages_user_item` on `(assessment_id, item_id)`), making the corresponding application guards atomic (ADR-007).
 
 A validation step warns if `_COLUMNS_TO_ADD` drifts from `models.py`.
 
@@ -75,6 +75,8 @@ sequenceDiagram
     API-->>B: reply + corrections + vocab
 ```
 
+The conversation turn never fails on an LLM outage: if every provider fails (or all output is unusable), the backend replies with a fixed recovery line ("Sorry, I lost my train of thought…") so the conversation stays alive — the student's next message retries the LLM with full history. Corrections attach only to the user's message; `assistant_message.corrections` is always empty (the previous legacy duplication rendered each correction twice in the UI).
+
 The conversation and assessment pages always run Web Speech API in the browser; `whisper_server` and `personal_api` STT modes execute server-side in the WS flow. (`whisper_wasm` is selectable in Settings but not yet implemented client-side.)
 
 ### Assessment (multi-skill flow)
@@ -92,12 +94,12 @@ stateDiagram-v2
 
 1. `POST /api/assessment/start` — guarded by the partial unique index `uq_assessments_user_in_progress` (one in-progress assessment per user; duplicate starts fail atomically, not via SELECT-then-INSERT).
 2. `POST /api/assessment/{id}/message` — the single entry point for every phase; `handle_message()` dispatches on `assessments.phase`:
-   - **mic_check** — one fixed calibration sentence, then the LLM greets and opens the interview.
+   - **mic_check** — voice-only (a non-voice source is rejected with HTTP 400 — a typed answer would bypass the measurement): one fixed calibration sentence, then the LLM greets and opens the interview.
    - **conversation** — LLM interview, min 6 / max 10 exchanges (`MIN/MAX_ASSESSMENT_EXCHANGES`). Completion is detected **server-side first**: question cap reached or `wants_to_finish()` matches a short end-request utterance (≤4 words after punctuation stripping); the LLM's own `is_complete` flag is honored only once the minimum is met. Each LLM call retries up to 3 times with raw-response logging (ADR-010); on a total LLM outage the interview continues with a fixed line — phases never advance accidentally.
    - **listening** — audio-only items from the fixed bank (`assessment_bank.py`), tutor text never shown; LLM grading per item with keyword fallback; adaptive stop after `LISTENING_EARLY_STOP_FAILS` (2) consecutive fails.
-   - **speaking** — read-aloud items scored deterministically by `pronunciation.score_pronunciation()` (WER + phoneme PER + fluency from STT word timestamps). When the last item is answered, the handler returns `is_complete=True` — the transient `AssessmentResponse` flag telling the client to call `/complete`.
+   - **speaking** — voice-only (like mic_check) read-aloud items scored deterministically by `pronunciation.score_pronunciation()` (WER + phoneme PER + fluency from STT word timestamps). When the last item is answered, the handler returns `is_complete=True` — the transient `AssessmentResponse` flag telling the client to call `/complete`.
 3. Voice input — `POST /api/assessment/{id}/recordings` → `services/stt.py:transcribe_audio()` under a global 1-job semaphore (Moonshine saturates the box): personal-api first (returns word timestamps), in-process faster-whisper fallback (no timestamps). Returns transcript + words; the raw audio is never persisted.
-4. **Evidence integrity** (ADR-012) — the client merely echoes the STT `words` and the `item_id` it is answering; the server always recomputes pronunciation metrics itself and silently drops stale/duplicate submissions whose `item_id` no longer matches the current item. The client can never inject scores.
+4. **Evidence integrity** (ADR-012) — the client merely echoes the STT `words` and the `item_id` it is answering; the server always recomputes pronunciation metrics itself (and drops client word-timestamps that don't align with the transcript, so fluency can't be fabricated) and silently drops stale/duplicate submissions — atomically via the `(assessment_id, item_id)` unique index. The client can never inject scores.
 5. `POST /api/assessment/{id}/complete` — idempotent (re-calls return the stored result). Runs `analyze_assessment()`: deterministic aggregation in `assessment_scoring.py` (each dimension maps to a CEFR band, final level = conservative median, confidence from coverage/evidence/dispersion) plus up to 3 LLM attempts for the summary/recommendations prose. If every LLM attempt fails or returns an unusable shape, the analysis completes with a deterministic fallback built from the measured evidence (level + listening/pronunciation scores; grammar/vocabulary/fluency stay unmeasured) instead of failing the request — "Re-analyze Results" retries the LLM later. Updates the user's `current_level` and `assessment_completed`.
 6. `POST /api/assessment/{id}/reanalyze` — re-runs the analysis over the stored conversation (e.g. to recover a degraded earlier result). Per-process 30 s cooldown per assessment (HTTP 429 on repeat); requires a completed assessment (HTTP 400).
 7. Tutor audio — `GET /api/assessment/{id}/messages/{message_id}/audio` synthesizes on demand (Pocket TTS) and caches the data URI in `assessment_messages.audio_url` (`Text` column; never serialized in API responses).
@@ -107,11 +109,13 @@ stateDiagram-v2
 1. `POST /api/learning-paths/generate` (optional `assessment_id`) — the old active path is deactivated and the new path inserted atomically under the `uq_learning_paths_user_active` partial unique index.
 2. Lesson target comes from `LEVEL_LESSONS_REQUIRED` for the CEFR jump; if the LLM returns fewer lessons, `lessons_required` is **capped** to the actual count so the path can always complete.
 3. Up to 3 LLM attempts; parsed output is shape-validated (lessons list, allowed `lesson_type` values). `path_lessons.content` is stored as a JSON string and parsed to an object (or `null` on corrupt rows) by a Pydantic before-validator.
+4. **Interactive path lessons (ADR-014)** — opening a lesson calls `POST .../lessons/{lesson_id}/generate`, which lazily and idempotently generates the content (explanation, examples, 3–5 exercises) on first open: up to 3 LLM attempts, `parse_lesson_json` + `normalize_llm_lesson`, merged into the existing content JSON; when the path came from an assessment, the prompt personalizes toward the measured weaknesses. Exercises are graded by `POST .../exercise` (index + answer, case/trim-insensitive) — answers never leave the stored JSON (ADR-003/005 contract). Entity reloads after core UPDATEs use `populate_existing`, never `db.expire()`.
 
 ## Patterns Worth Knowing
 
 - **BYOK provider config** — providers live exclusively in `provider_configs` (encrypted keys, priority, per-task routing), managed through the Settings UI. The `*_API_KEY` env vars declared in `backend/app/config.py` are **not** consumed by `LLMRouter` — there is no env seeding (TBD despite the `.env.example` comment).
-- **Answer stripping** — exercise answers never leave the backend except through the exercise-check endpoints, which grade server-side and return `correct`/`correct_answer`/`explanation` (ADR-003/005/008).
+- **Answer stripping** — exercise answers never leave the backend except through the exercise-check endpoints, which grade server-side and return `correct`/`correct_answer`/`explanation` (ADR-003/005/008; the same contract covers learning-path lessons via ADR-014).
+- **`populate_existing` over `db.expire()`** — after core UPDATEs, reload rows with a `populate_existing` re-select; `db.expire()` makes the next attribute access lazy-load synchronously outside the greenlet (MissingGreenlet → 500).
 - **LLM output normalization** — `normalize_llm_lesson()` coerces double-encoded JSON, non-list values, and malformed exercises before persistence (ADR-008).
 - **Tolerant JSON** — all LLM responses go through `parse_llm_json` (dict-only) or `parse_lesson_json` (strict); multi-step flows retry 3× and log raw responses (ADR-010).
 

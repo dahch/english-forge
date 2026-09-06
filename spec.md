@@ -52,6 +52,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 
 - Generación de mini-lecciones de gramática/vocabulario bajo demanda por el LLM, basadas en los errores recurrentes del usuario ("veo que confundes present perfect vs past simple, aquí tienes una lección corta + 5 ejercicios").
 - Biblioteca local de lecciones fijas para temas base (tiempos verbales, phrasal verbs, preposiciones, etc.) como fallback sin necesitar LLM.
+- Las lecciones del **learning path** se abren como lecciones interactivas: el contenido (explicación, ejemplos y 3–5 ejercicios de completar/opción múltiple) se genera bajo demanda en la primera apertura — personalizado con las debilidades medidas del assessment — y los ejercicios se corrigen en el servidor (las respuestas correctas nunca viajan al frontend).
 
 ### 2.5 Progreso y gamificación
 
@@ -246,7 +247,7 @@ tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, u
 assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, phase, section_step, dimension_scores)
 
 -- assessment_messages table
-assessment_messages(id, assessment_id, role, text, kind, audio_url, metrics, created_at)
+assessment_messages(id, assessment_id, role, text, kind, audio_url, metrics, item_id, created_at)
 
 -- generated_lessons table
 generated_lessons(id, user_id, title, topic, level, explanation, examples, exercises, based_on_errors, completed, completed_at, created_at)
@@ -265,7 +266,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 
 > **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
-> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto (`{focus, lesson_type}`) mediante un `field_validator` y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path.
+> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path. El objeto arranca como metadatos (`{focus, lesson_type}`); `explanation`, `examples` y `exercises` se generan bajo demanda (lazy, idempotente) la primera vez que se abre la lección (`POST /api/learning-paths/{path_id}/lessons/{lesson_id}/generate`), y cada ejercicio se corrige en el servidor (`POST .../exercise`) — las respuestas correctas nunca se exponen al listado, solo vía el endpoint de corrección.
 
 ---
 
@@ -281,7 +282,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`, máquina de estados en `app/services/assessment_flow.py`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
 9. **Puntuación determinista**: el nivel final y la confianza **ya no los decide el LLM**. `listening` se puntúa por aciertos en los ítems (grading LLM por ítem con fallback por keywords), `pronunciation` con métricas objetivas por grabación (WER de palabras + PER fonémico vía phonemizer/espeak-ng + fluidez desde word timestamps de Moonshine; compuesto 60/25/15), y `grammar`/`vocabulary`/`fluency` con rúbrica LLM 0-100 sobre la transcripción. La agregación (`app/services/assessment_scoring.py`) mapea cada dimensión a banda CEFR (0-20 A1 … 86-100 C2), toma la mediana conservadora como nivel final y calcula la confianza a partir de cobertura de dimensiones, volumen de evidencia y dispersión. Strengths/weaknesses son etiquetas derivadas de dimensiones medidas — el LLM solo escribe resumen y recomendaciones, y nunca puede afirmar dimensiones sin evidencia.
 10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire). Si el LLM falla o devuelve una forma inesperada, el análisis se completa con un fallback determinista construido desde la evidencia medida (nivel + scores de listening/pronunciation; grammar/vocabulary/fluency quedan sin medir) en lugar de fallar la petición — «Re-analyze Results» reintenta el LLM más tarde.
-11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación y descarta envíos duplicados/desactualizados (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
+11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación — descartando además los timestamps que no se corresponden con el transcript, de modo que la fluidez no se puede fabricar — y descarta envíos duplicados/desactualizados de forma atómica vía el índice único parcial sobre `(assessment_id, item_id)` (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -388,8 +389,8 @@ english-forge/
 **Phase 4 — Progreso y lecciones** ✅
 - Dashboard, streaks, estimación CEFR heurística.
 - Generación de mini-lecciones basadas en errores recurrentes (CRUD de lecciones generadas, endpoint `/api/lessons/generate`).
-- Learning paths con progression automática.
-- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005).
+- Learning paths con progresión automática y lecciones interactivas cuyo contenido se genera bajo demanda (lazy) con corrección server-side.
+- Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005/014).
 
 **Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).

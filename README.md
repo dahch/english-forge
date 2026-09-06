@@ -8,7 +8,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 
 - **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2)
 - **CEFR Assessment** — Multi-skill placement: voice interview (min 6 exchanges), audio-only listening items, and read-aloud pronunciation scoring (WER + phoneme error rate + fluency), with per-dimension scores (A1–C2)
-- **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets and automatic progression
+- **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets, interactive lessons (content generated on open, exercises graded server-side), and automatic progression
 - **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
 - **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
 - **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with flashcards and quiz modes
@@ -158,7 +158,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, and learning paths (schemas plus lazy path-lesson content generation and server-side grading). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
