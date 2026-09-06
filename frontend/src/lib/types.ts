@@ -161,6 +161,15 @@ export interface QuizResult {
   explanation: string
 }
 
+// Assessment chat messages — unlike conversation Messages they carry no
+// session_id/audio_url (see backend AssessmentMessageResponse).
+export interface AssessmentMessage {
+  id: string
+  role: string
+  text: string
+  created_at: string
+}
+
 export interface Assessment {
   id: string
   started_at: string
@@ -171,7 +180,7 @@ export interface Assessment {
   weaknesses: string[] | null
   recommendations: string[] | null
   summary: string | null
-  messages: Message[]
+  messages: AssessmentMessage[]
   is_complete?: boolean
 }
 

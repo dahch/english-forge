@@ -53,6 +53,17 @@ export function isAuthenticated(): boolean {
 
 let redirecting = false
 
+// Typed error carrying the HTTP status, so callers can branch on status
+// codes (e.g. 404 = "no active X") instead of matching error message text.
+export class ApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
 function handleUnauthorized(): never {
   clearToken()
   setActiveSessionId(null)
@@ -84,7 +95,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || "Request failed")
+    throw new ApiError(err.detail || "Request failed", res.status)
   }
 
   if (res.status === 204) return undefined as T
