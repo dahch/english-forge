@@ -11,9 +11,6 @@ services:
     networks:
       - app
       - coolify
-    depends_on:
-      db:
-        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -29,23 +26,6 @@ services:
       - backend
     restart: unless-stopped
 
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: englishforge
-      POSTGRES_USER: ${DB_USER:-englishforge}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-englishforge}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    networks:
-      - app
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-englishforge}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
 networks:
   app:
     driver: bridge
@@ -53,5 +33,4 @@ networks:
     external: true
 
 volumes:
-  pgdata:
   backend_data:

@@ -87,10 +87,9 @@ def _ensure_new_columns_sync(sync_conn) -> None:
                     with sync_conn.begin_nested():
                         sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_def}"))
                     logger.info(f"Added missing column {table}.{column_name}")
-                # SQLite raises OperationalError for duplicate columns, Postgres
-                # raises ProgrammingError — catch both so the race handling
-                # below actually fires on both dialects.
-                except (sa.exc.ProgrammingError, sa.exc.OperationalError):
+                # SQLite raises OperationalError for duplicate columns —
+                # catch it so the race handling below actually fires.
+                except sa.exc.OperationalError:
                     if _column_exists(sync_conn, table, column_name):
                         logger.info(f"Column {table}.{column_name} already added by a concurrent startup — skipping")
                     else:
@@ -105,14 +104,8 @@ def _ensure_new_columns_sync(sync_conn) -> None:
 
 
 def _index_exists(sync_conn, table_name: str, index_name: str) -> bool:
-    if sync_conn.dialect.name == "sqlite":
-        rows = sync_conn.execute(text(f"PRAGMA index_list({table_name!r})")).fetchall()
-        return any(r[1] == index_name for r in rows)
-    rows = sync_conn.execute(
-        text("SELECT 1 FROM pg_indexes WHERE tablename = :t AND indexname = :n"),
-        {"t": table_name, "n": index_name},
-    )
-    return rows.first() is not None
+    rows = sync_conn.execute(text(f"PRAGMA index_list({table_name!r})")).fetchall()
+    return any(r[1] == index_name for r in rows)
 
 
 # Partial unique indexes enforcing invariants that plain column adds can't
@@ -146,9 +139,8 @@ def _ensure_indexes_sync(sync_conn) -> None:
                 sync_conn.execute(text(index_sql))
             logger.info(f"Verified index {index_name}")
         # SQLite raises OperationalError for duplicate-column/UNIQUE-violation
-        # DDL, Postgres raises ProgrammingError — catch both so the race
-        # handling below actually fires on both dialects.
-        except (sa.exc.ProgrammingError, sa.exc.OperationalError):
+        # DDL — catch it so the race handling below actually fires.
+        except sa.exc.OperationalError:
             if _index_exists(sync_conn, table_name, index_name):
                 logger.info(f"Index {index_name} already created by a concurrent startup — skipping")
             else:
