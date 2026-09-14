@@ -3,8 +3,10 @@ import type {
   CEFRResult,
   ConversationTurn,
   DashboardStats,
+  ExerciseCheckResult,
   GeneratedLesson,
   LearningPath,
+  LessonExercise,
   Message,
   PathLessonDetail,
   ProviderConfig,
@@ -18,6 +20,8 @@ import type {
   User,
   VocabItem,
 } from "./types"
+
+export type { LessonExercise, ExerciseCheckResult }
 
 // Same-origin by default: Next.js rewrites proxy /api/* to the backend
 // service inside the docker network. Override only for special setups.
@@ -126,20 +130,6 @@ export async function fetchBlob(path: string): Promise<Blob> {
   return res.blob()
 }
 
-export interface LessonExercise {
-  question: string
-  type: string
-  explanation: string
-  // multiple_choice only
-  options?: string[]
-}
-
-export interface ExerciseCheckResult {
-  correct: boolean
-  correct_answer: string
-  explanation: string
-}
-
 export interface LibraryLesson {
   id: string
   title: string
@@ -205,7 +195,7 @@ export const api = {
 
   vocab: {
     list: (filter: string = "all") => request<VocabItem[]>(`/api/vocab?filter=${filter}`),
-    create: (data: { word: string; definition: string; example: string }) =>
+    create: (data: { word: string; definition: string; example: string; ipa?: string | null }) =>
       request<VocabItem>("/api/vocab", {
         method: "POST",
         body: JSON.stringify(data),
@@ -304,6 +294,27 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify({ completed }),
       }),
+    startLessonConversation: (pathId: string, lessonId: string) =>
+      request<{ session_id: string }>(
+        `/api/learning-paths/${pathId}/lessons/${lessonId}/start-conversation`,
+        { method: "POST" }
+      ),
+    addVocabBatch: async (
+      items: { word: string; definition: string; example: string; ipa?: string | null }[]
+    ) => {
+      const results = await Promise.allSettled(
+        items.map((item) =>
+          api.vocab.create({
+            word: item.word,
+            definition: item.definition,
+            example: item.example,
+            ipa: item.ipa ?? null,
+          })
+        )
+      )
+      const count = results.filter((r) => r.status === "fulfilled").length
+      return { count }
+    },
     advance: (pathId: string) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/advance`, { method: "POST" }),
   },

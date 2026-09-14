@@ -236,16 +236,52 @@ export interface PathLesson {
   completed_at: string | null
 }
 
+export interface LessonExercise {
+  question: string
+  type: string
+  options?: string[]
+  explanation?: string
+}
+
+export interface ExerciseCheckResult {
+  correct: boolean
+  correct_answer: string
+  explanation: string
+}
+
+export interface VocabItemPayload {
+  word: string
+  definition: string
+  ipa?: string | null
+  example: string
+}
+
 // Interactive content of a path lesson. Metadata (focus/lesson_type) is stored
-// at path-generation time; explanation/examples/exercises are generated lazily
-// on first open (POST .../generate, idempotent). Answers never reach the
-// client — grading happens server-side.
+// at path-generation time; multi-type content is generated lazily on first open
+// (POST .../generate, idempotent). Answers never reach the client — grading
+// happens server-side.
 export interface PathLessonContent {
   focus?: string
   lesson_type?: string
+  title?: string
   explanation?: string
   examples?: string[]
-  exercises?: { question: string; type: string; options?: string[]; explanation?: string }[]
+  formula?: string
+  // Conversation
+  scenario_context?: string
+  goal?: string
+  tutor_role?: string
+  target_expressions?: string[]
+  // Vocabulary
+  items?: VocabItemPayload[]
+  vocab_items?: VocabItemPayload[]
+  // Listening & Reading / Writing
+  passage?: string
+  transcript?: string
+  audio_url?: string
+  writing_prompt?: string
+  // Interactive Exercises
+  exercises?: LessonExercise[]
 }
 
 // Shape of POST /learning-paths/{path_id}/lessons/{lesson_id}/generate.
