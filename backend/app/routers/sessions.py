@@ -60,28 +60,23 @@ async def list_sessions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(Session)
+    query = (
+        select(
+            Session,
+            func.count(Message.id).label("message_count"),
+            Scenario.name.label("scenario_name"),
+        )
+        .outerjoin(Scenario, Session.scenario_id == Scenario.id)
+        .outerjoin(Message, Message.session_id == Session.id)
         .where(Session.user_id == current_user.id)
+        .group_by(Session.id, Scenario.name)
         .order_by(Session.started_at.desc())
         .offset(skip)
         .limit(limit)
     )
-    sessions = result.scalars().all()
-
-    responses = []
-    for s in sessions:
-        msg_count = await db.execute(
-            select(func.count(Message.id)).where(Message.session_id == s.id)
-        )
-        count = msg_count.scalar() or 0
-
-        scenario_name = None
-        if s.scenario_id:
-            sc = await db.execute(select(Scenario.name).where(Scenario.id == s.scenario_id))
-            scenario_name = sc.scalar_one_or_none()
-
-        responses.append(SessionResponse(
+    rows = (await db.execute(query)).all()
+    return [
+        SessionResponse(
             id=s.id,
             scenario_id=s.scenario_id,
             started_at=s.started_at,
@@ -90,8 +85,9 @@ async def list_sessions(
             provider_used=s.provider_used,
             scenario_name=scenario_name,
             message_count=count,
-        ))
-    return responses
+        )
+        for s, count, scenario_name in rows
+    ]
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
