@@ -118,8 +118,63 @@ stateDiagram-v2
 5. **Lesson-linked conversation sessions** — `POST .../lessons/{lesson_id}/start-conversation` creates or reuses an in-character custom scenario (`Lesson: {topic}`) pre-configured with the lesson's goal and target expressions, and initializes an active conversation `Session` with an opening tutor message in character.
 6. **Elimination of facade completion & flexible grading** — curriculum cards replace the instant "Complete" shortcut with "Start Lesson / Open". Lessons can only be completed by completing exercises or engaging with the lesson activity. Exercise checks (`POST .../exercise`) perform flexible normalization (`_resolve_mcq_answer` handles 0/1-based indices, letters A–D, and full option strings; `_clean_str` strips punctuation, quotes, and whitespace). Once all required lessons are completed, `POST .../advance` promotes `user.current_level`, synchronizes the `default_cefr` setting, deactivates the finished path, and activates the next CEFR level path. Entity reloads after core UPDATEs use `populate_existing`, never `db.expire()`.
 
+### Vocabulary SRS & Flashcard Review Flow
+
+The vocabulary system incorporates an Anki-compatible SuperMemo 2 (SM-2) spaced repetition engine with an interactive flashcard review mode, Web Speech audio pronunciation, and daily progress tracking (ADR-016).
+
+```mermaid
+sequenceDiagram
+    participant U as Learner (Browser)
+    participant UI as Vocab UI (/vocab)
+    participant API as Vocab API (/api/vocab)
+    participant SRS as SM-2 Engine (sm2.py)
+    participant DB as SQLite DB
+
+    Note over U,UI: Learner clicks "Review Now" on Dashboard (/vocab?mode=review)
+    UI->>API: GET /review/due?limit=50
+    API->>DB: SELECT WHERE next_review_at <= today OR next_review_at IS NULL
+    DB-->>API: due items (ordered nulls first)
+    API-->>UI: list of due cards
+
+    loop For each due card
+        UI->>U: Display card front (Word)
+        opt Pronounce audio
+            U->>UI: Click Volume2 or press 'R'
+            UI->>U: Web Speech API synthesis (US / UK accent)
+        end
+        U->>UI: Click "Show Answer" (or Space/Enter)
+        UI->>U: Reveal card back (Definition, IPA, Context Example)
+        U->>UI: Select rating (Again=0, Hard=3, Good=4, Easy=5)
+        UI->>API: POST /{id}/review { quality: 0..5 }
+        API->>SRS: sm2_update(quality, ease_factor, interval_days)
+        SRS-->>API: new_ease_factor, new_interval_days
+        API->>DB: UPDATE vocab_items (interval, EF, next_review_at, last_reviewed_at)
+        API->>DB: INSERT/UPDATE progress_daily (increment reviews_done)
+        DB-->>API: commit
+        API-->>UI: ReviewCardResponse
+        UI->>U: Audio chime feedback + advance to next card
+    end
+
+    UI->>U: Session complete screen (retention rate, tier breakdown)
+```
+
+1. **Due Card Selection & Null Safety** — `GET /api/vocab/review/due` queries items where `next_review_at <= date.today() OR next_review_at IS NULL`, ordered by `next_review_at.asc().nulls_first()`. Words newly created or imported from learning paths without an initial review date are scheduled first. The same condition drives the `due_today` badge in `dashboard.py` and the `/vocab?filter=due` tab.
+2. **Pronunciation Audio** — Client-side Web Speech API synthesizes target words (`rate = 0.88`) with system voice matching for American English (`en-US`) and British English (`en-GB`). Accent preference is persisted in `localStorage` (`ef_vocab_accent`). Audio is accessible from the list view, the flashcard review front/back, and keyboard shortcuts (`R` / `A`).
+3. **SM-2 Response Rating & Quality Mapping**:
+   - **Again (Quality 0)**: Complete blackout. Resets `interval_days = 1` and subtracts 0.20 from `ease_factor` (clamped at minimum 1.30).
+   - **Hard (Quality 3)**: Correct recall with serious difficulty. Advances interval (`round(interval * ease_factor)`) while penalizing `ease_factor` by -0.14. *Note: In standard SM-2, quality < 3 is treated as a failure resetting interval to 1 day; quality 3 is the lowest passing grade, accurately implementing Anki's Hard rating without an unintended reset.*
+   - **Good (Quality 4)**: Successful recall after slight hesitation. Standard SM-2 interval progression (0 → 1 → 6 → `interval * ease_factor`), leaving `ease_factor` unchanged (delta 0.00).
+   - **Easy (Quality 5)**: Perfect, immediate recall. Advances interval and increases `ease_factor` by +0.10.
+   - **Ease Factor Stabilization**: Ease factors are rounded to 2 decimal places (`round(..., 2)`) to eliminate floating-point drift across repeated review cycles.
+4. **Daily Progress & Batched Streak Calculation** — Each card review increments `progress_daily.reviews_done` for `date.today()`. In `dashboard.py`, the 365-day streak calculation queries the past year's daily records in a single query (`ProgressDaily.date >= today - 365`) indexed by date in memory, replacing 365 sequential database round-trips.
+5. **Dashboard Direct Review CTA** — When `stats.due_for_review > 0`, the dashboard's "Due for Review" card renders with active accent styling and a "Review Now" button linking directly to `/vocab?mode=review`.
+6. **Quiz Word Boundary Replacement** — In `generate_quiz`, context sentences blank out the target word using regex word boundary matching `re.sub(rf"\b{re.escape(item.word)}\b", ...)` case-insensitively, preventing corruptions where words are replaced inside larger words (e.g. "cat" inside "caterpillar").
+
 ## Patterns Worth Knowing
 
+- **SM-2 quality mapping & ease-factor rounding** — `sm2_update()` maps "Hard" to quality 3 (correct with difficulty, preserving interval scaling with EF penalty) rather than quality < 3 (which forces interval reset to 1 day). Ease factors are rounded to 2 decimals on each transition.
+- **Due items null-safety** — vocabulary and dashboard due queries check `or_(VocabItem.next_review_at <= today, VocabItem.next_review_at.is_(None))` so newly imported or unreviewed words surface immediately for review.
+- **Single-query streak lookup** — `dashboard.py` retrieves all `ProgressDaily` entries for the last 365 days in one query and tests dates against an in-memory dictionary instead of firing 365 individual SQL queries.
 - **BYOK provider config** — providers live exclusively in `provider_configs` (encrypted keys, priority, per-task routing), managed through the Settings UI. The `*_API_KEY` env vars declared in `backend/app/config.py` are **not** consumed by `LLMRouter` — there is no env seeding (TBD despite the `.env.example` comment).
 - **Answer stripping** — exercise answers never leave the backend except through the exercise-check endpoints, which grade server-side and return `correct`/`correct_answer`/`explanation` (ADR-003/005/008; the same contract covers learning-path lessons via ADR-014).
 - **`populate_existing` over `db.expire()`** — after core UPDATEs, reload rows with a `populate_existing` re-select; `db.expire()` makes the next attribute access lazy-load synchronously outside the greenlet (MissingGreenlet → 500).

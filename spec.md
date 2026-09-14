@@ -43,10 +43,14 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 
 ### 2.3 Vocabulario y SRS
 
-- Banco de palabras/expresiones personal, alimentado automáticamente desde las conversaciones (o añadido manualmente).
-- Algoritmo de repetición espaciada tipo **SM-2** (igual que Anki) para repasos diarios.
-- Tarjetas con: palabra, definición, pronunciación (IPA + audio TTS), frase de ejemplo, frase generada por el usuario en su última práctica.
-- Modo "quiz" rápido (multiple choice / completar frase / escuchar y escribir).
+- Banco de palabras/expresiones personal, alimentado automáticamente desde las conversaciones, importación desde rutas de aprendizaje (`/api/vocab/import-batch`) o añadido manual.
+- Algoritmo de repetición espaciada tipo **SM-2** (estilo Anki) para repasos diarios:
+  - **Modo Flashcard Review** (`/vocab?mode=review`): interfaz dedicada de repaso con dos fases: anverso (término y pronunciación TTS) y reverso ("Show Answer", transcripción IPA, definición y ejemplo contextual).
+  - **Calificación en 4 niveles SM-2**: Again (calidad 0, reinicio de intervalo a 1 día), Hard (calidad 3, retención difícil con penalización de facilidad sin reiniciar intervalo), Good (calidad 4, avance estándar SM-2), Easy (calidad 5, avance con bonificación).
+  - **Pronunciación y acentos**: síntesis de voz en cliente (Web Speech API) con selector de acento estadounidense (US) o británico (UK) persistido localmente y atajos de teclado (R/A para escuchar, Espacio/Enter para revelar/Good, 1-4 para calificar).
+  - **Soporte de pendientes y Dashboard**: selección de tarjetas pendientes que incluye términos nuevos sin fecha previa (`next_review_at IS NULL`), y enlace directo «Review Now» desde la tarjeta de repaso del Dashboard.
+  - **Resumen post-sesión**: pantalla de completado con desglose de calificaciones (Again/Hard/Good/Easy) y cálculo de tasa de retención.
+- Modo "quiz" rápido (multiple choice / completar frase con enmascaramiento regex por frontera de palabra).
 
 ### 2.4 Lecciones estructuradas
 
@@ -85,8 +89,12 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
   - El botón de las tarjetas del camino debe ser «Empezar lección / Abrir» en lugar de un botón «Complete» que salte el aprendizaje sin enseñar nada.
 
 - **REQ-SRS-1 (Modo Repaso Flashcards SRS Anki/SM-2)**:
-  - La pantalla `/vocab` debe incluir una interfaz real de repaso por tarjetas espaciadas (Flashcards) con calificación SM-2 (Again, Hard, Good, Easy / calidad 0 a 5).
-  - Las tarjetas de vocabulario deben contar con botón de audio para escuchar la pronunciación TTS en inglés.
+  - La pantalla `/vocab` debe incluir una interfaz real de repaso por tarjetas espaciadas (Flashcards) accesible mediante `/vocab?mode=review` o el botón «Review Now» del Dashboard.
+  - Flujo de dos caras con revelado controlado ("Show Answer"): anverso (término y audio) y reverso (definición, transcripción IPA y frase de ejemplo contextual).
+  - 4 botones de evaluación SM-2 con atajos de teclado: Again [0] (reinicio a 1 día), Hard [3] (retención con dificultad sin reinicio de intervalo, penaliza factor de facilidad), Good [4] (progresión estándar) y Easy [5] (progresión acelerada).
+  - Audio TTS de pronunciación en cliente (Web Speech API) con selector de acento US/UK persistido en `localStorage` y atajo 'R' / 'A'.
+  - Las tarjetas no revisadas (`next_review_at IS NULL`) se integran automáticamente como pendientes tanto en la cola de repaso como en el contador del Dashboard.
+  - Pantalla final de resumen con estadísticas por calificación y puntuación porcentual de retención.
 
 - **REQ-CONV-1 (Inicio Proactivo del Tutor en Escenarios y Voz Universal)**:
   - Al iniciar un escenario (o conversación en el path), el tutor IA debe enviar el primer mensaje de saludo/contextualización en personaje con audio TTS, guiando al alumno.

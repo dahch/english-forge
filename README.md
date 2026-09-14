@@ -11,7 +11,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 - **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets, specialized multi-type interactive lessons (conversation roleplay with direct AI tutor launch, vocabulary with one-click SRS deck import, listening with audio passages, grammar with rule formulas), server-side exercise grading with flexible normalization, elimination of skip facades, and automatic CEFR level progression
 - **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
 - **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
-- **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with flashcards and quiz modes
+- **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with dedicated Flashcard Review mode (`/vocab?mode=review`), Web Speech pronunciation audio with US/UK accent toggle and keyboard shortcuts, 4-tier response grading (Again, Hard, Good, Easy), session retention metrics, dashboard "Review Now" quick launcher, and multiple-choice / fill-in-the-blank quiz modes
 - **Lessons** — Static grammar library + dynamic LLM-generated lessons based on your error patterns
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
 - **PWA** — Installable on mobile and desktop
@@ -158,7 +158,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, and learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading). The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), and vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
