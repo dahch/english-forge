@@ -183,6 +183,20 @@ export const api = {
     end: (id: string) =>
       request<SessionSummary>(`/api/sessions/${id}/end`, { method: "PATCH" }),
     messages: (id: string) => request<Message[]>(`/api/sessions/${id}/messages`),
+    uploadRecording: (
+      sessionId: string,
+      blob: Blob
+    ): Promise<{ transcript: string; words: unknown[] }> => {
+      const formData = new FormData()
+      formData.append("file", blob, "recording.webm")
+      return request<{ transcript: string; words: unknown[] }>(
+        `/api/sessions/${sessionId}/recordings`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      )
+    },
   },
 
   messages: {

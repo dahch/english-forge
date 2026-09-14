@@ -39,6 +39,7 @@ export interface Session {
   provider_used: string | null
   scenario_name: string | null
   message_count: number
+  initial_message?: Message
 }
 
 export interface Correction {

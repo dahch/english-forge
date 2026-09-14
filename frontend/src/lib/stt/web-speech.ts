@@ -8,6 +8,7 @@ export interface STTProvider {
   stop(): Promise<void>
   onResult(callback: (text: string) => void): void
   onError(callback: (error: string) => void): void
+  onEnd(callback: () => void): void
   isAvailable(): boolean
 }
 
@@ -15,6 +16,7 @@ export class WebSpeechSTT implements STTProvider {
   private recognition: any = null
   private resultCallback: ((text: string) => void) | null = null
   private errorCallback: ((error: string) => void) | null = null
+  private endCallback: (() => void) | null = null
 
   isAvailable(): boolean {
     return typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)
@@ -41,6 +43,10 @@ export class WebSpeechSTT implements STTProvider {
       this.errorCallback?.(event.error || "Speech recognition error")
     }
 
+    this.recognition.onend = () => {
+      this.endCallback?.()
+    }
+
     this.recognition.start()
   }
 
@@ -54,5 +60,9 @@ export class WebSpeechSTT implements STTProvider {
 
   onError(callback: (error: string) => void): void {
     this.errorCallback = callback
+  }
+
+  onEnd(callback: () => void): void {
+    this.endCallback = callback
   }
 }
