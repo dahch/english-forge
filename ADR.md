@@ -139,3 +139,39 @@
 - **Consequences**: 
   - Pros: LLM cost is paid only for lessons actually opened; content is personalized to assessment weaknesses; answers never reach the client; the detail view renders instantly from the stub card while content loads in.
   - Cons: The first open of a lesson pays LLM latency (shown as a loading skeleton) and surfaces HTTP 503 if generation fails (retry re-opens the lesson); a lesson can still be marked complete from the path-card shortcut without opening it; callers must never use `db.expire()` on rows that are serialized afterwards.
+
+## ADR-015: Resilient Multi-Type Path Lessons and Elimination of Facades
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: Path lessons were generic fill-blank quizzes regardless of whether the type was `conversation`, `listening`, or `vocabulary`. Lazy generation timed out through Next.js proxy (socket hang up) leaving broken skeletons, and the card shortcut encouraged skipping without learning.
+- **Decision**:
+  - Distinguish lesson types with concrete interactive capabilities:
+    - `conversation`: displays dialogue context, target vocabulary/structures, and a button to launch an active conversation session with the AI tutor focused on this exact topic.
+    - `listening`: synthesizes an audio passage with Pocket TTS, prompts comprehension questions, and allows transcript review.
+    - `vocabulary`: provides words with IPA, definitions, audio playback, and a one-click "Add to Vocab / SRS Deck" action.
+    - `grammar`/`reading`: detailed explanations with instant server-graded practice.
+  - Replace the list "Complete" shortcut with "Start Lesson / Open". A lesson can only be marked complete once the student has engaged with its content or submitted exercises.
+  - Mitigate generation timeouts by capping prompts, caching syllabus seeds, and pre-generating curriculum templates.
+
+## ADR-016: Dedicated SRS Flashcard Review Interface (SM-2)
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: The backend implemented the SM-2 algorithm (`/api/vocab/{id}/review`), but the UI only presented a 5-question quiz and a static list. The spaced repetition capability was essentially a dead facade for the end-user.
+- **Decision**: Implement a dedicated Flashcard Review mode in `/vocab`: cards display front (word), audio pronunciation button, "Show Answer" reveal with definition, IPA and contextual examples, and 4 grading buttons (Again [0], Hard [2], Good [4], Easy [5]) hooked directly to SM-2 calculations.
+
+## ADR-017: Proactive Tutor Roleplay Greetings & Universal Audio STT in Conversation
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: When starting a scenario, the tutor never initiated the conversation, forcing the user to speak first without prompt or context. Furthermore, microphone input in conversation was bound exclusively to browser `WebSpeechSTT`, failing on Firefox, Safari, and Linux setups, despite the homelab already having Moonshine/faster-whisper STT.
+- **Decision**:
+  - On session creation for a scenario, automatically generate or select the tutor's opening line and synthesize its TTS audio so the student is greeted immediately.
+  - Enable the microphone button to use `MediaRecorder` + backend STT (`/api/sessions/{id}/recordings` or unified audio endpoint) with automatic fallback to Web Speech API when supported.
+  - Provide a UI modal for creating custom scenarios.
+
+## ADR-018: Flexible Lesson Hub & Unblocked Curriculum Generation
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: `/api/lessons/generate` rejected users without prior conversation mistakes (HTTP 400). The static library had only 5 files with no CEFR filter or completion tracking.
+- **Decision**:
+  - Unblock lesson generation: allow users to request lessons by topic (e.g. "Past Simple vs Present Perfect", "Job Interviewing") or target CEFR level, falling back to conversation errors if available.
+  - Track completed state for library lessons so users see their cumulative progress.

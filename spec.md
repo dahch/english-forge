@@ -68,9 +68,39 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 ### 2.7 Fuera de alcance (explícitamente simplificado)
 
 - Avatar animado / lipsync: **no es prioridad** (según lo indicado). Se deja un placeholder de avatar estático o un simple indicador de "hablando/escuchando", con arquitectura preparada por si luego se quiere añadir (Live2D / Ready Player Me) sin rehacer nada.
-- Multiusuario, pagos, onboarding comercial: no aplica (uso personal).
+- Pagos, onboarding comercial: no aplica (uso personal).
 
 ---
+
+### 2.8 Requerimientos Funcionales Completos (Cierre de Fachadas y Funcionalidades Capadas)
+
+- **REQ-LP-1 (Generación y Contenido Real de Rutas de Aprendizaje)**:
+  - La generación de `learning-path` no debe limitarse a meros títulos o nombres en blanco ni bloquearse por timeouts de red. Debe generar de inmediato un currículo estructurado y completo acorde al nivel CEFR y debilidades del assessment.
+  - Cada lección del camino debe contener material educativo real y relevante: explicaciones conceptuales, ejemplos contextuales y ejercicios interactivos calificados en servidor.
+  - Cada tipo de lección (`vocabulary`, `grammar`, `conversation`, `listening`, `reading`, `writing`) debe proporcionar su experiencia correspondiente:
+    - **Conversation**: Contexto del roleplay, expresiones clave y botón de acción directa «Iniciar Conversación con Tutor sobre este tema». Al terminar la sesión, la lección se marca como completada.
+    - **Listening**: Pasaje en audio generado por TTS Pocket, preguntas de comprensión y revelado de transcripción.
+    - **Vocabulary**: Términos clave con definición, ejemplo, botón de audio TTS y botón «Añadir a mi mazo de vocabulario (SRS)».
+    - **Grammar**: Reglas claras, fórmulas, ejemplos y ejercicios con retroalimentación instantánea.
+  - El botón de las tarjetas del camino debe ser «Empezar lección / Abrir» en lugar de un botón «Complete» que salte el aprendizaje sin enseñar nada.
+
+- **REQ-SRS-1 (Modo Repaso Flashcards SRS Anki/SM-2)**:
+  - La pantalla `/vocab` debe incluir una interfaz real de repaso por tarjetas espaciadas (Flashcards) con calificación SM-2 (Again, Hard, Good, Easy / calidad 0 a 5).
+  - Las tarjetas de vocabulario deben contar con botón de audio para escuchar la pronunciación TTS en inglés.
+
+- **REQ-CONV-1 (Inicio Proactivo del Tutor en Escenarios y Voz Universal)**:
+  - Al iniciar un escenario (o conversación en el path), el tutor IA debe enviar el primer mensaje de saludo/contextualización en personaje con audio TTS, guiando al alumno.
+  - La entrada de voz en `/conversation` no debe depender únicamente de la Web Speech API del navegador: debe ofrecer grabación de audio con transcripción en el backend (Moonshine/faster-whisper) como en el assessment, garantizando funcionamiento en cualquier navegador o móvil.
+  - La interfaz debe permitir crear escenarios personalizados directamente desde la UI.
+
+- **REQ-LESS-1 (Generación Flexible de Lecciones en la Biblioteca)**:
+  - La generación de lecciones en `/lessons` debe permitir elegir un tema o nivel CEFR libremente, sin bloquearse si el usuario no tiene errores previos en conversaciones.
+  - Las lecciones de la biblioteca deben tener seguimiento de completado y visualización de progreso.
+
+- **REQ-SYS-1 (Eliminación de Fachadas y Robustez de Infraestructura)**:
+  - Eliminar opciones de fachada sin implementar (como `whisper_wasm` en Settings).
+  - Soporte de fallback en `LLMRouter` a claves de entorno (`.env`) si no se han configurado proveedores en la base de datos.
+  - Corregir el ciclo de vida de la sesión de base de datos en WebSockets (`ws.py`).
 
 ## 3. Arquitectura técnica
 
@@ -266,7 +296,7 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 
 > **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
-> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path. El objeto arranca como metadatos (`{focus, lesson_type}`); `explanation`, `examples` y `exercises` se generan bajo demanda (lazy, idempotente) la primera vez que se abre la lección (`POST /api/learning-paths/{path_id}/lessons/{lesson_id}/generate`), y cada ejercicio se corrige en el servidor (`POST .../exercise`) — las respuestas correctas nunca se exponen al listado, solo vía el endpoint de corrección.
+> **Nota**: `path_lessons.content` se guarda como string JSON en la BD; la API lo parsea a un objeto y devuelve `null` si el JSON es inválido o no es un objeto, para que una fila corrupta no rompa la respuesta completa del path. El objeto arranca como metadatos (`{focus, lesson_type}`); el contenido especializado (`explanation`, `formula`, `examples`, `vocab_items`, `scenario_context`/`target_expressions`, `passage`/`transcript`, `exercises`) se genera bajo demanda (lazy, idempotente) la primera vez que se abre la lección (`POST /api/learning-paths/{path_id}/lessons/{lesson_id}/generate`). Las lecciones de conversación pueden inicializar una sesión de práctica interactiva con el tutor (`POST .../start-conversation`). Cada ejercicio interactivo se corrige en el servidor (`POST .../exercise`) con normalización flexible (letras, índices u opciones completas) — las respuestas correctas nunca se exponen al listado, solo vía el endpoint de corrección. No existen atajos de marcado completado sin interacción real.
 
 ---
 
