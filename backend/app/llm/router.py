@@ -273,6 +273,18 @@ def parse_lesson_json(content: str) -> dict[str, Any]:
                 data = json.loads(attempt)
             except json.JSONDecodeError:
                 continue
-            if isinstance(data, dict) and ("exercises" in data or "title" in data):
+            if isinstance(data, dict) and any(
+                k in data
+                for k in (
+                    "exercises",
+                    "title",
+                    "scenario_context",
+                    "items",
+                    "vocab_items",
+                    "passage",
+                    "explanation",
+                    "goal",
+                )
+            ):
                 return data
     raise ValueError("No lesson JSON found in LLM response")
