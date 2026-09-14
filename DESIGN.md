@@ -52,7 +52,7 @@ A validation step warns if `_COLUMNS_TO_ADD` drifts from `models.py`.
 
 ## Key Flows
 
-### Conversation turn
+### Conversation turn & session lifecycle
 
 ```mermaid
 sequenceDiagram
@@ -61,8 +61,30 @@ sequenceDiagram
     participant L as LLM Router
     participant PA as personal-api
 
-    B->>B: STT (Web Speech API, client-side)
-    B->>API: user text + JWT
+    Note over B,API: 1. Session Creation (Proactive Greeting)
+    B->>API: POST /api/sessions {scenario_id, cefr_level}
+    opt custom scenario
+        API->>L: complete_with_fallback() → roleplay opening line
+    end
+    API->>PA: POST /v1/speak {text: greeting, voice, model}
+    PA-->>API: audio_base64
+    API->>API: persist initial Message(role="assistant", audio_url)
+    API-->>B: SessionResponse (initial_message + audio)
+    B->>B: autoplay opening greeting
+
+    Note over B,API: 2. Voice Input & Backend STT
+    B->>B: MediaRecorder (live meter, 30s cap)
+    alt MediaRecorder supported
+        B->>API: POST /api/sessions/{id}/recordings (multipart/form-data)
+        API->>PA: transcribe_audio() (Moonshine / faster-whisper)
+        PA-->>API: transcript + words
+        API-->>B: { transcript, words }
+    else Fallback
+        B->>B: Web Speech API (client-side speech recognition)
+    end
+
+    Note over B,API: 3. Conversation Turn
+    B->>API: user text + JWT (POST /api/sessions/{id}/messages)
     API->>API: build_system_prompt (persona + CEFR + scenario)
     API->>L: chat() — priority-ordered providers, fallback on error
     L-->>API: raw response
@@ -75,9 +97,10 @@ sequenceDiagram
     API-->>B: reply + corrections + vocab
 ```
 
-The conversation turn never fails on an LLM outage: if every provider fails (or all output is unusable), the backend replies with a fixed recovery line ("Sorry, I lost my train of thought…") so the conversation stays alive — the student's next message retries the LLM with full history. Corrections attach only to the user's message; `assistant_message.corrections` is always empty (the previous legacy duplication rendered each correction twice in the UI).
-
-The conversation and assessment pages always run Web Speech API in the browser; `whisper_server` and `personal_api` STT modes execute server-side in the WS flow. (`whisper_wasm` is selectable in Settings but not yet implemented client-side.)
+1. **Proactive Tutor Roleplay Greetings (ADR-017)** — When a session starts (`POST /api/sessions`), the backend ensures the student is not met with silence. For built-in scenarios, it selects from curated opening lines (`SCENARIO_OPENING_GREETINGS`); for custom scenarios, it invokes `LLMRouter` (max 80 tokens) to craft an in-character opening greeting (with a safe fallback template). The greeting is eagerly synthesized into TTS audio (`TTSPersonalAPI`), persisted as the initial `assistant` message with `audio_url`, and returned in `SessionResponse.initial_message` for immediate autoplay in the frontend.
+2. **Universal Voice Recording & Server-Side STT** — Voice input uses browser `MediaRecorder` with a live volume visualizer and a 30-second cap, uploading recorded audio to `POST /api/sessions/{session_id}/recordings`. The endpoint enforces session ownership, active status (`ended_at IS NULL`), audio mime-type validation, and a 10MB limit before calling `transcribe_audio()` under a global 1-job semaphore (Moonshine via personal-api first, in-process faster-whisper fallback). If `MediaRecorder` is unavailable or fails, the interface falls back seamlessly to browser Web Speech API.
+3. **Turn Resilience & Error Recovery** — The conversation turn never fails on an LLM outage: if every provider fails (or all output is unusable), the backend replies with a fixed recovery line ("Sorry, I lost my train of thought…") so the conversation stays alive — the student's next message retries the LLM with full history. Corrections attach only to the user's message; `assistant_message.corrections` is always empty (the previous legacy duplication rendered each correction twice in the UI).
+4. **Custom Scenarios & Collapsible Briefing** — Users can create customized roleplay scenarios on the fly via a modal dialog (`POST /api/scenarios`), complete with targeted CEFR levels and prompt context. During active sessions, a collapsible briefing header allows learners to inspect scenario context, tutor roles, and learning objectives without obstructing the conversation history.
 
 ### Assessment (multi-skill flow)
 
@@ -180,6 +203,9 @@ sequenceDiagram
 - **`populate_existing` over `db.expire()`** — after core UPDATEs, reload rows with a `populate_existing` re-select; `db.expire()` makes the next attribute access lazy-load synchronously outside the greenlet (MissingGreenlet → 500).
 - **LLM output normalization** — `normalize_llm_lesson()` coerces double-encoded JSON, non-list values, and malformed exercises before persistence (ADR-008).
 - **Tolerant JSON** — all LLM responses go through `parse_llm_json` (dict-only) or `parse_lesson_json` (strict); multi-step flows retry 3× and log raw responses (ADR-010).
+- **Consolidated single-query session listing** — `GET /api/sessions` executes a single query joining `Scenario` and `Message` with `func.count(Message.id)` and `group_by(Session.id, Scenario.name)` to fetch session entities, message counts, and scenario names in one round-trip, eliminating N+1 database queries.
+- **Proactive tutor greeting on session creation** — `POST /api/sessions` generates an initial in-character message (curated mapping or LLM completion with fallback) and synthesizes Pocket TTS audio on session creation so students are immediately greeted when opening a scenario (ADR-017).
+- **Universal voice recording with STT fallback** — Conversation audio uses `MediaRecorder` uploaded to `POST /api/sessions/{id}/recordings` (10MB limit, mime-type validated, Moonshine/faster-whisper transcription under a 1-job semaphore), with seamless fallback to client-side Web Speech API.
 
 ## External Dependencies
 

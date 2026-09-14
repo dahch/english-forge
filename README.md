@@ -6,11 +6,11 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 
 ## Features
 
-- **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2)
+- **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2), proactive in-character tutor opening greetings with Pocket TTS synthesis/autoplay, custom scenario creation modal with LLM-generated greetings, and collapsible scenario briefing header
 - **CEFR Assessment** — Multi-skill placement: voice interview (min 6 exchanges), audio-only listening items, and read-aloud pronunciation scoring (WER + phoneme error rate + fluency), with per-dimension scores (A1–C2)
 - **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets, specialized multi-type interactive lessons (conversation roleplay with direct AI tutor launch, vocabulary with one-click SRS deck import, listening with audio passages, grammar with rule formulas), server-side exercise grading with flexible normalization, elimination of skip facades, and automatic CEFR level progression
 - **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
-- **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
+- **Voice** — Universal recording via MediaRecorder with live audio visualizer and server-side transcription (`/api/sessions/{id}/recordings` and `/api/assessment/{id}/recordings` via Moonshine / faster-whisper), plus browser Web Speech API fallback; TTS (Pocket TTS via personal-api)
 - **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with dedicated Flashcard Review mode (`/vocab?mode=review`), Web Speech pronunciation audio with US/UK accent toggle and keyboard shortcuts, 4-tier response grading (Again, Hard, Good, Easy), session retention metrics, dashboard "Review Now" quick launcher, and multiple-choice / fill-in-the-blank quiz modes
 - **Lessons** — Static grammar library + dynamic LLM-generated lessons based on your error patterns
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
@@ -105,7 +105,7 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
-**Note:** The conversation page uses Web Speech API in the browser. The assessment page records with MediaRecorder and transcribes server-side (Moonshine via personal-api, faster-whisper in-process fallback). The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
+**Note:** Both conversation and assessment pages use universal voice recording: audio captured via `MediaRecorder` (up to 10MB, with live audio level meter and countdown timer) is transcribed server-side via `POST /api/sessions/{session_id}/recordings` or `POST /api/assessment/{id}/recordings` (Moonshine via personal-api, faster-whisper in-process fallback). If `MediaRecorder` is unavailable or fails, conversation recording falls back seamlessly to client-side Web Speech API. The `whisper_server` and `personal_api` modes also run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
 
 ## Architecture
 
@@ -158,7 +158,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), and vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation). The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, and single-query session listing aggregation). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
