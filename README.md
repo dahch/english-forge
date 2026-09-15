@@ -9,8 +9,8 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 - **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2), proactive in-character tutor opening greetings with Pocket TTS synthesis/autoplay, custom scenario creation modal with LLM-generated greetings, and collapsible scenario briefing header
 - **CEFR Assessment** — Multi-skill placement: voice interview (min 6 exchanges), audio-only listening items, and read-aloud pronunciation scoring (WER + phoneme error rate + fluency), with per-dimension scores (A1–C2)
 - **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets, specialized multi-type interactive lessons (conversation roleplay with direct AI tutor launch, vocabulary with one-click SRS deck import, listening with audio passages, grammar with rule formulas), server-side exercise grading with flexible normalization, elimination of skip facades, and automatic CEFR level progression
-- **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
-- **Voice** — Universal recording via MediaRecorder with live audio visualizer and server-side transcription (`/api/sessions/{id}/recordings` and `/api/assessment/{id}/recordings` via Moonshine / faster-whisper), plus browser Web Speech API fallback; TTS (Pocket TTS via personal-api)
+- **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint, with automatic server environment fallback (`.env` keys) when no database providers are configured
+- **Voice & STT** — Universal recording via MediaRecorder with live audio visualizer and server-side transcription (`/api/sessions/{id}/recordings` and `/api/assessment/{id}/recordings` via Moonshine / faster-whisper), plus browser Web Speech API fallback; TTS (Pocket TTS via personal-api). Streamlined STT options removing non-functional WASM facades.
 - **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with dedicated Flashcard Review mode (`/vocab?mode=review`), Web Speech pronunciation audio with US/UK accent toggle and keyboard shortcuts, 4-tier response grading (Again, Hard, Good, Easy), session retention metrics, dashboard "Review Now" quick launcher, and multiple-choice / fill-in-the-blank quiz modes
 - **Lessons Hub** — Interactive grammar and vocabulary hub featuring three integrated modes: curated static library with completion tracking and daily streak sync; on-demand topical and CEFR-targeted (A1–C2) AI lesson generation (without requiring prior conversation error history) with deterministic seed fallbacks; and Learning Path curriculum progression. All exercises enforce server-side evaluation with upfront answer and explanation stripping to prevent answer pre-disclosure.
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
@@ -22,7 +22,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 ### Prerequisites
 
 - Docker & Docker Compose
-- At least one LLM API key (OpenAI, Anthropic, DeepSeek, etc.)
+- At least one LLM API key (OpenAI, Anthropic, DeepSeek, etc.) or configured server environment keys
 
 ### Setup
 
