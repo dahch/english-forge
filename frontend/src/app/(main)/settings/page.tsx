@@ -6,7 +6,6 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { Separator } from "@/components/ui/separator"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
 import type { ProviderConfig, TutorProfile } from "@/lib/types"
@@ -28,7 +27,7 @@ const PERSONALITY_PRESETS = [
 export default function SettingsPage() {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
-  const [tutorProfile, setTutorProfile] = useState<TutorProfile | null>(null)
+  const [, setTutorProfile] = useState<TutorProfile | null>(null)
   const [tutorForm, setTutorForm] = useState<Partial<Omit<TutorProfile, "id" | "user_id">>>({
     name: "",
     age: null,
@@ -387,10 +386,9 @@ export default function SettingsPage() {
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="web_speech">Web Speech API (default, lowest latency)</SelectItem>
-                <SelectItem value="whisper_wasm">Whisper WASM (offline, browser-based)</SelectItem>
-                <SelectItem value="whisper_server">faster-whisper (server-side)</SelectItem>
-                <SelectItem value="personal_api">Personal API / Moonshine (highest accuracy)</SelectItem>
+                <SelectItem value="web_speech">Web Speech API (Browser native, lowest latency)</SelectItem>
+                <SelectItem value="personal_api">Personal API / Moonshine (Highest accuracy & fluency)</SelectItem>
+                <SelectItem value="whisper_server">faster-whisper (Server-side transcription)</SelectItem>
               </SelectContent>
             </Select>
           </div>
