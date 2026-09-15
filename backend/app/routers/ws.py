@@ -56,7 +56,15 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
     try:
         while True:
             raw = await websocket.receive_text()
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    await websocket.send_json({"type": "error", "message": "Payload must be a JSON object"})
+                    continue
+            except Exception:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON format"})
+                continue
+
             msg_type = data.get("type", "")
 
             if msg_type == "user_text":
@@ -65,14 +73,26 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                     await websocket.send_json({"type": "error", "message": "Empty text"})
                     continue
 
-                response = await _process_turn(db, session_id, user.id, text, session)
+                async with async_session_factory() as turn_db:
+                    res = await turn_db.execute(
+                        select(Session).where(Session.id == session_id, Session.user_id == user.id)
+                    )
+                    curr_session = res.scalar_one_or_none()
+                    if not curr_session:
+                        await websocket.send_json({"type": "error", "message": "Session not found"})
+                        break
+                    response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
                 await websocket.send_json({"type": "assistant_response", **response})
 
             elif msg_type == "user_audio":
                 import base64
                 audio_b64 = data.get("audio", "")
                 stt_mode = data.get("stt_mode", "web_speech")
-                audio_bytes = base64.b64decode(audio_b64) if audio_b64 else b""
+                try:
+                    audio_bytes = base64.b64decode(audio_b64) if audio_b64 else b""
+                except Exception:
+                    await websocket.send_json({"type": "error", "message": "Invalid base64 audio data"})
+                    continue
 
                 if not audio_bytes:
                     await websocket.send_json({"type": "error", "message": "No audio data"})
@@ -90,7 +110,7 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                 else:
                     await websocket.send_json({
                         "type": "error",
-                        "message": f"STT mode '{stt_mode}' not supported via WebSocket. Use web_speech or whisper_wasm on frontend.",
+                        "message": f"STT mode '{stt_mode}' not supported via WebSocket. Use personal_api, whisper_server, or browser Web Speech.",
                     })
                     continue
 
@@ -100,15 +120,27 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
 
                 await websocket.send_json({"type": "stt_result", "text": text})
 
-                response = await _process_turn(db, session_id, user.id, text, session)
+                async with async_session_factory() as turn_db:
+                    res = await turn_db.execute(
+                        select(Session).where(Session.id == session_id, Session.user_id == user.id)
+                    )
+                    curr_session = res.scalar_one_or_none()
+                    if not curr_session:
+                        await websocket.send_json({"type": "error", "message": "Session not found"})
+                        break
+                    response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
                 await websocket.send_json({"type": "assistant_response", **response})
 
             elif msg_type == "end_session":
                 from datetime import datetime, timezone
-                session_obj = await db.get(Session, session_id)
-                if session_obj:
-                    session_obj.ended_at = datetime.now(timezone.utc)
-                    await db.commit()
+                async with async_session_factory() as turn_db:
+                    res = await turn_db.execute(
+                        select(Session).where(Session.id == session_id, Session.user_id == user.id)
+                    )
+                    session_obj = res.scalar_one_or_none()
+                    if session_obj:
+                        session_obj.ended_at = datetime.now(timezone.utc)
+                        await turn_db.commit()
                 await websocket.send_json({"type": "session_ended"})
                 break
 
@@ -118,9 +150,9 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for session {session_id}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.exception(f"Unhandled WebSocket error in session {session_id}: {e}")
         try:
-            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.send_json({"type": "error", "message": "An internal error occurred during the session turn"})
         except Exception:
             pass
 
