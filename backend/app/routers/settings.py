@@ -16,6 +16,7 @@ from app.models.models import (
     Correction,
     GeneratedLesson,
     LearningPath,
+    LibraryLessonCompletion,
     Message,
     PathLesson,
     ProgressDaily,
@@ -317,6 +318,13 @@ async def clear_user_data(
     deleted_counts["generated_lessons"] = (
         await db.execute(
             delete(GeneratedLesson).where(GeneratedLesson.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
+    # Library lesson completions reference users.
+    deleted_counts["library_lesson_completions"] = (
+        await db.execute(
+            delete(LibraryLessonCompletion).where(LibraryLessonCompletion.user_id == user_id).execution_options(synchronize_session=False)
         )
     ).rowcount
 

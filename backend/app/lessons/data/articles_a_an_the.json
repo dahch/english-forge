@@ -31,8 +31,9 @@
     },
     {
       "question": "I love ___ chocolate. (in general)",
-      "type": "fill_blank",
-      "answer": "",
+      "type": "multiple_choice",
+      "options": ["a", "an", "the", "no article"],
+      "answer": "no article",
       "explanation": "General/abstract concept → no article."
     },
     {

@@ -46,6 +46,7 @@ class User(Base):
     tutor_profile: Mapped["TutorProfile | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
     assessments: Mapped[list["Assessment"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     generated_lessons: Mapped[list["GeneratedLesson"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    library_completions: Mapped[list["LibraryLessonCompletion"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
@@ -236,6 +237,18 @@ class GeneratedLesson(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="generated_lessons")
+
+
+class LibraryLessonCompletion(Base):
+    __tablename__ = "library_lesson_completions"
+    __table_args__ = (UniqueConstraint("user_id", "lesson_id", name="uq_library_completion_user_lesson"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    lesson_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user: Mapped["User"] = relationship(back_populates="library_completions")
 
 
 class LearningPath(Base):
