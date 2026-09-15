@@ -106,6 +106,24 @@ export interface GeneratedLesson {
   created_at: string
 }
 
+export interface LibraryLesson {
+  id: string
+  title: string
+  topic: string
+  level: string
+  explanation: string
+  examples: string[]
+  exercises?: LessonExercise[]
+  exercise_count: number
+  completed?: boolean
+  completed_at?: string | null
+}
+
+export interface LessonGenerateRequest {
+  topic?: string
+  level?: string
+}
+
 export interface ProviderConfig {
   id: string
   provider_name: string

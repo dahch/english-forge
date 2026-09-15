@@ -7,6 +7,8 @@ import type {
   GeneratedLesson,
   LearningPath,
   LessonExercise,
+  LessonGenerateRequest,
+  LibraryLesson,
   Message,
   PathLessonDetail,
   ProviderConfig,
@@ -21,7 +23,7 @@ import type {
   VocabItem,
 } from "./types"
 
-export type { LessonExercise, ExerciseCheckResult }
+export type { LessonExercise, ExerciseCheckResult, LibraryLesson, LessonGenerateRequest }
 
 // Same-origin by default: Next.js rewrites proxy /api/* to the backend
 // service inside the docker network. Override only for special setups.
@@ -130,18 +132,6 @@ export async function fetchBlob(path: string): Promise<Blob> {
   return res.blob()
 }
 
-export interface LibraryLesson {
-  id: string
-  title: string
-  topic: string
-  level: string
-  explanation: string
-  examples: string[]
-  // Present in the detail response only — the list returns exercise_count.
-  exercises?: LessonExercise[]
-  exercise_count: number
-}
-
 export const api = {
   auth: {
     register: (email: string, password: string, display_name: string) =>
@@ -239,6 +229,12 @@ export const api = {
   lessons: {
     library: () => request<LibraryLesson[]>("/api/lessons/library"),
     get: (id: string) => request<LibraryLesson>(`/api/lessons/library/${id}`),
+    completedLibraryIds: () => request<string[]>("/api/lessons/library/completed"),
+    completeLibrary: (id: string, completed: boolean = true) =>
+      request<{ lesson_id: string; completed: boolean }>(`/api/lessons/library/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      }),
     checkExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
       request<ExerciseCheckResult>(`/api/lessons/library/${lessonId}/exercise`, {
         method: "POST",
@@ -255,7 +251,11 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify({ completed }),
       }),
-    generate: () => request<GeneratedLesson>("/api/lessons/generate", { method: "POST" }),
+    generate: (options?: LessonGenerateRequest) =>
+      request<GeneratedLesson>("/api/lessons/generate", {
+        method: "POST",
+        body: JSON.stringify(options || {}),
+      }),
   },
 
   assessment: {
