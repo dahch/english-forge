@@ -262,3 +262,52 @@ class TestCompleteWithFallback:
 
         with pytest.raises(RuntimeError, match="All providers failed"):
             await router.complete_with_fallback(messages=[], system_prompt="s")
+
+
+class TestLLMRouterEnvFallback:
+    @pytest.mark.asyncio
+    async def test_fallback_to_openai_env(self, monkeypatch):
+        from app.config import Settings
+
+        mock_settings = Settings(
+            OPENAI_API_KEY="sk-mock-openai-key",
+            OPENAI_BASE_URL="https://api.openai.com/v1",
+            OPENAI_MODEL="gpt-4.1-mini",
+        )
+        monkeypatch.setattr("app.config.get_settings", lambda: mock_settings)
+
+        router = LLMRouter(None, "user-without-db-providers")
+        providers = await router._load_providers()
+        assert len(providers) == 1
+        assert providers[0].provider_name == "openai_env"
+        assert providers[0].model_name == "gpt-4.1-mini"
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_multiple_env_providers(self, monkeypatch):
+        from app.config import Settings
+
+        mock_settings = Settings(
+            ANTHROPIC_API_KEY="sk-ant-mock-key",
+            ANTHROPIC_MODEL="claude-sonnet-4-6",
+            FIREWORKS_API_KEY="fw-mock-key",
+            FIREWORKS_MODEL="accounts/fireworks/models/llama-v3p1-70b-instruct",
+        )
+        monkeypatch.setattr("app.config.get_settings", lambda: mock_settings)
+
+        router = LLMRouter(None, "user-without-db-providers")
+        providers = await router._load_providers()
+        assert len(providers) == 2
+        names = [p.provider_name for p in providers]
+        assert "anthropic" in names
+        assert "fireworks_env" in names
+
+    @pytest.mark.asyncio
+    async def test_no_db_and_no_env_raises_runtime_error(self, monkeypatch):
+        from app.config import Settings
+
+        mock_settings = Settings()
+        monkeypatch.setattr("app.config.get_settings", lambda: mock_settings)
+
+        router = LLMRouter(None, "user-without-any-keys")
+        with pytest.raises(RuntimeError, match="No LLM providers configured"):
+            await router.get_provider()

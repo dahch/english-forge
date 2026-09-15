@@ -24,31 +24,96 @@ class LLMRouter:
         self._providers: list[ChatProvider] | None = None
 
     async def _load_providers(self) -> list[ChatProvider]:
-        result = await self._db.execute(
-            select(ProviderConfig)
-            .where(ProviderConfig.user_id == self._user_id, ProviderConfig.is_active == True)
-            .order_by(ProviderConfig.priority.desc())
-        )
-        configs = result.scalars().all()
         providers: list[ChatProvider] = []
-        for cfg in configs:
+        if self._db is not None:
             try:
-                api_key = decrypt_value(cfg.api_key_enc) if cfg.api_key_enc else ""
-                if not api_key:
-                    continue
-                if cfg.protocol == "anthropic":
-                    providers.append(AnthropicProvider(api_key=api_key, model=cfg.model))
-                else:
+                result = await self._db.execute(
+                    select(ProviderConfig)
+                    .where(ProviderConfig.user_id == self._user_id, ProviderConfig.is_active == True)
+                    .order_by(ProviderConfig.priority.desc())
+                )
+                configs = result.scalars().all()
+                for cfg in configs:
+                    try:
+                        api_key = decrypt_value(cfg.api_key_enc) if cfg.api_key_enc else ""
+                        if not api_key:
+                            continue
+                        if cfg.protocol == "anthropic":
+                            providers.append(AnthropicProvider(api_key=api_key, model=cfg.model))
+                        else:
+                            providers.append(
+                                OpenAICompatibleProvider(
+                                    base_url=cfg.base_url,
+                                    api_key=api_key,
+                                    model=cfg.model,
+                                    provider_label=cfg.provider_name,
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to load provider {cfg.provider_name}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to query ProviderConfig for user {self._user_id}: {e}")
+
+        if not providers:
+            # Fall back to server environment settings
+            try:
+                from app.config import get_settings
+                settings = get_settings()
+                if settings.OPENAI_API_KEY:
                     providers.append(
                         OpenAICompatibleProvider(
-                            base_url=cfg.base_url,
-                            api_key=api_key,
-                            model=cfg.model,
-                            provider_label=cfg.provider_name,
+                            base_url=settings.OPENAI_BASE_URL,
+                            api_key=settings.OPENAI_API_KEY,
+                            model=settings.OPENAI_MODEL,
+                            provider_label="openai_env",
+                        )
+                    )
+                if settings.ANTHROPIC_API_KEY:
+                    providers.append(
+                        AnthropicProvider(
+                            api_key=settings.ANTHROPIC_API_KEY,
+                            model=settings.ANTHROPIC_MODEL,
+                        )
+                    )
+                if settings.DEEPSEEK_API_KEY:
+                    providers.append(
+                        OpenAICompatibleProvider(
+                            base_url=settings.DEEPSEEK_BASE_URL,
+                            api_key=settings.DEEPSEEK_API_KEY,
+                            model=settings.DEEPSEEK_MODEL,
+                            provider_label="deepseek_env",
+                        )
+                    )
+                if settings.FIREWORKS_API_KEY:
+                    providers.append(
+                        OpenAICompatibleProvider(
+                            base_url=settings.FIREWORKS_BASE_URL,
+                            api_key=settings.FIREWORKS_API_KEY,
+                            model=settings.FIREWORKS_MODEL,
+                            provider_label="fireworks_env",
+                        )
+                    )
+                if settings.CLINEPASS_API_KEY and settings.CLINEPASS_BASE_URL and settings.CLINEPASS_MODEL:
+                    providers.append(
+                        OpenAICompatibleProvider(
+                            base_url=settings.CLINEPASS_BASE_URL,
+                            api_key=settings.CLINEPASS_API_KEY,
+                            model=settings.CLINEPASS_MODEL,
+                            provider_label="clinepass_env",
+                        )
+                    )
+                if settings.CUSTOM_API_KEY and settings.CUSTOM_BASE_URL and settings.CUSTOM_MODEL:
+                    providers.append(
+                        OpenAICompatibleProvider(
+                            base_url=settings.CUSTOM_BASE_URL,
+                            api_key=settings.CUSTOM_API_KEY,
+                            model=settings.CUSTOM_MODEL,
+                            provider_label="custom_env",
                         )
                     )
             except Exception as e:
-                logger.warning(f"Failed to load provider {cfg.provider_name}: {e}")
+                logger.warning(f"Failed to load environment LLM providers: {e}")
+
         return providers
 
     async def get_provider(self, task: str = "conversation") -> ChatProvider:
