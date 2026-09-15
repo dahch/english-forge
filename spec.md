@@ -52,10 +52,17 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
   - **Resumen post-sesión**: pantalla de completado con desglose de calificaciones (Again/Hard/Good/Easy) y cálculo de tasa de retención.
 - Modo "quiz" rápido (multiple choice / completar frase con enmascaramiento regex por frontera de palabra).
 
-### 2.4 Lecciones estructuradas
+### 2.4 Lecciones estructuradas y Lessons Hub
 
-- Generación de mini-lecciones de gramática/vocabulario bajo demanda por el LLM, basadas en los errores recurrentes del usuario ("veo que confundes present perfect vs past simple, aquí tienes una lección corta + 5 ejercicios").
-- Biblioteca local de lecciones fijas para temas base (tiempos verbales, phrasal verbs, preposiciones, etc.) como fallback sin necesitar LLM.
+- **Generación flexible bajo demanda (`POST /api/lessons/generate`)**: permite generar mini-lecciones especificando cualquier tema libre o nivel CEFR objetivo (A1–C2), o basándose en los errores recurrentes del usuario si no se especifica tema. Si el usuario aún no tiene errores registrados, el sistema no bloquea la petición (eliminado el error 400 previo), generando en su lugar una lección de fundamentos del nivel solicitado.
+- **Semillas deterministas de respaldo (A1–C2)**: ante indisponibilidad, error o timeout del LLM (2 reintentos con 20s de límite), el sistema recurre a plantillas deterministas completas (`FALLBACK_LESSONS_BY_LEVEL`) cubriendo todos los niveles (A1 a C2), garantizando que el alumno siempre reciba una lección interactiva válida.
+- **Biblioteca estática y seguimiento de completado**: seguimiento persistente del progreso en lecciones estáticas mediante el modelo `LibraryLessonCompletion` (`GET /api/lessons/library/completed`, `PATCH /api/lessons/library/{lesson_id}`). Cada completado/desmarcado incrementa o decrementa de forma atómica el contador de lecciones diarias (`ProgressDaily.lessons_completed`), sincronizándose con la racha diaria (streaks).
+- **Protección contra revelado anticipado (Stripping de respuestas y explicaciones)**: en la carga inicial de lecciones (tanto de la biblioteca como generadas), las respuestas (`answer`) y las explicaciones (`explanation`) de los ejercicios se eliminan (`_strip_answers`, `_serialize_generated_lesson`). La evaluación y la explicación se entregan exclusivamente a través de los endpoints de corrección (`POST /api/lessons/{library|generated}/{lesson_id}/exercise`).
+- **Lessons Hub frontend (`/lessons`)**: interfaz centralizada organizada en tres pestañas:
+  - **Library**: lecciones fijas con insignias de nivel CEFR, contador de ejercicios y distintivo de completado.
+  - **Generated**: lecciones personalizadas generadas por IA.
+  - **Learning Path**: currículo activo del camino de aprendizaje con barra de progreso visual, estados de pasos (completado, activo, bloqueado) y botón directo para reanudar.
+  - **Diálogo modal «Generate Lesson»**: selector de temas con sugerencias populares («Job Interview Phrasal Verbs», «Small Talk & Icebreakers», etc.) y selector de nivel CEFR objetivo.
 - Las lecciones del **learning path** se abren como lecciones interactivas: el contenido (explicación, ejemplos y 3–5 ejercicios de completar/opción múltiple) se genera bajo demanda en la primera apertura — personalizado con las debilidades medidas del assessment — y los ejercicios se corrigen en el servidor (las respuestas correctas nunca viajan al frontend).
 
 ### 2.5 Progreso y gamificación
@@ -101,9 +108,12 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
   - La entrada de voz en `/conversation` no debe depender únicamente de la Web Speech API del navegador: debe ofrecer grabación de audio con transcripción en el backend (Moonshine/faster-whisper) como en el assessment, garantizando funcionamiento en cualquier navegador o móvil.
   - La interfaz debe permitir crear escenarios personalizados directamente desde la UI.
 
-- **REQ-LESS-1 (Generación Flexible de Lecciones en la Biblioteca)**:
-  - La generación de lecciones en `/lessons` debe permitir elegir un tema o nivel CEFR libremente, sin bloquearse si el usuario no tiene errores previos en conversaciones.
-  - Las lecciones de la biblioteca deben tener seguimiento de completado y visualización de progreso.
+- **REQ-LESS-1 (Generación Flexible de Lecciones en la Biblioteca y Lessons Hub)**:
+  - La generación de lecciones en `/lessons` debe permitir elegir un tema o nivel CEFR libremente (`POST /api/lessons/generate`), sin bloquearse con 400 si el usuario no tiene errores previos en conversaciones (generando lecciones de fundamentos del nivel).
+  - Incluir semillas deterministas de respaldo para todos los niveles CEFR (A1–C2) ante indisponibilidad, error o timeout del LLM.
+  - Seguimiento de completado para las lecciones de la biblioteca estática (`LibraryLessonCompletion`, `GET /api/lessons/library/completed`, `PATCH /api/lessons/library/{lesson_id}`) con sincronización atómica de racha diaria (`progress_daily.lessons_completed`).
+  - Protección estricta contra revelado previo: tanto las respuestas como las explicaciones se eliminan en la carga inicial (`_strip_answers`, `_serialize_generated_lesson`), evaluándose exclusivamente en el servidor (`/exercise`).
+  - Interfaz unificada de Lessons Hub con pestañas de Biblioteca, Lecciones Generadas y Currículo del Learning Path, además de diálogo modal de generación con sugerencias populares y selector de nivel CEFR.
 
 - **REQ-SYS-1 (Eliminación de Fachadas y Robustez de Infraestructura)**:
   - Eliminar opciones de fachada sin implementar (como `whisper_wasm` en Settings).
@@ -290,6 +300,9 @@ assessment_messages(id, assessment_id, role, text, kind, audio_url, metrics, ite
 -- generated_lessons table
 generated_lessons(id, user_id, title, topic, level, explanation, examples, exercises, based_on_errors, completed, completed_at, created_at)
 
+-- library_lesson_completions table (tracks static library lesson completion per user)
+library_lesson_completions(id, user_id, lesson_id, completed_at, UNIQUE (user_id, lesson_id))
+
 -- learning_paths table
 learning_paths(id, user_id, assessment_id, current_level, target_level, lessons_required, lessons_completed, created_at, completed_at, is_active)
 
@@ -426,7 +439,9 @@ english-forge/
 
 **Phase 4 — Progreso y lecciones** ✅
 - Dashboard, streaks, estimación CEFR heurística.
-- Generación de mini-lecciones basadas en errores recurrentes (CRUD de lecciones generadas, endpoint `/api/lessons/generate`).
+- Lessons Hub centralizado: generación bajo demanda por tema o nivel CEFR (sin requerir historial de errores) con semillas deterministas de respaldo (A1–C2) ante fallos de LLM (`/api/lessons/generate`).
+- Seguimiento persistente de completado en lecciones de biblioteca (`LibraryLessonCompletion`) y sincronización atómica con racha diaria (`ProgressDaily.lessons_completed`).
+- Protección estricta contra revelado anticipado: stripping inicial de respuestas y explicaciones en lecciones estáticas y generadas con evaluación server-side (`/exercise`).
 - Learning paths con progresión automática y lecciones interactivas cuyo contenido se genera bajo demanda (lazy) con corrección server-side.
 - Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005/014).
 

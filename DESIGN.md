@@ -38,7 +38,7 @@ graph TB
 | Integrations | `backend/app/integrations/` | `tts_personal_api.py` and `stt_personal_api.py` (async job submission + polling against personal-api; every `/v1/speak` pins `model=TTS_MODEL` and every `/v1/transcribe` sends `language=STT_LANGUAGE` — see ADR-013), `stt_whisper_server.py` (faster-whisper in-process, optional dependency), `crypto.py` (Fernet encryption of provider API keys — key from `SETTINGS_ENCRYPTION_KEY` or derived from `JWT_SECRET_KEY`). |
 | Services | `backend/app/services/` | `assessment_flow.py` — the assessment phase state machine (`handle_message()` dispatches `mic_check` → `conversation` → `listening` → `speaking`) plus the completion analysis and TTS caching; `assessment_bank.py` — fixed listening/speaking item banks; `assessment_scoring.py` — deterministic CEFR aggregation (dimension bands, conservative median level, confidence); `pronunciation.py` — WER + phoneme PER + fluency scoring; `stt.py` — shared STT entry point under a global 1-job semaphore (personal-api Moonshine first, in-process faster-whisper fallback). |
 | Domain | `backend/app/lessons/`, `backend/app/srs/` | Static lesson library (no LLM needed) and the SM-2 spaced-repetition implementation. |
-| Data | `backend/app/models/`, `backend/app/schemas/` | SQLAlchemy 2.0 async ORM (15 tables) and Pydantic response schemas. |
+| Data | `backend/app/models/`, `backend/app/schemas/` | SQLAlchemy 2.0 async ORM (16 tables) and Pydantic response schemas. |
 | App | `backend/app/main.py` | Lifespan: drift validation of `_COLUMNS_TO_ADD` against the ORM metadata → `create_all` → `_ensure_new_columns_sync` (`_COLUMNS_TO_ADD` + savepoint guards) → `_ensure_indexes_sync` (`_INDEXES_TO_ADD` partial unique indexes). Global 500 handler. |
 
 ### Startup schema sync
@@ -193,13 +193,74 @@ sequenceDiagram
 5. **Dashboard Direct Review CTA** — When `stats.due_for_review > 0`, the dashboard's "Due for Review" card renders with active accent styling and a "Review Now" button linking directly to `/vocab?mode=review`.
 6. **Quiz Word Boundary Replacement** — In `generate_quiz`, context sentences blank out the target word using regex word boundary matching `re.sub(rf"\b{re.escape(item.word)}\b", ...)` case-insensitively, preventing corruptions where words are replaced inside larger words (e.g. "cat" inside "caterpillar").
 
+### Lessons Hub & On-Demand Lesson Generation Flow
+
+The Lessons Hub integrates curated static grammar lessons, AI-generated topical lessons, and the learner's active Learning Path curriculum into a unified workspace.
+
+```mermaid
+sequenceDiagram
+    participant U as Learner (Browser)
+    participant UI as Lessons Hub UI (/lessons)
+    participant API as Lessons API (/api/lessons)
+    participant L as LLM Router
+    participant DB as SQLite DB
+
+    Note over U,UI: 1. On-Demand Lesson Generation
+    U->>UI: Click "Generate Lesson" (select topic & CEFR level)
+    UI->>API: POST /api/lessons/generate {topic, level}
+    alt Custom topic or CEFR requested
+        API->>API: build_prompt(topic, target_level)
+    else No topic provided
+        API->>DB: query recent user corrections
+        alt Errors found
+            API->>API: build_prompt(frequent_errors, target_level)
+        else No prior errors
+            API->>API: build_prompt(core_fundamentals, target_level)
+        end
+    end
+    API->>L: complete_with_fallback(task="lesson", timeout=20s, 2 attempts)
+    alt LLM succeeds with valid exercises
+        L-->>API: lesson JSON
+    else LLM fails or times out
+        API->>API: load FALLBACK_LESSONS_BY_LEVEL[level]
+    end
+    API->>DB: persist GeneratedLesson
+    API->>API: _serialize_generated_lesson() (strip answers & explanations)
+    API-->>UI: sanitized GeneratedLesson
+    UI->>U: Display lesson (explanation, examples, exercises)
+
+    Note over U,UI: 2. Interactive Exercise Check
+    U->>UI: Submit answer for exercise i
+    UI->>API: POST /{library|generated}/{id}/exercise {exercise_index, answer}
+    API->>API: compare submission with stored answer
+    API-->>UI: { correct, correct_answer, explanation }
+    UI->>U: Display verdict & explanation
+
+    Note over U,UI: 3. Static Library Completion & Streak Sync
+    U->>UI: Toggle completion on library lesson
+    UI->>API: PATCH /api/lessons/library/{lesson_id} {completed}
+    API->>DB: INSERT / DELETE LibraryLessonCompletion
+    API->>DB: bump_daily_lessons(user_id, delta=+1/-1)
+    DB-->>API: commit
+    API-->>UI: { id, completed }
+    UI->>U: Update badge & sync streak progress
+```
+
+1. **On-Demand Generation Without Error Prerequisites** — `POST /api/lessons/generate` accepts an optional `topic` and `level` (`LessonGenerateRequest`). If `topic` is provided, it targets the requested concept at the chosen CEFR level (A1–C2, defaulting to the learner's current level). When omitted, it inspects top conversation errors; if the user has no prior errors, it generates core language fundamentals for that level instead of returning an HTTP 400 error.
+2. **Resilient LLM Execution & Deterministic CEFR Seeds** — Lesson generation uses `LLMRouter` with a 20-second timeout across 2 attempts. If the LLM call times out, errors, or fails to return exercises, the router seamlessly falls back to `FALLBACK_LESSONS_BY_LEVEL`, a pre-seeded dictionary of rich, deterministic lesson templates spanning all CEFR levels (A1 to C2). The student is guaranteed an interactive lesson.
+3. **Upfront Answer & Explanation Stripping** — Responses from `_strip_answers` (for static library lessons) and `_serialize_generated_lesson` (for AI-generated lessons) omit both `answer` and `explanation` from exercise objects. Grading occurs server-side via `POST /api/lessons/library/{lesson_id}/exercise` and `POST /api/lessons/generated/{lesson_id}/exercise`, returning `{correct, correct_answer, explanation}` only after submission.
+4. **Static Library Completion Tracking & Daily Streak Sync** — Completions for static lessons are tracked in the `library_lesson_completions` table (enforcing a `(user_id, lesson_id)` unique constraint). Marking a library lesson complete via `PATCH /api/lessons/library/{lesson_id}` atomically adjusts `progress_daily.lessons_completed` via `bump_daily_lessons(db, user_id, +1/-1)`, synchronizing with daily streak progression.
+5. **Unified Lessons Hub UI** — The frontend Lessons Hub (`/lessons`) organizes study into three tabs: **Library** (curated grammar lessons with completion badges and status toggles), **Generated** (AI-crafted lessons personalized by topic or mistakes), and **Learning Path** (an embedded curriculum view of active CEFR level progression with step statuses and direct resume links). A "Generate Lesson" modal dialog provides popular topic chips and a CEFR level selector.
+
 ## Patterns Worth Knowing
 
 - **SM-2 quality mapping & ease-factor rounding** — `sm2_update()` maps "Hard" to quality 3 (correct with difficulty, preserving interval scaling with EF penalty) rather than quality < 3 (which forces interval reset to 1 day). Ease factors are rounded to 2 decimals on each transition.
 - **Due items null-safety** — vocabulary and dashboard due queries check `or_(VocabItem.next_review_at <= today, VocabItem.next_review_at.is_(None))` so newly imported or unreviewed words surface immediately for review.
 - **Single-query streak lookup** — `dashboard.py` retrieves all `ProgressDaily` entries for the last 365 days in one query and tests dates against an in-memory dictionary instead of firing 365 individual SQL queries.
 - **BYOK provider config** — providers live exclusively in `provider_configs` (encrypted keys, priority, per-task routing), managed through the Settings UI. The `*_API_KEY` env vars declared in `backend/app/config.py` are **not** consumed by `LLMRouter` — there is no env seeding (TBD despite the `.env.example` comment).
-- **Answer stripping** — exercise answers never leave the backend except through the exercise-check endpoints, which grade server-side and return `correct`/`correct_answer`/`explanation` (ADR-003/005/008; the same contract covers learning-path lessons via ADR-014).
+- **Answer and explanation stripping** — exercise answers and explanations never leave the backend upfront (`_strip_answers` for library lessons, `_serialize_generated_lesson` for generated lessons). Correct answers and explanations are delivered only upon exercise submission via `/exercise` endpoints (ADR-003/005/008/014).
+- **Deterministic CEFR fallback lesson seeds** — `POST /api/lessons/generate` does not require previous errors and falls back to `FALLBACK_LESSONS_BY_LEVEL` (covering A1–C2) if LLM generation times out (20s) or fails, ensuring uninterrupted lesson delivery.
+- **Idempotent library completion & atomic streak sync** — static library completions persist in `library_lesson_completions` and update `progress_daily.lessons_completed` atomically (+1/-1) using `bump_daily_lessons`, ensuring library study counts toward daily active streaks.
 - **`populate_existing` over `db.expire()`** — after core UPDATEs, reload rows with a `populate_existing` re-select; `db.expire()` makes the next attribute access lazy-load synchronously outside the greenlet (MissingGreenlet → 500).
 - **LLM output normalization** — `normalize_llm_lesson()` coerces double-encoded JSON, non-list values, and malformed exercises before persistence (ADR-008).
 - **Tolerant JSON** — all LLM responses go through `parse_llm_json` (dict-only) or `parse_lesson_json` (strict); multi-step flows retry 3× and log raw responses (ADR-010).
