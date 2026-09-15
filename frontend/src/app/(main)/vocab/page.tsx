@@ -56,7 +56,15 @@ function VocabContent() {
   const [viewMode, setViewMode] = useState<ViewMode>("list")
 
   // TTS Pronunciation state
-  const [accent, setAccent] = useState<Accent>("en-US")
+  const [accent, setAccent] = useState<Accent>(() => {
+    if (typeof window !== "undefined") {
+      const savedAccent = localStorage.getItem("ef_vocab_accent") as Accent | null
+      if (savedAccent === "en-US" || savedAccent === "en-GB") {
+        return savedAccent
+      }
+    }
+    return "en-US"
+  })
   const [speakingWord, setSpeakingWord] = useState<string | null>(null)
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
 
@@ -87,16 +95,6 @@ function VocabContent() {
   const [quizResults, setQuizResults] = useState<Record<string, QuizResult>>({})
   const [loadingQuiz, setLoadingQuiz] = useState(false)
 
-  // Load saved accent preference from localStorage
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const savedAccent = localStorage.getItem("ef_vocab_accent") as Accent | null
-      if (savedAccent === "en-US" || savedAccent === "en-GB") {
-        setAccent(savedAccent)
-      }
-    }
-  }, [])
-
   const handleAccentChange = (newAccent: Accent) => {
     setAccent(newAccent)
     if (typeof window !== "undefined") {
@@ -106,7 +104,6 @@ function VocabContent() {
 
   // Load vocabulary list
   const loadVocab = useCallback(async () => {
-    setLoading(true)
     setError("")
     try {
       const items = await api.vocab.list("all")
@@ -119,7 +116,9 @@ function VocabContent() {
   }, [])
 
   useEffect(() => {
-    loadVocab()
+    Promise.resolve().then(() => {
+      void loadVocab()
+    })
   }, [loadVocab])
 
   // TTS Speech Synthesis helper
@@ -271,11 +270,13 @@ function VocabContent() {
   // Check URL query param `mode=review`
   useEffect(() => {
     if (searchParams.get("mode") === "review") {
-      startReview()
+      Promise.resolve().then(() => {
+        void startReview()
+      })
     }
   }, [searchParams, startReview])
 
-  const exitReview = () => {
+  const exitReview = useCallback(() => {
     setViewMode("list")
     setIsAnswerRevealed(false)
     setIsReviewCompleted(false)
@@ -283,11 +284,11 @@ function VocabContent() {
     setReviewError(null)
     setPendingRatingQuality(null)
     router.replace("/vocab")
-    loadVocab()
-  }
+    void loadVocab()
+  }, [loadVocab, router])
 
   // Rate a card in Flashcard Review Mode
-  const handleRateCard = async (quality: number) => {
+  const handleRateCard = useCallback(async (quality: number) => {
     const currentCard = reviewCards[currentCardIndex]
     if (!currentCard || ratingSubmitting) return
 
@@ -324,7 +325,7 @@ function VocabContent() {
     } finally {
       setRatingSubmitting(false)
     }
-  }
+  }, [currentCardIndex, ratingSubmitting, reviewCards])
 
   // Keyboard shortcut listener for Flashcard Review Mode
   useEffect(() => {
@@ -386,6 +387,8 @@ function VocabContent() {
     isAnswerRevealed,
     speakText,
     ratingSubmitting,
+    exitReview,
+    handleRateCard,
   ])
 
   // Add word action

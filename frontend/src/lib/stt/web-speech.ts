@@ -12,8 +12,37 @@ export interface STTProvider {
   isAvailable(): boolean
 }
 
+interface SpeechRecognitionResultItem {
+  transcript: string
+}
+
+interface SpeechRecognitionResultList {
+  [index: number]: SpeechRecognitionResultItem[]
+}
+
+interface SpeechRecognitionEvent {
+  results: SpeechRecognitionResultList
+}
+
+interface SpeechRecognitionErrorEvent {
+  error?: string
+}
+
+interface ISpeechRecognition {
+  continuous: boolean
+  interimResults: boolean
+  lang: string
+  onresult: ((event: SpeechRecognitionEvent) => void) | null
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null
+  onend: (() => void) | null
+  start(): void
+  stop(): void
+}
+
+type SpeechRecognitionConstructor = new () => ISpeechRecognition
+
 export class WebSpeechSTT implements STTProvider {
-  private recognition: any = null
+  private recognition: ISpeechRecognition | null = null
   private resultCallback: ((text: string) => void) | null = null
   private errorCallback: ((error: string) => void) | null = null
   private endCallback: (() => void) | null = null
@@ -28,18 +57,27 @@ export class WebSpeechSTT implements STTProvider {
       return
     }
 
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    const win = window as unknown as {
+      SpeechRecognition?: SpeechRecognitionConstructor
+      webkitSpeechRecognition?: SpeechRecognitionConstructor
+    }
+    const SpeechRecognition = win.SpeechRecognition || win.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      this.errorCallback?.("Web Speech API not available")
+      return
+    }
+
     this.recognition = new SpeechRecognition()
     this.recognition.continuous = false
     this.recognition.interimResults = false
     this.recognition.lang = "en-US"
 
-    this.recognition.onresult = (event: any) => {
-      const transcript = event.results[0][0].transcript
+    this.recognition.onresult = (event: SpeechRecognitionEvent) => {
+      const transcript = event.results[0]?.[0]?.transcript || ""
       this.resultCallback?.(transcript)
     }
 
-    this.recognition.onerror = (event: any) => {
+    this.recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
       this.errorCallback?.(event.error || "Speech recognition error")
     }
 

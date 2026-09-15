@@ -77,6 +77,7 @@ function handleUnauthorized(): never {
   setActiveSessionId(null)
   if (typeof window !== "undefined" && !redirecting) {
     redirecting = true
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = "/login"
   }
   throw new Error("Unauthorized")
