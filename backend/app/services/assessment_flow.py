@@ -784,6 +784,16 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
     current_user.current_level = assessment.estimated_level
     current_user.assessment_completed = True
 
+    if assessment.estimated_level:
+        result_setting = await db.execute(
+            select(Setting).where(Setting.user_id == current_user.id, Setting.key == "default_cefr")
+        )
+        cefr_setting = result_setting.scalar_one_or_none()
+        if cefr_setting:
+            cefr_setting.value = assessment.estimated_level
+        else:
+            db.add(Setting(user_id=current_user.id, key="default_cefr", value=assessment.estimated_level))
+
     await db.flush()
 
     logger.info(

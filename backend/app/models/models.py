@@ -33,7 +33,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
-    current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="B1")
+    current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="A1")
     assessment_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

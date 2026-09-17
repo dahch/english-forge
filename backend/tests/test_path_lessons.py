@@ -225,8 +225,8 @@ async def test_generate_path_uses_curriculum_seed_when_llm_fails(db, user, monke
 
     # Path generation must not fail with 503; it must gracefully seed from curriculum templates
     res = await generate_path(GeneratePathRequest(), user, db)
-    assert res.current_level == "B1"
-    assert res.target_level == "B2"
+    assert res.current_level == "A1"
+    assert res.target_level == "A2"
     assert len(res.path_lessons) > 0
     assert res.lessons_required == len(res.path_lessons)
     assert res.path_lessons[0].topic != ""

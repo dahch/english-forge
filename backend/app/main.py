@@ -58,7 +58,7 @@ app.add_middleware(
 # by an inspector check, making this safe to run on every startup.
 _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     "users": [
-        ("current_level", "VARCHAR(2) NOT NULL DEFAULT 'B1'"),
+        ("current_level", "VARCHAR(2) NOT NULL DEFAULT 'A1'"),
         ("assessment_completed", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ],
     "progress_daily": [

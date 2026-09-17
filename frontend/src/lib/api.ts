@@ -365,7 +365,14 @@ export const api = {
       }),
     deleteProvider: (id: string) => request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
     get: () => request<{ key: string; value: string }[]>("/api/settings"),
-    update: (data: Record<string, unknown>) =>
+    update: (data: {
+      stt_mode?: string
+      tts_voice?: string
+      default_cefr?: string
+      task_routing?: Record<string, string>
+      regenerate_path?: boolean
+      [key: string]: unknown
+    }) =>
       request<{ key: string; value: string }[]>("/api/settings", {
         method: "PATCH",
         body: JSON.stringify(data),

@@ -51,7 +51,7 @@ export default function ConversationPage() {
   const [user, setUser] = useState<User | null>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [selectedScenario, setSelectedScenario] = useState<string>("")
-  const [cefrLevel, setCefrLevel] = useState<CEFRLevel>("B1")
+  const [cefrLevel, setCefrLevel] = useState<CEFRLevel>("A1")
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [inputText, setInputText] = useState("")
@@ -69,7 +69,7 @@ export default function ConversationPage() {
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [newScenarioName, setNewScenarioName] = useState("")
   const [newScenarioDesc, setNewScenarioDesc] = useState("")
-  const [newScenarioLevel, setNewScenarioLevel] = useState<CEFRLevel>("B1")
+  const [newScenarioLevel, setNewScenarioLevel] = useState<CEFRLevel>("A1")
   const [isCreatingScenario, setIsCreatingScenario] = useState(false)
   const [createModalError, setCreateModalError] = useState("")
 
@@ -200,7 +200,7 @@ export default function ConversationPage() {
       ])
       setSession(s)
       setMessages(msgs)
-      setCefrLevel((s.cefr_level as CEFRLevel) || "B1")
+      setCefrLevel((s.cefr_level as CEFRLevel) || "A1")
       setSummary(null)
       setActiveSessionId(s.id)
     } catch (err: unknown) {
@@ -219,7 +219,7 @@ export default function ConversationPage() {
         const [u, sc] = await Promise.all([api.auth.me(), api.scenarios.list()])
         if (cancelled) return
         setUser(u)
-        setCefrLevel((u.current_level as CEFRLevel) || "B1")
+        setCefrLevel((u.current_level as CEFRLevel) || "A1")
         setScenarios(sc)
 
         const sessions = await api.sessions.list()

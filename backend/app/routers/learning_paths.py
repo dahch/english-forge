@@ -1061,3 +1061,7 @@ async def advance_level(
     # Generate the next path automatically — same shared service as
     # POST /generate, without assessment context (the old path is done).
     return await _generate_path_for_user(db, current_user)
+
+
+# Public alias for cross-module consumption (e.g. settings router)
+generate_path_for_user = _generate_path_for_user
