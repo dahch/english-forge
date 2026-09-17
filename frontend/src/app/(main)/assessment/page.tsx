@@ -187,7 +187,19 @@ export default function AssessmentPage() {
     try {
       applyResponse(await api.assessment.complete(id))
       setCompleted(true)
+      setError("")
     } catch (err: unknown) {
+      try {
+        const current = await api.assessment.current()
+        if (current.completed_at) {
+          applyResponse(current)
+          setCompleted(true)
+          setError("")
+          return
+        }
+      } catch {
+        // Fall back to original error
+      }
       setError(err instanceof Error ? err.message : "Failed to complete assessment")
     } finally {
       setLoading(false)

@@ -363,7 +363,7 @@ async def complete_assessment(
         raise HTTPException(status_code=503, detail=str(e))
 
     assessment.completed_at = datetime.now(timezone.utc)
-    await db.flush()
+    await db.commit()
 
     return await reload_assessment(db, assessment.id)
 
