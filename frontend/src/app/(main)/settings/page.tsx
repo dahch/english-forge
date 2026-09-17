@@ -8,7 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import type { ProviderConfig, TutorProfile } from "@/lib/types"
+import type { ProviderConfig, TutorProfile, User } from "@/lib/types"
 import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
 
 const PERSONALITY_PRESETS = [
@@ -27,6 +27,13 @@ const PERSONALITY_PRESETS = [
 export default function SettingsPage() {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
+  const [currentUser, setCurrentUser] = useState<User | null>(null)
+  const [hasActivePath, setHasActivePath] = useState(false)
+  const [savedCefr, setSavedCefr] = useState<string>("A1")
+  const [preferencesSaved, setPreferencesSaved] = useState(false)
+  const [savingPreferences, setSavingPreferences] = useState(false)
+  const [showCefrConfirm, setShowCefrConfirm] = useState(false)
+  const [pendingCefr, setPendingCefr] = useState<string | null>(null)
   const [, setTutorProfile] = useState<TutorProfile | null>(null)
   const [tutorForm, setTutorForm] = useState<Partial<Omit<TutorProfile, "id" | "user_id">>>({
     name: "",
@@ -58,7 +65,21 @@ export default function SettingsPage() {
       const map: Record<string, string> = {}
       data.forEach((s) => { map[s.key] = s.value })
       setSettings(map)
+      if (map.default_cefr) {
+        setSavedCefr(map.default_cefr)
+      }
     }).catch(console.error)
+    api.auth.me().then((u) => {
+      setCurrentUser(u)
+      setSavedCefr((prev) => (prev && prev !== "A1" ? prev : u.current_level || "A1"))
+    }).catch(console.error)
+    api.learningPath.current().then((p) => {
+      if (p && p.id && p.is_active) {
+        setHasActivePath(true)
+      }
+    }).catch(() => {
+      setHasActivePath(false)
+    })
     api.tutorProfile.get().then((p) => {
       setTutorProfile(p)
       setTutorForm({
@@ -96,11 +117,62 @@ export default function SettingsPage() {
     }
   }
 
+  const cancelCefrChange = () => {
+    setSettings((prev) => ({ ...prev, default_cefr: savedCefr }))
+    setPendingCefr(null)
+    setShowCefrConfirm(false)
+  }
+
+  const confirmCefrChange = async () => {
+    if (!pendingCefr) return
+    setSavingPreferences(true)
+    setError("")
+    try {
+      const updatedSettings = { ...settings, default_cefr: pendingCefr }
+      await api.settings.update({
+        ...updatedSettings,
+        regenerate_path: true,
+      })
+      setSettings(updatedSettings)
+      setSavedCefr(pendingCefr)
+      if (currentUser) {
+        setCurrentUser({ ...currentUser, current_level: pendingCefr })
+      }
+      setHasActivePath(true)
+      setShowCefrConfirm(false)
+      setPendingCefr(null)
+      setPreferencesSaved(true)
+      setTimeout(() => setPreferencesSaved(false), 2000)
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to update preferences and regenerate path")
+    } finally {
+      setSavingPreferences(false)
+    }
+  }
+
   const saveSettings = async () => {
+    const newLevel = settings.default_cefr || "A1"
+    const levelChanged = newLevel !== savedCefr
+    if (levelChanged && (currentUser?.assessment_completed || hasActivePath)) {
+      setPendingCefr(newLevel)
+      setShowCefrConfirm(true)
+      return
+    }
+
+    setSavingPreferences(true)
+    setError("")
     try {
       await api.settings.update(settings)
+      setSavedCefr(newLevel)
+      if (currentUser && levelChanged) {
+        setCurrentUser({ ...currentUser, current_level: newLevel })
+      }
+      setPreferencesSaved(true)
+      setTimeout(() => setPreferencesSaved(false), 2000)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to save preferences")
+    } finally {
+      setSavingPreferences(false)
     }
   }
 
@@ -395,7 +467,7 @@ export default function SettingsPage() {
           <div className="space-y-1">
             <Label>TTS Voice</Label>
             <Input
-              value={settings.tts_voice || "alba"}
+              value={settings.tts_voice ?? ""}
               onChange={(e) => setSettings({ ...settings, tts_voice: e.target.value })}
               placeholder="alba"
             />
@@ -406,7 +478,7 @@ export default function SettingsPage() {
           <div className="space-y-1">
             <Label>Default CEFR Level</Label>
             <Select
-              value={settings.default_cefr || "B1"}
+              value={settings.default_cefr || "A1"}
               onValueChange={(v) => setSettings({ ...settings, default_cefr: v })}
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
@@ -417,9 +489,18 @@ export default function SettingsPage() {
               </SelectContent>
             </Select>
           </div>
-          <Button onClick={saveSettings}>
-            <Save className="h-4 w-4 mr-1" />
-            Save Preferences
+          <Button onClick={saveSettings} disabled={preferencesSaved || savingPreferences}>
+            {preferencesSaved ? (
+              <>
+                <CheckCircle2 className="h-4 w-4 mr-1" />
+                Saved!
+              </>
+            ) : (
+              <>
+                <Save className="h-4 w-4 mr-1" />
+                {savingPreferences ? "Saving..." : "Save Preferences"}
+              </>
+            )}
           </Button>
         </CardContent>
       </Card>
@@ -470,6 +551,44 @@ export default function SettingsPage() {
           )}
         </CardContent>
       </Card>
+
+      {showCefrConfirm && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-cefr-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-150"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !savingPreferences) {
+              cancelCefrChange()
+            }
+          }}
+        >
+          <Card className="w-full max-w-md shadow-2xl border-primary/20" onClick={(e) => e.stopPropagation()}>
+            <CardHeader>
+              <CardTitle id="confirm-cefr-title">Confirm CEFR Level Change</CardTitle>
+              <CardDescription>
+                Changing your default CEFR level to {pendingCefr} will update your profile level and regenerate your active learning path. Do you want to proceed?
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={cancelCefrChange}
+                disabled={savingPreferences}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={confirmCefrChange}
+                disabled={savingPreferences}
+              >
+                {savingPreferences ? "Regenerating..." : "Confirm & Regenerate"}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   )
 }
