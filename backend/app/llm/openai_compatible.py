@@ -1,12 +1,43 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
 
 from app.config import get_settings
 from app.llm.base import ChatProvider
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_content(data: dict, provider_label: str) -> tuple[str | None, str | None]:
+    """Extract (content, finish_reason) from a chat-completions response.
+
+    Reasoning models (e.g. DeepSeek served on Fireworks) return the thinking
+    process in `message.reasoning_content` and the final answer in
+    `message.content`. When the token budget is consumed by thinking, content
+    comes back null/empty with finish_reason="length" — the caller retries
+    with a bigger budget. `reasoning_content` is deliberately NOT used as a
+    content fallback: it is the model's raw chain-of-thought, and leaking it
+    as a chat reply is worse than retrying (or failing over) with more room.
+    The raw shape is logged either way so failures are diagnosable.
+    """
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content")
+    finish_reason = choice.get("finish_reason")
+    usage = data.get("usage", {})
+
+    if not content:
+        logger.warning(
+            f"Provider {provider_label} returned empty content "
+            f"(finish_reason={finish_reason}, message_keys={sorted(message.keys())}, "
+            f"reasoning_present={bool(message.get('reasoning_content'))}, "
+            f"usage={usage})"
+        )
+    return content, finish_reason
 
 
 class OpenAICompatibleProvider(ChatProvider):
@@ -57,10 +88,11 @@ class OpenAICompatibleProvider(ChatProvider):
             resp.raise_for_status()
             data = resp.json()
 
-        content = data["choices"][0]["message"].get("content")
+        content, finish_reason = _extract_content(data, self._label)
 
         return {
             "content": content,
+            "finish_reason": finish_reason,
             "usage": data.get("usage", {}),
             "model": data.get("model", self._model),
         }

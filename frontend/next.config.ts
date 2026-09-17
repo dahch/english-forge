@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
   output: "standalone",
   experimental: {
     optimizePackageImports: ["lucide-react", "recharts"],
+    proxyTimeout: 300_000,
   },
   async rewrites() {
     // Same-origin API proxy: the browser talks to the frontend origin only.

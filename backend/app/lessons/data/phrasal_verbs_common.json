@@ -1,0 +1,45 @@
+{
+  "title": "Common Phrasal Verbs",
+  "topic": "vocabulary",
+  "level": "B1",
+  "explanation": "Phrasal verbs are verbs combined with a particle (preposition or adverb) that changes the meaning. They are extremely common in everyday English. Many have meanings that are not obvious from the individual words.",
+  "examples": [
+    "give up = stop trying / quit → Don't give up! Keep practicing.",
+    "look forward to = be excited about something in the future → I look forward to meeting you.",
+    "run out of = have no more left → We ran out of milk.",
+    "turn down = reject / lower volume → She turned down the job offer.",
+    "come up with = think of / invent → He came up with a great idea."
+  ],
+  "exercises": [
+    {
+      "question": "I need to ___ (stop trying). This is too hard!",
+      "type": "fill_blank",
+      "answer": "give up",
+      "explanation": "'Give up' means to stop trying or quit."
+    },
+    {
+      "question": "We've ___ (have no more) sugar. Can you buy some?",
+      "type": "fill_blank",
+      "answer": "run out of",
+      "explanation": "'Run out of' means to have no more of something left."
+    },
+    {
+      "question": "She ___ (thought of) a brilliant solution to the problem.",
+      "type": "fill_blank",
+      "answer": "came up with",
+      "explanation": "'Come up with' means to think of or invent something."
+    },
+    {
+      "question": "I really ___ (am excited about) the weekend.",
+      "type": "fill_blank",
+      "answer": "look forward to",
+      "explanation": "'Look forward to' means to be excited about something in the future."
+    },
+    {
+      "question": "The company ___ (rejected) his application.",
+      "type": "fill_blank",
+      "answer": "turned down",
+      "explanation": "'Turn down' means to reject or refuse something."
+    }
+  ]
+}

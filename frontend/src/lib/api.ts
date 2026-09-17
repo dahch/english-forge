@@ -3,12 +3,18 @@ import type {
   CEFRResult,
   ConversationTurn,
   DashboardStats,
+  ExerciseCheckResult,
   GeneratedLesson,
   LearningPath,
+  LessonExercise,
+  LessonGenerateRequest,
+  LibraryLesson,
   Message,
+  PathLessonDetail,
   ProviderConfig,
   QuizQuestion,
   QuizResult,
+  RecordingResult,
   Scenario,
   Session,
   SessionSummary,
@@ -16,6 +22,8 @@ import type {
   User,
   VocabItem,
 } from "./types"
+
+export type { LessonExercise, ExerciseCheckResult, LibraryLesson, LessonGenerateRequest }
 
 // Same-origin by default: Next.js rewrites proxy /api/* to the backend
 // service inside the docker network. Override only for special setups.
@@ -69,6 +77,7 @@ function handleUnauthorized(): never {
   setActiveSessionId(null)
   if (typeof window !== "undefined" && !redirecting) {
     redirecting = true
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.href = "/login"
   }
   throw new Error("Unauthorized")
@@ -76,8 +85,11 @@ function handleUnauthorized(): never {
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken()
+  // FormData bodies must not carry a JSON Content-Type — the browser sets
+  // its own multipart boundary header.
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...((options.headers as Record<string, string>) || {}),
   }
   if (token) {
@@ -102,30 +114,23 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json()
 }
 
-export interface LessonExercise {
-  question: string
-  type: string
-  explanation: string
-  // multiple_choice only
-  options?: string[]
-}
+// Fetch a non-JSON resource (e.g. an audio blob) with the same auth header,
+// API base prefix and 401 handling as `request`. Used by the assessment audio
+// player, which needs the raw bytes rather than a parsed JSON body.
+export async function fetchBlob(path: string): Promise<Blob> {
+  const token = getToken()
+  const headers: Record<string, string> = {}
+  if (token) headers["Authorization"] = `Bearer ${token}`
 
-export interface ExerciseCheckResult {
-  correct: boolean
-  correct_answer: string
-  explanation: string
-}
+  const res = await fetch(`${API_BASE}${path}`, { headers })
 
-export interface LibraryLesson {
-  id: string
-  title: string
-  topic: string
-  level: string
-  explanation: string
-  examples: string[]
-  // Present in the detail response only — the list returns exercise_count.
-  exercises?: LessonExercise[]
-  exercise_count: number
+  if (res.status === 401) {
+    return handleUnauthorized()
+  }
+  if (!res.ok) {
+    throw new ApiError(res.statusText || "Request failed", res.status)
+  }
+  return res.blob()
 }
 
 export const api = {
@@ -169,6 +174,20 @@ export const api = {
     end: (id: string) =>
       request<SessionSummary>(`/api/sessions/${id}/end`, { method: "PATCH" }),
     messages: (id: string) => request<Message[]>(`/api/sessions/${id}/messages`),
+    uploadRecording: (
+      sessionId: string,
+      blob: Blob
+    ): Promise<{ transcript: string; words: unknown[] }> => {
+      const formData = new FormData()
+      formData.append("file", blob, "recording.webm")
+      return request<{ transcript: string; words: unknown[] }>(
+        `/api/sessions/${sessionId}/recordings`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      )
+    },
   },
 
   messages: {
@@ -181,7 +200,7 @@ export const api = {
 
   vocab: {
     list: (filter: string = "all") => request<VocabItem[]>(`/api/vocab?filter=${filter}`),
-    create: (data: { word: string; definition: string; example: string }) =>
+    create: (data: { word: string; definition: string; example: string; ipa?: string | null }) =>
       request<VocabItem>("/api/vocab", {
         method: "POST",
         body: JSON.stringify(data),
@@ -198,7 +217,9 @@ export const api = {
         body: JSON.stringify({ quality }),
       }),
     due: (limit: number = 20) => request<VocabItem[]>(`/api/vocab/review/due?limit=${limit}`),
-    generateQuiz: (count: number = 5) => request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`),
+    // Backend route is POST (GET would 405) with count as a query param.
+    generateQuiz: (count: number = 5) =>
+      request<QuizQuestion[]>(`/api/vocab/quiz/generate?count=${count}`, { method: "POST" }),
     checkQuiz: (vocab_item_id: string, answer: string) =>
       request<QuizResult>("/api/vocab/quiz/check", {
         method: "POST",
@@ -209,6 +230,12 @@ export const api = {
   lessons: {
     library: () => request<LibraryLesson[]>("/api/lessons/library"),
     get: (id: string) => request<LibraryLesson>(`/api/lessons/library/${id}`),
+    completedLibraryIds: () => request<string[]>("/api/lessons/library/completed"),
+    completeLibrary: (id: string, completed: boolean = true) =>
+      request<{ lesson_id: string; completed: boolean }>(`/api/lessons/library/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ completed }),
+      }),
     checkExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
       request<ExerciseCheckResult>(`/api/lessons/library/${lessonId}/exercise`, {
         method: "POST",
@@ -225,17 +252,34 @@ export const api = {
         method: "PATCH",
         body: JSON.stringify({ completed }),
       }),
-    generate: () => request<GeneratedLesson>("/api/lessons/generate", { method: "POST" }),
+    generate: (options?: LessonGenerateRequest) =>
+      request<GeneratedLesson>("/api/lessons/generate", {
+        method: "POST",
+        body: JSON.stringify(options || {}),
+      }),
   },
 
   assessment: {
     current: () => request<Assessment>("/api/assessment/current"),
     start: () => request<Assessment>("/api/assessment/start", { method: "POST" }),
-    send: (id: string, text: string) =>
+    // words = STT word timestamps echoed from uploadRecording; item_id = the
+    // banked item this answer addresses. The backend recomputes pronunciation
+    // metrics itself and never trusts client scores.
+    send: (id: string, text: string, source: "text" | "voice" = "text", words?: { word: string; start: number; end: number }[] | null, itemId?: string | null) =>
       request<Assessment>(`/api/assessment/${id}/message`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, source, words: words ?? null, item_id: itemId ?? null }),
       }),
+    // Upload a recording for STT (Moonshine/whisper) and, when the phase has
+    // an expected text, pronunciation scoring.
+    uploadRecording: (id: string, blob: Blob) => {
+      const form = new FormData()
+      form.append("file", blob, "answer.webm")
+      return request<RecordingResult>(`/api/assessment/${id}/recordings`, {
+        method: "POST",
+        body: form,
+      })
+    },
     complete: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
     reanalyze: (id: string) =>
@@ -249,11 +293,43 @@ export const api = {
         method: "POST",
         body: JSON.stringify(assessmentId ? { assessment_id: assessmentId } : {}),
       }),
+    // Lazy, idempotent: returns the lesson with its interactive content,
+    // generating explanation/examples/exercises on first open.
+    lessonDetail: (pathId: string, lessonId: string) =>
+      request<PathLessonDetail>(`/api/learning-paths/${pathId}/lessons/${lessonId}/generate`, {
+        method: "POST",
+      }),
+    checkLessonExercise: (pathId: string, lessonId: string, exerciseIndex: number, answer: string) =>
+      request<ExerciseCheckResult>(`/api/learning-paths/${pathId}/lessons/${lessonId}/exercise`, {
+        method: "POST",
+        body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
+      }),
     completeLesson: (pathId: string, lessonId: string, completed: boolean = true) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/lessons/${lessonId}/complete`, {
         method: "PATCH",
         body: JSON.stringify({ completed }),
       }),
+    startLessonConversation: (pathId: string, lessonId: string) =>
+      request<{ session_id: string }>(
+        `/api/learning-paths/${pathId}/lessons/${lessonId}/start-conversation`,
+        { method: "POST" }
+      ),
+    addVocabBatch: async (
+      items: { word: string; definition: string; example: string; ipa?: string | null }[]
+    ) => {
+      const results = await Promise.allSettled(
+        items.map((item) =>
+          api.vocab.create({
+            word: item.word,
+            definition: item.definition,
+            example: item.example,
+            ipa: item.ipa ?? null,
+          })
+        )
+      )
+      const count = results.filter((r) => r.status === "fulfilled").length
+      return { count }
+    },
     advance: (pathId: string) =>
       request<LearningPath>(`/api/learning-paths/${pathId}/advance`, { method: "POST" }),
   },
@@ -289,7 +365,14 @@ export const api = {
       }),
     deleteProvider: (id: string) => request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
     get: () => request<{ key: string; value: string }[]>("/api/settings"),
-    update: (data: Record<string, unknown>) =>
+    update: (data: {
+      stt_mode?: string
+      tts_voice?: string
+      default_cefr?: string
+      task_routing?: Record<string, string>
+      regenerate_path?: boolean
+      [key: string]: unknown
+    }) =>
       request<{ key: string; value: string }[]>("/api/settings", {
         method: "PATCH",
         body: JSON.stringify(data),

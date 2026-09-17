@@ -16,6 +16,7 @@ from app.models.models import (
     Correction,
     GeneratedLesson,
     LearningPath,
+    LibraryLessonCompletion,
     Message,
     PathLesson,
     ProgressDaily,
@@ -214,6 +215,12 @@ async def update_settings(
         else:
             db.add(Setting(user_id=current_user.id, key=key, value=value))
 
+    if body.default_cefr is not None:
+        current_user.current_level = body.default_cefr
+        if body.regenerate_path:
+            from app.routers.learning_paths import generate_path_for_user
+            await generate_path_for_user(db, current_user)
+
     await db.flush()
 
     result = await db.execute(select(Setting).where(Setting.user_id == current_user.id))
@@ -320,6 +327,13 @@ async def clear_user_data(
         )
     ).rowcount
 
+    # Library lesson completions reference users.
+    deleted_counts["library_lesson_completions"] = (
+        await db.execute(
+            delete(LibraryLessonCompletion).where(LibraryLessonCompletion.user_id == user_id).execution_options(synchronize_session=False)
+        )
+    ).rowcount
+
     # Scenarios reference users.
     deleted_counts["scenarios"] = (
         await db.execute(
@@ -350,7 +364,7 @@ async def clear_user_data(
     ).rowcount
 
     # Reset user level and assessment status so the frontend starts fresh.
-    current_user.current_level = "B1"
+    current_user.current_level = "A1"
     current_user.assessment_completed = False
 
     await db.commit()

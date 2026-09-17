@@ -6,13 +6,13 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 
 ## Features
 
-- **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2)
-- **CEFR Assessment** — Conversational placement test (up to 10 questions) that estimates your level, strengths, and weaknesses
-- **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets and automatic progression
-- **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint
-- **Voice** — STT (4 modes: Web Speech API, Whisper WASM, faster-whisper server, Moonshine via personal-api) + TTS (Pocket TTS via personal-api)
-- **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with flashcards and quiz modes
-- **Lessons** — Static grammar library + dynamic LLM-generated lessons based on your error patterns
+- **AI Conversation Tutor** — Roleplay scenarios (job interview, restaurant, hotel, etc.) with CEFR level adjustment (A1–C2), proactive in-character tutor opening greetings with Pocket TTS synthesis/autoplay, custom scenario creation modal with LLM-generated greetings, and collapsible scenario briefing header
+- **CEFR Assessment** — Multi-skill placement: voice interview (min 6 exchanges), audio-only listening items, and read-aloud pronunciation scoring (WER + phoneme error rate + fluency), with per-dimension scores (A1–C2)
+- **Learning Paths** — LLM-generated personalized curriculum based on your assessment, with per-level lesson targets, specialized multi-type interactive lessons (conversation roleplay with direct AI tutor launch, vocabulary with one-click SRS deck import, listening with audio passages, grammar with rule formulas), server-side exercise grading with flexible normalization, elimination of skip facades, and automatic CEFR level progression
+- **BYOK Multi-Provider LLM** — OpenAI, Anthropic, DeepSeek, Fireworks, ClinePass, or any OpenAI-compatible endpoint, with automatic server environment fallback (`.env` keys) when no database providers are configured
+- **Voice & STT** — Universal recording via MediaRecorder with live audio visualizer and server-side transcription (`/api/sessions/{id}/recordings` and `/api/assessment/{id}/recordings` via Moonshine / faster-whisper), plus browser Web Speech API fallback; TTS (Pocket TTS via personal-api). Streamlined STT options removing non-functional WASM facades.
+- **Vocabulary SRS** — SM-2 spaced repetition (Anki-style) with dedicated Flashcard Review mode (`/vocab?mode=review`), Web Speech pronunciation audio with US/UK accent toggle and keyboard shortcuts, 4-tier response grading (Again, Hard, Good, Easy), session retention metrics, dashboard "Review Now" quick launcher, and multiple-choice / fill-in-the-blank quiz modes
+- **Lessons Hub** — Interactive grammar and vocabulary hub featuring three integrated modes: curated static library with completion tracking and daily streak sync; on-demand topical and CEFR-targeted (A1–C2) AI lesson generation (without requiring prior conversation error history) with deterministic seed fallbacks; and Learning Path curriculum progression. All exercises enforce server-side evaluation with upfront answer and explanation stripping to prevent answer pre-disclosure.
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
 - **PWA** — Installable on mobile and desktop
 - **Multi-user** — JWT auth, per-user settings, encrypted API keys
@@ -22,7 +22,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 ### Prerequisites
 
 - Docker & Docker Compose
-- At least one LLM API key (OpenAI, Anthropic, DeepSeek, etc.)
+- At least one LLM API key (OpenAI, Anthropic, DeepSeek, etc.) or configured server environment keys
 
 ### Setup
 
@@ -89,7 +89,8 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 1. Set `PERSONAL_API_URL=http://personal-api:8000` in `.env`
 2. Set `TTS_DEFAULT_VOICE` to a valid voice name
-3. The backend automatically joins the `coolify` network
+3. `TTS_MODEL` pins the Pocket TTS model sent on every `/v1/speak` call (default `english_2026-04_24l`) — personal-api servers default to a Spanish model, so english-forge always sends the English one. Unknown model ids are ignored by Pocket TTS (hot-swap safe, and older personal-api servers ignore the field entirely).
+4. The backend automatically joins the `coolify` network
 
 **Note:** Verify available voices with `GET /v1/voices` on your Pocket TTS instance before setting the default.
 
@@ -104,7 +105,7 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
-**Note:** The conversation and assessment pages always use Web Speech API in the browser. The `whisper_server` and `personal_api` modes run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet.
+**Note:** Both conversation and assessment pages use universal voice recording: audio captured via `MediaRecorder` (up to 10MB, with live audio level meter and countdown timer) is transcribed server-side via `POST /api/sessions/{session_id}/recordings` or `POST /api/assessment/{id}/recordings` (Moonshine via personal-api, faster-whisper in-process fallback). If `MediaRecorder` is unavailable or fails, conversation recording falls back seamlessly to client-side Web Speech API. The `whisper_server` and `personal_api` modes also run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
 
 ## Architecture
 
@@ -157,18 +158,18 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router JSON parsing, lesson normalization, assessment logic, and learning-path schemas. The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, Lessons Hub (on-demand topical generation, CEFR level targeting, deterministic A1–C2 fallbacks, library completion tracking with atomic daily streak sync, and answer stripping), assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, and single-query session listing aggregation). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
-Reset a user's data (sessions, messages, corrections, vocab, scenarios, assessments, generated lessons, learning paths, progress, settings) while preserving the account and its LLM provider configs — useful for testing:
+Reset a user's data (sessions, messages, corrections, vocab, scenarios, assessments, generated lessons, library lesson completions, learning paths, progress, settings) while preserving the account and its LLM provider configs — useful for testing:
 
 ```bash
 python scripts/clear_user_data.py --email user@example.com --dry-run   # preview
 python scripts/clear_user_data.py --email user@example.com
 ```
 
-The script also resets the user's level to B1 and clears `assessment_completed`.
+The script also resets the user's level to A1 and clears `assessment_completed`.
 
 ### Database
 
@@ -198,6 +199,8 @@ See `.env.example` for the full list. Required:
 | `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
 | `STT_MODE` | No | STT mode (default: web_speech) |
+| `STT_LANGUAGE` | No (default: `en`) | Language hint sent on every personal-api `/v1/transcribe` call. `en` unlocks real Moonshine word timestamps (used by pronunciation fluency metrics); older personal-api servers ignore the field. |
+| `TTS_MODEL` | No (default: `english_2026-04_24l`) | Pocket TTS model id pinned on every `/v1/speak` call (personal-api defaults to a Spanish model). Unknown ids are ignored — hot-swap safe. |
 | `LLM_TIMEOUT_SECONDS` | No (default: `300`) | Per-request timeout for LLM providers. Reasoning models can take a while before producing output — keep generous, or unset to disable the timeout entirely. |
 
 LLM API keys are configured in the app's Settings UI (encrypted in the DB) — see the note under [LLM Providers](#llm-providers).

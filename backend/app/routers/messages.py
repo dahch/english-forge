@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -33,6 +34,8 @@ from app.srs.sm2 import next_review_date
 from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
+
+logger = logging.getLogger(__name__)
 
 
 @router.post("/{session_id}/messages", response_model=ConversationTurnResponse)
@@ -87,20 +90,32 @@ async def send_message(
     )
 
     llm_router = LLMRouter(db, current_user.id)
-    llm_result = await llm_router.complete_with_fallback(
-        messages=messages_for_llm,
-        system_prompt=system_prompt,
-        task="conversation",
-    )
+    parsed: dict = {}
+    provider_used = "unknown"
+    try:
+        llm_result = await llm_router.complete_with_fallback(
+            messages=messages_for_llm,
+            system_prompt=system_prompt,
+            task="conversation",
+        )
+        parsed = parse_llm_json(llm_result["content"])
+        provider_used = llm_result.get("provider", "unknown")
+    except Exception as e:
+        logger.error(f"Conversation LLM call failed for session {session_id}: {e}")
 
-    parsed = parse_llm_json(llm_result["content"])
+    reply = (parsed.get("reply") or "").strip()
+    if not reply:
+        # All providers failed (or returned unusable output) — keep the
+        # conversation alive with a recovery line instead of a 500; the
+        # student's next message retries the LLM with full history.
+        reply = "Sorry, I lost my train of thought for a second — tell me a bit more about that."
 
-    session.provider_used = llm_result.get("provider", "unknown")
+    session.provider_used = provider_used
 
     assistant_msg = Message(
         session_id=session_id,
         role="assistant",
-        text=parsed.get("reply", ""),
+        text=reply,
     )
     db.add(assistant_msg)
     await db.flush()
@@ -158,7 +173,7 @@ async def send_message(
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
-        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
+        audio_bytes = await tts.synthesize(reply, voice=voice)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
@@ -189,9 +204,9 @@ async def send_message(
             text=assistant_msg.text,
             audio_url=assistant_msg.audio_url,
             created_at=assistant_msg.created_at,
-            # Corrections attach to the user message; duplicated here only so
-            # legacy clients reading assistant_message.corrections keep working.
-            corrections=correction_responses,
+            # Corrections belong to the user's message only — duplicating them
+            # here made the UI render the same correction twice.
+            corrections=[],
         ),
         corrections=correction_responses,
         new_vocab=new_vocab_list,

@@ -23,7 +23,7 @@ def sm2_update(quality: int, ease_factor: float, interval: int) -> tuple[float, 
     """
     if quality < 3:
         new_interval = 1
-        new_ef = max(ease_factor - 0.2, 1.3)
+        new_ef = round(max(ease_factor - 0.2, 1.3), 2)
         return new_ef, new_interval
 
     if interval == 0:
@@ -34,7 +34,7 @@ def sm2_update(quality: int, ease_factor: float, interval: int) -> tuple[float, 
         new_interval = round(interval * ease_factor)
 
     new_ef = ease_factor + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-    new_ef = max(new_ef, 1.3)
+    new_ef = round(max(new_ef, 1.3), 2)
 
     return new_ef, max(new_interval, 1)
 

@@ -39,6 +39,7 @@ export interface Session {
   provider_used: string | null
   scenario_name: string | null
   message_count: number
+  initial_message?: Message
 }
 
 export interface Correction {
@@ -105,6 +106,24 @@ export interface GeneratedLesson {
   created_at: string
 }
 
+export interface LibraryLesson {
+  id: string
+  title: string
+  topic: string
+  level: string
+  explanation: string
+  examples: string[]
+  exercises?: LessonExercise[]
+  exercise_count: number
+  completed?: boolean
+  completed_at?: string | null
+}
+
+export interface LessonGenerateRequest {
+  topic?: string
+  level?: string
+}
+
 export interface ProviderConfig {
   id: string
   provider_name: string
@@ -161,13 +180,29 @@ export interface QuizResult {
   explanation: string
 }
 
-// Assessment chat messages — unlike conversation Messages they carry no
-// session_id/audio_url (see backend AssessmentMessageResponse).
+// Assessment chat messages. `kind` drives the section UI: "chat" (tutor
+// conversation), "mic_check" (read-aloud calibration), "listening" (audio-only
+// item — text hidden until answered), "speaking" (read-aloud item). Tutor
+// audio plays via a fetch-with-auth endpoint (see AudioButton); the raw data
+// URI is never serialized. metrics holds per-answer evidence (listening grade
+// or pronunciation WER/PER/fluency composite, computed server-side).
 export interface AssessmentMessage {
   id: string
   role: string
   text: string
+  kind: string
+  metrics: Record<string, unknown> | null
   created_at: string
+}
+
+// Dimension scores (0-100) computed deterministically at analysis time.
+// Missing keys mean the dimension was not assessed.
+export type DimensionScores = {
+  grammar?: number
+  vocabulary?: number
+  fluency?: number
+  listening?: number
+  pronunciation?: number
 }
 
 export interface Assessment {
@@ -180,8 +215,19 @@ export interface Assessment {
   weaknesses: string[] | null
   recommendations: string[] | null
   summary: string | null
+  phase: string | null
+  dimension_scores: DimensionScores | null
   messages: AssessmentMessage[]
   is_complete?: boolean
+}
+
+// Result of POST /assessment/{id}/recordings — STT transcript with Moonshine
+// word timestamps (when personal-api exposes them) and optional pronunciation
+// metrics computed against the item's expected text.
+export interface RecordingResult {
+  transcript: string
+  words: { word: string; start: number; end: number }[]
+  metrics: Record<string, unknown> | null
 }
 
 export interface LearningPath {
@@ -203,11 +249,64 @@ export interface PathLesson {
   topic: string
   description: string
   // Backend JSON-parses the stored content column, so it arrives as an object.
-  content: { focus: string; lesson_type: string } | null
+  content: PathLessonContent | null
   order: number
   completed: boolean
   completed_at: string | null
 }
+
+export interface LessonExercise {
+  question: string
+  type: string
+  options?: string[]
+  explanation?: string
+}
+
+export interface ExerciseCheckResult {
+  correct: boolean
+  correct_answer: string
+  explanation: string
+}
+
+export interface VocabItemPayload {
+  word: string
+  definition: string
+  ipa?: string | null
+  example: string
+}
+
+// Interactive content of a path lesson. Metadata (focus/lesson_type) is stored
+// at path-generation time; multi-type content is generated lazily on first open
+// (POST .../generate, idempotent). Answers never reach the client — grading
+// happens server-side.
+export interface PathLessonContent {
+  focus?: string
+  lesson_type?: string
+  title?: string
+  explanation?: string
+  examples?: string[]
+  formula?: string
+  // Conversation
+  scenario_context?: string
+  goal?: string
+  tutor_role?: string
+  target_expressions?: string[]
+  // Vocabulary
+  items?: VocabItemPayload[]
+  vocab_items?: VocabItemPayload[]
+  // Listening & Reading / Writing
+  passage?: string
+  transcript?: string
+  audio_url?: string
+  writing_prompt?: string
+  // Interactive Exercises
+  exercises?: LessonExercise[]
+}
+
+// Shape of POST /learning-paths/{path_id}/lessons/{lesson_id}/generate.
+// Structurally identical to PathLesson — a PathLesson can be used as the
+// loading stub while the detail request is in flight.
+export type PathLessonDetail = PathLesson
 
 export type CEFRLevel = "A1" | "A2" | "B1" | "B2" | "C1" | "C2"
 

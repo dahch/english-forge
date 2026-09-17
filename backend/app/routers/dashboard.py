@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -48,17 +48,21 @@ async def get_stats(
     total_reviews_count = total_reviews.scalar() or 0
 
     today = date.today()
+    start_date = today - timedelta(days=365)
+    result = await db.execute(
+        select(ProgressDaily).where(
+            ProgressDaily.user_id == current_user.id,
+            ProgressDaily.date >= start_date,
+        )
+    )
+    daily_records = result.scalars().all()
+    progress_by_date = {entry.date: entry for entry in daily_records}
+
     streak = 0
     for i in range(365):
         check_date = today - timedelta(days=i)
-        result = await db.execute(
-            select(ProgressDaily).where(
-                ProgressDaily.user_id == current_user.id,
-                ProgressDaily.date == check_date,
-            )
-        )
-        day = result.scalar_one_or_none()
-        if day and (day.minutes_spoken > 0 or day.reviews_done > 0):
+        day = progress_by_date.get(check_date)
+        if day and (day.minutes_spoken > 0 or day.reviews_done > 0 or day.lessons_completed > 0):
             streak += 1
         elif i > 0:
             break
@@ -66,7 +70,7 @@ async def get_stats(
     due_today = await db.execute(
         select(func.count(VocabItem.id)).where(
             VocabItem.user_id == current_user.id,
-            VocabItem.next_review_at <= today,
+            or_(VocabItem.next_review_at <= today, VocabItem.next_review_at.is_(None)),
         )
     )
     due_count = due_today.scalar() or 0
