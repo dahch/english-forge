@@ -62,7 +62,7 @@ async def get_stats(
     for i in range(365):
         check_date = today - timedelta(days=i)
         day = progress_by_date.get(check_date)
-        if day and (day.minutes_spoken > 0 or day.reviews_done > 0):
+        if day and (day.minutes_spoken > 0 or day.reviews_done > 0 or day.lessons_completed > 0):
             streak += 1
         elif i > 0:
             break

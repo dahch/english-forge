@@ -42,6 +42,32 @@ async def bump_daily_lessons(db: AsyncSession, user_id: str, delta: int = 1) -> 
         )
 
 
+async def bump_daily_minutes(db: AsyncSession, user_id: str, minutes: int) -> None:
+    """Increment today's ProgressDaily minutes_spoken counter for a user."""
+    if minutes <= 0:
+        return
+
+    today = date.today()
+    result = await db.execute(
+        update(ProgressDaily)
+        .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+        .values(minutes_spoken=ProgressDaily.minutes_spoken + minutes)
+    )
+    if result.rowcount:
+        return
+
+    try:
+        async with db.begin_nested():
+            db.add(ProgressDaily(user_id=user_id, date=today, minutes_spoken=minutes))
+    except IntegrityError:
+        await db.execute(
+            update(ProgressDaily)
+            .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+            .values(minutes_spoken=ProgressDaily.minutes_spoken + minutes)
+        )
+
+
+
 async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:
     """Load the user's tutor profile as a plain dict, or None if not configured."""
     result = await db.execute(select(TutorProfile).where(TutorProfile.user_id == user_id))

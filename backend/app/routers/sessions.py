@@ -19,7 +19,7 @@ from app.schemas.session import (
 )
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.services.stt import transcribe_audio
-from app.utils import get_tutor_profile_dict, resolve_tts_voice
+from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
 from app.llm.router import LLMRouter
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -286,6 +286,9 @@ async def end_session(
         ended = session.ended_at if session.ended_at.tzinfo else session.ended_at.replace(tzinfo=timezone.utc)
         started = session.started_at if session.started_at.tzinfo else session.started_at.replace(tzinfo=timezone.utc)
         duration = (ended - started).total_seconds() / 60.0
+
+    if duration > 0:
+        await bump_daily_minutes(db, current_user.id, int(round(duration)))
 
     await db.flush()
 

@@ -13,7 +13,7 @@ from app.security import decode_access_token
 from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.models.models import Correction, Scenario
-from app.utils import get_tutor_profile_dict, resolve_tts_voice
+from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.integrations.stt_personal_api import STTPersonalAPI
 from app.integrations.stt_whisper_server import STTWhisperServer
@@ -120,16 +120,21 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
 
                 await websocket.send_json({"type": "stt_result", "text": text})
 
-                async with async_session_factory() as turn_db:
-                    res = await turn_db.execute(
-                        select(Session).where(Session.id == session_id, Session.user_id == user.id)
-                    )
-                    curr_session = res.scalar_one_or_none()
-                    if not curr_session:
-                        await websocket.send_json({"type": "error", "message": "Session not found"})
-                        break
-                    response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
-                await websocket.send_json({"type": "assistant_response", **response})
+                try:
+                    async with async_session_factory() as turn_db:
+                        res = await turn_db.execute(
+                            select(Session).where(Session.id == session_id, Session.user_id == user.id)
+                        )
+                        curr_session = res.scalar_one_or_none()
+                        if not curr_session:
+                            await websocket.send_json({"type": "error", "message": "Session not found"})
+                            break
+                        response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
+                        await turn_db.commit()
+                    await websocket.send_json({"type": "assistant_response", **response})
+                except Exception as e:
+                    logger.error(f"Turn processing error in session {session_id}: {e}")
+                    await websocket.send_json({"type": "error", "message": "Failed to process turn. Please try again."})
 
             elif msg_type == "end_session":
                 from datetime import datetime, timezone
@@ -140,6 +145,13 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                     session_obj = res.scalar_one_or_none()
                     if session_obj:
                         session_obj.ended_at = datetime.now(timezone.utc)
+                        duration = 0.0
+                        if session_obj.started_at:
+                            ended = session_obj.ended_at if session_obj.ended_at.tzinfo else session_obj.ended_at.replace(tzinfo=timezone.utc)
+                            started = session_obj.started_at if session_obj.started_at.tzinfo else session_obj.started_at.replace(tzinfo=timezone.utc)
+                            duration = (ended - started).total_seconds() / 60.0
+                        if duration > 0:
+                            await bump_daily_minutes(turn_db, user.id, int(round(duration)))
                         await turn_db.commit()
                 await websocket.send_json({"type": "session_ended"})
                 break
@@ -164,10 +176,6 @@ async def _process_turn(
     text: str,
     session: Session,
 ) -> dict:
-    user_msg = Message(session_id=session_id, role="user", text=text)
-    db.add(user_msg)
-    await db.flush()
-
     history_result = await db.execute(
         select(Message)
         .where(Message.session_id == session_id)
@@ -175,6 +183,7 @@ async def _process_turn(
     )
     history = history_result.scalars().all()
     messages_for_llm = [{"role": m.role, "content": m.text} for m in history]
+    messages_for_llm.append({"role": "user", "content": text})
 
     scenario_prompt = None
     scenario_key = None
@@ -197,19 +206,34 @@ async def _process_turn(
     )
 
     llm_router = LLMRouter(db, user_id)
-    llm_result = await llm_router.complete_with_fallback(
-        messages=messages_for_llm,
-        system_prompt=system_prompt,
-        task="conversation",
-    )
+    parsed: dict = {}
+    provider_used = "unknown"
+    try:
+        llm_result = await llm_router.complete_with_fallback(
+            messages=messages_for_llm,
+            system_prompt=system_prompt,
+            task="conversation",
+        )
+        parsed = parse_llm_json(llm_result["content"])
+        provider_used = llm_result.get("provider", "unknown")
+    except Exception as e:
+        logger.error(f"WebSocket LLM call failed for session {session_id}: {e}")
 
-    parsed = parse_llm_json(llm_result["content"])
-    session.provider_used = llm_result.get("provider", "unknown")
+    reply = (parsed.get("reply") or "").strip()
+    if not reply:
+        reply = "Sorry, I lost my train of thought for a second — tell me a bit more about that."
+
+    session.provider_used = provider_used
+
+    # Now write user message and assistant reply in a short-lived transaction
+    user_msg = Message(session_id=session_id, role="user", text=text)
+    db.add(user_msg)
+    await db.flush()
 
     assistant_msg = Message(
         session_id=session_id,
         role="assistant",
-        text=parsed.get("reply", ""),
+        text=reply,
     )
     db.add(assistant_msg)
     await db.flush()
