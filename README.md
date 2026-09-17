@@ -169,7 +169,7 @@ python scripts/clear_user_data.py --email user@example.com --dry-run   # preview
 python scripts/clear_user_data.py --email user@example.com
 ```
 
-The script also resets the user's level to B1 and clears `assessment_completed`.
+The script also resets the user's level to A1 and clears `assessment_completed`.
 
 ### Database
 

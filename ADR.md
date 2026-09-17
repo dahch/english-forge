@@ -175,3 +175,24 @@
 - **Decision**:
   - Unblock lesson generation: allow users to request lessons by topic (e.g. "Past Simple vs Present Perfect", "Job Interviewing") or target CEFR level, falling back to conversation errors if available.
   - Track completed state for library lessons so users see their cumulative progress.
+
+## ADR-019: CEFR Level Lifecycle, Proxy Timeout Resilience & Settings Preferences Feedback
+- **Date**: 2026-09-16
+- **Status**: Accepted
+- **Context**: 
+  1. Finishing an assessment triggers a detailed LLM analysis with reasoning models that can take 35–45 seconds. Next.js `rewrites` proxies backend requests with a hardcoded default `proxyTimeout` of 30,000 ms (30s). When the timeout was reached, Next.js aborted the connection with `ECONNRESET / socket hang up`, causing the browser to receive an error. Because Starlette catches the disconnect as an exception, `get_db()` rolled back the session, discarding the analysis. On manual retry via "Finish & See Results", the whole 40s LLM analysis was repeated and timed out again.
+  2. In `/settings`, the TTS Voice input used `settings.tts_voice || "alba"`. When a user cleared the input with backspace, it immediately snapped back to "alba", preventing typing any voice name that did not begin with 'a'. Furthermore, saving Preferences had zero visual feedback.
+  3. The initial default level was inconsistently set to "B1" on `User`, but expected to be "A1" when neither assessment nor manual setting was configured. Updating `default_cefr` in settings did not update `current_user.current_level` or propagate to Dashboard and Conversation. When an assessment completed, it updated `current_user.current_level` but did not synchronize the `default_cefr` setting. Lastly, changing the default level in settings when an assessment was already completed lacked confirmation and did not regenerate the learning path.
+- **Decision**:
+  1. Configure `experimental: { proxyTimeout: 300_000 }` (5 minutes) in `frontend/next.config.ts`.
+  2. In `backend/app/routers/assessment.py`, explicitly call `await db.commit()` once `assessment.completed_at` is set, ensuring completed analyses are never rolled back on client disconnects.
+  3. In `frontend/src/app/(main)/assessment/page.tsx`, if `api.assessment.complete()` encounters an error, perform an immediate transparent query to `api.assessment.current()`. If the server completed the analysis, seamlessly transition to the Results screen.
+  4. In `frontend/src/app/(main)/settings/page.tsx`, bind TTS Voice to `settings.tts_voice ?? ""` and add a visual `settingsSaved` state ("Saved!" on button for 2s).
+  5. Change the unassessed/unconfigured system baseline level from "B1" to "A1" in `models.py` and `main.py`.
+  6. In `analyze_assessment`, upsert `Setting(key="default_cefr", value=assessment.estimated_level)` alongside `current_user.current_level`.
+  7. In `update_settings`, update `current_user.current_level` when `default_cefr` changes, and if `regenerate_path=True` (or when user has completed assessment / active path), regenerate the active learning path for the new level.
+  8. In Settings UI, show a confirmation dialog before applying a level change if the user has completed assessment or has an active path.
+- **Consequences**:
+  - Pros: Eliminates proxy timeout failures on long LLM runs; robust recovery if network blips occur; consistent CEFR level across User, Settings, Dashboard, Conversation, and Learning Paths; safe confirmation gate before path regeneration.
+  - Cons: Regenerating a learning path replaces the previous active path's pending lessons (completed lesson metrics are preserved in daily progress).
+

@@ -103,6 +103,30 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
   - Las tarjetas no revisadas (`next_review_at IS NULL`) se integran automáticamente como pendientes tanto en la cola de repaso como en el contador del Dashboard.
   - Pantalla final de resumen con estadísticas por calificación y puntuación porcentual de retención.
 
+### 2.9 Ciclo de Vida de Nivel CEFR, Resiliencia de Assessment y Ajustes de Preferencias
+
+- **REQ-ASSESS-RESILIENCE (Resiliencia al Finalizar Assessment y Prevensión de Timeout)**:
+  - El proxy de Next.js (`rewrites` en `next.config.ts`) debe tener configurado `experimental.proxyTimeout` en 300,000 ms (5 minutos) para evitar abortar peticiones con `ECONNRESET / socket hang up` durante llamadas LLM extensas como el análisis final del assessment.
+  - En el backend, al completar el assessment (`complete_assessment`), los cambios (`completed_at`, `current_user.current_level`, análisis) deben confirmarse de manera atómica con `await db.commit()` para que no se descarten en rollback si ocurre una desconexión o cancelación del cliente.
+  - Si un assessment ya tiene `completed_at` establecido, peticiones subsiguientes a `/complete` deben ser idempotentes devolviendo el assessment existente sin relanzar el análisis por LLM.
+  - En el frontend (`completeAssessment`), ante un error HTTP o desconexión en `/complete`, el cliente debe consultar de forma transparente `/api/assessment/current`: si el servidor completó con éxito el análisis, el cliente recupera el estado y muestra de inmediato la pantalla de resultados en lugar de quedarse atascado en un mensaje de error.
+
+- **REQ-SETTINGS-PREF-FEEDBACK (Retroalimentación al Guardar Preferencias)**:
+  - Al hacer clic en «Save Preferences» en `/settings`, el botón debe mostrar un estado visual de confirmación («Saved!» por 2 segundos con icono `CheckCircle2`), consistente con la experiencia de «Save Tutor Profile».
+
+- **REQ-SETTINGS-TTS-VOICE (Corrección de Campo TTS Voice)**:
+  - El campo de texto de `TTS Voice` en Preferences debe evaluar su valor como `settings.tts_voice ?? ""` (no `|| "alba"`), permitiendo que el usuario borre por completo el contenido y escriba libremente cualquier nombre de voz sin que se restablezca automáticamente la palabra "alba".
+
+- **REQ-CEFR-LIFECYCLE (Ciclo de Vida Consistente de Nivel CEFR)**:
+  - **Nivel inicial por defecto**: Si el usuario no ha realizado el assessment y no ha guardado manualmente un nivel en Settings, el nivel por defecto en todo el sistema (modelo `User`, Dashboard, Conversación y generación manual de Learning Path) es **A1** (no B1).
+  - **Sincronización al completar Assessment**: Cuando el assessment concluye y determina un nivel (ej. A2, B2, C1), dicho resultado actualiza automáticamente `current_user.current_level`, marca `current_user.assessment_completed = True`, y sincroniza/crea el registro en `Setting(key="default_cefr", value=nivel)`.
+  - **Cambio manual de nivel en Settings**:
+    - Si el usuario ya completó el assessment o ya cuenta con un Learning Path activo, al seleccionar un nuevo nivel y guardar, el sistema debe solicitar confirmación explícita mediante un modal de advertencia: «Cambiar tu nivel CEFR por defecto actualizará tu nivel de perfil a [Nivel] y regenerará tu ruta de aprendizaje actual. ¿Deseas continuar?».
+    - Si el usuario cancela, no se efectúa ningún cambio y se restaura el valor anterior.
+    - Si el usuario confirma, se actualiza `default_cefr`, se actualiza `current_user.current_level`, y se regenera la ruta de aprendizaje activa adaptada al nuevo nivel.
+    - Si el usuario no ha completado el assessment ni tiene una ruta activa, la actualización del nivel por defecto se aplica directamente a `Setting` y `current_user.current_level`.
+  - **Consistencia en vistas**: Dashboard, pantalla de Conversación y Learning Path reflejan dinámicamente el `current_level` actualizado del usuario.
+
 - **REQ-CONV-1 (Inicio Proactivo del Tutor en Escenarios y Voz Universal)**:
   - Al iniciar un escenario (o conversación en el path), el tutor IA debe enviar el primer mensaje de saludo/contextualización en personaje con audio TTS, guiando al alumno.
   - La entrada de voz en `/conversation` no debe depender únicamente de la Web Speech API del navegador: debe ofrecer grabación de audio con transcripción en el backend (Moonshine/faster-whisper) como en el assessment, garantizando funcionamiento en cualquier navegador o móvil.

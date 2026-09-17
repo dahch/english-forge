@@ -75,3 +75,28 @@ Clean up broken facades and ensure bulletproof system execution:
    - Remove the non-existent `whisper_wasm` option from STT Mode dropdown.
    - Reflect real supported STT modes: Web Speech API (Browser native) and Homelab STT (Moonshine / Faster-Whisper server-side).
 4. Run comprehensive end-to-end checks across all modules: verify path generation, interactive lessons, SRS flashcard reviews, conversation audio, and dashboard statistics.
+
+## Iteration 6 — CEFR Level Lifecycle, Assessment Completion Resilience & Settings Fixes
+modules: frontend/next.config.ts, backend/app/models/models.py, backend/app/main.py, backend/app/routers/assessment.py, backend/app/services/assessment_flow.py, backend/app/routers/settings.py, backend/app/schemas/settings.py, frontend/src/app/(main)/settings/page.tsx, frontend/src/app/(main)/assessment/page.tsx, frontend/src/app/(main)/conversation/page.tsx, frontend/src/app/(main)/dashboard/page.tsx, frontend/src/lib/api.ts
+
+Resolve assessment analysis timeouts, eliminate TTS voice typing traps, provide preferences feedback, and enforce consistent CEFR level lifecycle:
+1. In `frontend/next.config.ts`:
+   - Configure `experimental.proxyTimeout: 300_000` (5 minutes) to prevent Next.js rewrites from prematurely severing backend requests (e.g. 35-45s LLM assessment analysis and curriculum generation) with ECONNRESET socket hang up.
+2. In `backend/app/routers/assessment.py` and `backend/app/services/assessment_flow.py`:
+   - Call `await db.commit()` explicitly upon assessment completion so persisted records are never rolled back if client disconnects occur.
+   - When the assessment analysis concludes, synchronize `Setting(key="default_cefr", value=assessment.estimated_level)` in addition to `current_user.current_level`.
+   - In `frontend/src/app/(main)/assessment/page.tsx`, if `completeAssessment` catches an error, transparently query `/api/assessment/current` to recover completed state if already persisted on the server.
+3. In `frontend/src/app/(main)/settings/page.tsx`:
+   - Change TTS Voice value binding from `settings.tts_voice || "alba"` to `settings.tts_voice ?? ""` so clearing the text allows typing custom voices without snapping back to "alba".
+   - Add visual feedback state on "Save Preferences" button (show "Saved!" for 2 seconds with check icon).
+4. Baseline CEFR Level & Lifecycle Synchronization:
+   - Change baseline default level in `backend/app/models/models.py` (`User.current_level`) and `backend/app/main.py` (`_COLUMNS_TO_ADD`) from "B1" to "A1".
+   - Update `frontend/src/app/(main)/conversation/page.tsx` and `frontend/src/app/(main)/dashboard/page.tsx` fallbacks to "A1".
+   - In `backend/app/routers/settings.py` and `backend/app/schemas/settings.py`:
+     - When updating `default_cefr`, synchronize `current_user.current_level = body.default_cefr`.
+     - Accept optional `regenerate_path: bool`. If True (or when level changes on a user with completed assessment or active path), trigger `_generate_path_for_user(db, current_user)` to regenerate the learning path for the new level.
+   - In `frontend/src/app/(main)/settings/page.tsx`:
+     - If the user has completed an assessment or has an active learning path, changing `Default CEFR Level` opens a confirmation dialog warning that this will update their default level and regenerate their learning path.
+     - If cancelled: revert level, no changes applied.
+     - If confirmed: proceed with saving settings and regenerating the learning path.
+
