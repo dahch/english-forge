@@ -138,6 +138,7 @@ class AssessmentResponse(BaseModel):
     summary: str | None
     phase: str | None
     dimension_scores: dict | None
+    dimension_bands: dict | None
     messages: list[AssessmentMessageResponse]
     # Transient signal: every section is done and the client should call
     # /complete. Defaults to False for endpoints that don't compute it.
@@ -161,7 +162,7 @@ class AssessmentResponse(BaseModel):
                 return []
         return v
 
-    @field_validator("dimension_scores", mode="before")
+    @field_validator("dimension_scores", "dimension_bands", mode="before")
     @classmethod
     def parse_dimension_scores(cls, v):
         if isinstance(v, str):

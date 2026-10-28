@@ -212,6 +212,7 @@ async def export_user_data(
                 "estimated_level": a.estimated_level,
                 "confidence": a.confidence,
                 "dimension_scores": a.dimension_scores,
+                "dimension_bands": a.dimension_bands,
                 "strengths": a.strengths,
                 "weaknesses": a.weaknesses,
                 "recommendations": a.recommendations,

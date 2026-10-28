@@ -23,6 +23,7 @@ from app.llm.prompts import (
     get_curriculum_seed,
     get_specialized_lesson_prompt,
 )
+from app.json_utils import load_json
 from app.llm.router import LLMRouter, parse_llm_json, parse_lesson_json
 from app.models.models import (
     Assessment,
@@ -523,9 +524,24 @@ async def _generate_path_for_user(
 
     assessment_info = ""
     if assessment:
-        strengths = json.loads(assessment.strengths) if assessment.strengths else []
-        weaknesses = json.loads(assessment.weaknesses) if assessment.weaknesses else []
-        recommendations = json.loads(assessment.recommendations) if assessment.recommendations else []
+        strengths = load_json(
+            assessment.strengths,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} strengths",
+        )
+        weaknesses = load_json(
+            assessment.weaknesses,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} weaknesses",
+        )
+        recommendations = load_json(
+            assessment.recommendations,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} recommendations",
+        )
         assessment_info = (
             f"Estimated level: {assessment.estimated_level}\n"
             f"Strengths: {', '.join(strengths)}\n"
@@ -772,8 +788,18 @@ async def _generate_lesson_content(
         )
         assessment = a_result.scalar_one_or_none()
         if assessment:
-            strengths = json.loads(assessment.strengths) if assessment.strengths else []
-            weaknesses = json.loads(assessment.weaknesses) if assessment.weaknesses else []
+            strengths = load_json(
+                assessment.strengths,
+                default=[],
+                expected_type=list,
+                context=f"assessment {assessment.id} strengths",
+            )
+            weaknesses = load_json(
+                assessment.weaknesses,
+                default=[],
+                expected_type=list,
+                context=f"assessment {assessment.id} weaknesses",
+            )
             assessment_info = (
                 f"\nLearner assessment context (personalize toward weaknesses):\n"
                 f"Estimated level: {assessment.estimated_level or path.current_level}\n"

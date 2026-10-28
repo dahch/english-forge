@@ -17,6 +17,7 @@ from app.schemas.session import (
     MessageResponse,
 )
 from app.integrations.tts_personal_api import TTSPersonalAPI
+from app.services.media_store import store_audio
 from app.services.session_metrics import finalize_session
 from app.services.stt import transcribe_audio
 from app.utils import get_tutor_profile_dict, resolve_tts_voice
@@ -127,8 +128,7 @@ async def create_session(
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
         audio_bytes = await tts.synthesize(greeting, voice=voice)
         if audio_bytes:
-            import base64
-            initial_msg.audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
+            initial_msg.audio_url = store_audio(audio_bytes)
             await db.commit()
     except Exception as e:
         logger.warning(f"TTS synthesis failed for opening session greeting: {e}")

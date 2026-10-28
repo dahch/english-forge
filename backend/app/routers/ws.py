@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.database import async_session_factory
 from app.models.models import Message, Session, User
 from app.security import decode_access_token
+from app.services.media_store import store_audio
 from app.services.session_metrics import finalize_session
 from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
@@ -343,9 +344,7 @@ async def _process_turn_locked(
         voice = await resolve_tts_voice(db, user_id, profile_dict)
         audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
-            import base64
-            audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
-            assistant_msg.audio_url = audio_url
+            assistant_msg.audio_url = store_audio(audio_bytes)
     except Exception:
         pass
 
@@ -356,9 +355,11 @@ async def _process_turn_locked(
             "id": assistant_msg.id,
             "role": "assistant",
             "text": assistant_msg.text,
-            "audio_url": audio_url,
+            "audio_url": None,
+            "has_audio": bool(assistant_msg.audio_url),
         },
         "corrections": correction_list,
         "new_vocab": new_vocab_list,
-        "audio_url": audio_url,
+        "audio_url": None,
+        "has_audio": bool(assistant_msg.audio_url),
     }

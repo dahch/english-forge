@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
         await conn.run_sync(lambda sync_conn: _ensure_indexes_sync(sync_conn))
+        await conn.run_sync(lambda sync_conn: _ensure_alembic_baseline_sync(sync_conn))
     logger.info("Database tables created/verified")
 
     await _warn_undecryptable_provider_keys()
@@ -124,6 +125,7 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
         ("phase", "VARCHAR(20) NOT NULL DEFAULT 'conversation'"),
         ("section_step", "INTEGER NOT NULL DEFAULT 0"),
         ("dimension_scores", "TEXT"),
+        ("dimension_bands", "TEXT"),
         # Abandoning frees the in-progress unique index without faking a result
         # (see DELETE /api/assessment/{id}).
         ("abandoned_at", "DATETIME"),
@@ -144,6 +146,43 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     # both — the microsecond default just removes the random-UUID tiebreak
     # for same-second inserts.
 }
+
+
+# Revision stamped on databases that predate Alembic. The baseline migration is
+# a no-op because create_all already owns creation; stamping makes future
+# revisions applicable to both fresh and existing databases.
+BASELINE_REVISION = "0001_baseline"
+
+
+def _ensure_alembic_baseline_sync(sync_conn) -> None:
+    inspector = sa.inspect(sync_conn)
+    if inspector.has_table("alembic_version"):
+        return
+    if not inspector.has_table("users"):
+        return
+    try:
+        with sync_conn.begin_nested():
+            sync_conn.execute(
+                text(
+                    "CREATE TABLE alembic_version ("
+                    "version_num VARCHAR(32) NOT NULL, "
+                    "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+                )
+            )
+            sync_conn.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+                {"revision": BASELINE_REVISION},
+            )
+        logger.info("Stamped Alembic baseline %s", BASELINE_REVISION)
+    except sa.exc.OperationalError:
+        if sa.inspect(sync_conn).has_table("alembic_version"):
+            logger.info("Alembic baseline already stamped by a concurrent startup")
+        else:
+            logger.warning(
+                "Could not stamp the Alembic baseline; future migrations will "
+                "need a manual 'alembic stamp %s'",
+                BASELINE_REVISION,
+            )
 
 
 def _column_exists(sync_conn, table: str, column_name: str) -> bool:
@@ -238,11 +277,30 @@ _INDEXES_TO_ADD: list[tuple[str, str, str]] = [
         "ON assessment_messages (assessment_id, item_id) "
         "WHERE role = 'user' AND item_id IS NOT NULL",
     ),
+    # One vocabulary row per word per user, case-insensitively. The LLM and the
+    # manual form used to race on SELECT-then-INSERT and create duplicates.
+    (
+        "uq_vocab_items_user_word",
+        "vocab_items",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_vocab_items_user_word "
+        "ON vocab_items (user_id, lower(word))",
+    ),
+    # The seeded predefined scenarios must exist once, not once per concurrent
+    # first request (ADR-023): global rows only.
+    (
+        "uq_scenarios_global_name",
+        "scenarios",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_scenarios_global_name "
+        "ON scenarios (lower(name)) WHERE user_id IS NULL AND is_custom = 0",
+    ),
 ]
 
 
 def _ensure_indexes_sync(sync_conn) -> None:
+    inspector = sa.inspect(sync_conn)
     for index_name, table_name, index_sql in _INDEXES_TO_ADD:
+        if not inspector.has_table(table_name):
+            continue
         # IF NOT EXISTS would silently keep an outdated predicate (e.g. the old
         # assessment index without `abandoned_at`). Replace it when the stored
         # definition differs from the one this build expects.

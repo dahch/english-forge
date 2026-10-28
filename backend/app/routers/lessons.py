@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.json_utils import as_dict_list, load_json
 from app.llm.router import parse_lesson_json
 from app.models.models import Correction, GeneratedLesson, Message, Session, User, LibraryLessonCompletion
 from app.utils import bump_daily_lessons
@@ -105,17 +106,26 @@ def _serialize_generated_lesson(lesson: GeneratedLesson) -> dict:
     generate endpoints (ADR-003/005). The frontend discriminates generated
     lessons by the presence of `completed`, so every serialized lesson
     carries it."""
+    examples = load_json(
+        lesson.examples,
+        default=[],
+        expected_type=list,
+        context=f"generated_lesson {lesson.id} examples",
+    )
+    exercises = as_dict_list(
+        lesson.exercises, context=f"generated_lesson {lesson.id} exercises"
+    )
     return {
         "id": lesson.id,
         "title": lesson.title,
         "topic": lesson.topic,
         "level": lesson.level,
         "explanation": lesson.explanation,
-        "examples": json.loads(lesson.examples) if lesson.examples else [],
+        "examples": examples,
         # Answers and explanations stripped — delivered upon exercise submission
         "exercises": [
             {k: v for k, v in ex.items() if k not in ("answer", "explanation")}
-            for ex in (json.loads(lesson.exercises) if lesson.exercises else [])
+            for ex in exercises
         ],
         "based_on_errors": lesson.based_on_errors,
         "completed": lesson.completed,

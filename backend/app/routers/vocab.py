@@ -6,6 +6,7 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -22,6 +23,7 @@ from app.schemas.vocab import (
     VocabItemUpdate,
 )
 from app.srs.sm2 import sm2_update, next_review_date
+from app.utils import bump_daily_words
 
 router = APIRouter(prefix="/api/vocab", tags=["vocab"])
 
@@ -63,7 +65,13 @@ async def create_vocab(
         next_review_at=next_review_date(0),
     )
     db.add(item)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Unique index on (user_id, lower(word)): report it instead of a 500.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="This word is already in your vocabulary")
+    await bump_daily_words(db, current_user.id, 1)
     await db.refresh(item)
     return VocabItemResponse.model_validate(item)
 

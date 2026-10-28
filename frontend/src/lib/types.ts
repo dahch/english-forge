@@ -55,7 +55,9 @@ export interface Message {
   session_id: string
   role: string
   text: string
+  // Always null from the API; audio is fetched from the authenticated endpoint.
   audio_url: string | null
+  has_audio?: boolean
   created_at: string
   corrections: Correction[]
 }
@@ -220,6 +222,8 @@ export interface Assessment {
   summary: string | null
   phase: string | null
   dimension_scores: DimensionScores | null
+  // Difficulty-weighted CEFR band per dimension (final level = median).
+  dimension_bands?: Record<string, string | null> | null
   messages: AssessmentMessage[]
   is_complete?: boolean
   // Server-computed progress for the section stepper ("item X of Y").

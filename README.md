@@ -161,7 +161,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, Lessons Hub (on-demand topical generation, CEFR level targeting, deterministic A1–C2 fallbacks, library completion tracking with atomic daily streak sync, and answer stripping), assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, single-query session listing aggregation, week-1 hardening (startup secret/Fernet validation, login rate limiting and email normalisation, bcrypt length limits, assessment abandon/reclaim, idempotent session billing, per-turn lock ordering, TTS-failure resilience and export credential redaction), and the UI feedback contracts (assessment progress fields, lesson/path provenance flags). The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, Lessons Hub (on-demand topical generation, CEFR level targeting, deterministic A1–C2 fallbacks, library completion tracking with atomic daily streak sync, and answer stripping), assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, single-query session listing aggregation, week-1 hardening (startup secret/Fernet validation, login rate limiting and email normalisation, bcrypt length limits, assessment abandon/reclaim, idempotent session billing, per-turn lock ordering, TTS-failure resilience and export credential redaction), the UI feedback contracts (assessment progress fields, lesson/path provenance flags), and week-4 durability (Alembic baseline stamping, CHECK/unique constraints, defensive JSON reads, real new-word counters, file-backed audio and difficulty-weighted CEFR bands). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
@@ -187,7 +187,9 @@ docker compose exec backend sh -c 'sqlite3 /app/data/englishforge.db ".backup /a
 ./scripts/backup_sqlite.sh backend/data/englishforge.db /var/backups/englishforge
 ```
 
-`scripts/backup_sqlite.sh` keeps the last 14 files; copy the directory off-host for real disaster recovery (the volume alone is not a backup).
+`scripts/backup_sqlite.sh` keeps the last 14 files, archives `MEDIA_DIR` (TTS audio lives outside the database) and copies off-host is still your job — the volume alone is not a backup.
+
+Audio note: new TTS output is written as files under `MEDIA_DIR` and served by authenticated endpoints; the database stores only a `media:<file>` reference (legacy base64 rows remain readable). Restoring the DB without the media directory keeps text and results but loses playback.
 
 Users can export everything they own as JSON from `GET /api/settings/export` (Settings → not yet surfaced in the UI). The export includes sessions, messages, vocabulary, assessments, lessons, paths and progress; provider API keys are **never** included (only `has_api_key`).
 
@@ -209,7 +211,22 @@ Schema handling (no manual migrations needed for routine changes):
 - Tables are created with `Base.metadata.create_all()` on startup.
 - Columns added to existing tables after first deployment are applied by the startup sync in `backend/app/main.py` (`_COLUMNS_TO_ADD`), guarded by an inspector check so it's safe to run on every launch.
 - Partial unique indexes enforcing invariants (one in-progress assessment, one active learning path per user) are created at startup (`_INDEXES_TO_ADD`) — see ADR-007. Stored index definitions are compared with the expected SQL and replaced when the predicate changes (e.g. the assessment index gaining `abandoned_at IS NULL`).
-- Alembic remains available for full table migrations: `alembic revision --autogenerate -m "description"` and `alembic upgrade head` (run from `backend/`).
+- Also enforced at startup: one vocabulary row per user and word (case-insensitive) and one global scenario per name (ADR-023). If pre-existing duplicates prevent creation, startup logs a warning naming the index; clean them and restart:
+
+```sql
+-- keep the oldest row per (user, lower(word)) / per global scenario name
+DELETE FROM vocab_items
+ WHERE rowid NOT IN (
+   SELECT MIN(rowid) FROM vocab_items GROUP BY user_id, lower(word)
+ );
+DELETE FROM scenarios
+ WHERE user_id IS NULL
+   AND rowid NOT IN (
+     SELECT MIN(rowid) FROM scenarios WHERE user_id IS NULL GROUP BY lower(name)
+   );
+```
+- Fresh databases get CHECK constraints (roles, phases, CEFR levels, non-negative counters). Databases created before ADR-023 keep the older, more permissive DDL; the application still validates on write.
+- The schema is versioned with Alembic: startup stamps `0001_baseline` after `create_all`. For later changes run `alembic revision --autogenerate -m "description"` and `alembic upgrade head` from `backend/` (`alembic/env.py` converts the async URL to a sync one). Do not bootstrap an empty database with `alembic upgrade` — start the app once so the tables exist and the baseline is stamped.
 
 ## Documentation
 
@@ -235,6 +252,7 @@ See `.env.example` for the full list. Required:
 | `TRUST_PROXY_HEADERS` | No (default: `true`) | Read the browser IP from `X-Forwarded-For` (set by the Next.js proxy). Disable only when the backend is exposed directly. |
 | `ASSESSMENT_INACTIVE_DAYS` | No (default: `7`) | In-progress assessments with no activity for this long are abandoned automatically. |
 | `MAX_SESSION_MINUTES` / `SESSION_END_GRACE_MINUTES` | No (default: 180 / 2) | Cap and grace period for a session's billable minutes. |
+| `MEDIA_DIR` | No (default: `data/media`) | Where TTS audio files are stored (inside the data volume in Docker). Back it up with the database. |
 | `DATABASE_URL` | No (default: `sqlite+aiosqlite:///./data/englishforge.db`) | SQLAlchemy async URL. Only SQLite is supported — override the file path if needed. |
 | `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |

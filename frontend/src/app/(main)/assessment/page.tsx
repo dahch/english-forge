@@ -534,6 +534,7 @@ export default function AssessmentPage() {
     const dims: [string, number][] = Object.entries(
       (assessment.dimension_scores ?? {}) as DimensionScores
     ).filter(([, v]) => typeof v === "number") as [string, number][]
+    const bands = assessment.dimension_bands ?? {}
     return (
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         <div className="text-center space-y-2">
@@ -563,7 +564,10 @@ export default function AssessmentPage() {
                 <div key={dim}>
                   <div className="flex justify-between text-sm mb-1">
                     <span>{DIMENSION_LABELS[dim] ?? dim}</span>
-                    <span className="text-muted-foreground">{Math.round(score)}/100</span>
+                    <span className="text-muted-foreground">
+                      {Math.round(score)}/100
+                      {typeof bands[dim] === "string" ? ` · ${bands[dim]}` : ""}
+                    </span>
                   </div>
                   <Progress value={score} />
                 </div>

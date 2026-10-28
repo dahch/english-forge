@@ -1,6 +1,6 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 from alembic import context
 
 config = context.config
@@ -8,13 +8,19 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 from app.models.models import Base
+
 target_metadata = Base.metadata
 
 
+def _sync_url() -> str:
+    """Alembic runs synchronously; the app URL is async (aiosqlite)."""
+    url = config.get_main_option("sqlalchemy.url") or ""
+    return url.replace("+aiosqlite", "")
+
+
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=_sync_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -24,9 +30,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    from sqlalchemy.ext.asyncio import create_async_engine
-    url = config.get_main_option("sqlalchemy.url")
-    connectable = create_async_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(_sync_url(), poolclass=pool.NullPool)
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():

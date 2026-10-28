@@ -10,11 +10,12 @@ import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, setActiveSessionId, getActiveSessionId } from "@/lib/api"
+import { api, fetchBlob, setActiveSessionId, getActiveSessionId } from "@/lib/api"
 import { useToast } from "@/components/feedback/toast"
 import { startRecording, RecorderError, type RecorderHandle } from "@/lib/recorder"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
 import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
+import { formatServerDateTime } from "@/lib/datetime"
 import type { Scenario, Message, Session, SessionSummary, CEFRLevel, User } from "@/lib/types"
 import { CEFR_LEVELS } from "@/lib/types"
 import {
@@ -101,6 +102,7 @@ export default function ConversationPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sttRef = useRef<WebSpeechSTT | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioObjectUrlRef = useRef<string | null>(null)
   const recorderHandleRef = useRef<RecorderHandle | null>(null)
   const cancelRecordingRef = useRef<boolean>(false)
   const levelBarRef = useRef<HTMLDivElement>(null)
@@ -135,6 +137,10 @@ export default function ConversationPage() {
         audioRef.current.src = ""
         audioRef.current = null
       }
+      if (audioObjectUrlRef.current) {
+        URL.revokeObjectURL(audioObjectUrlRef.current)
+        audioObjectUrlRef.current = null
+      }
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel()
         utteranceRef.current = null
@@ -158,21 +164,30 @@ export default function ConversationPage() {
     setPlayingAudioId(null)
   }
 
-  const playServerAudio = (msgId: string, url: string) => {
+  // Tutor audio is fetched with the session cookie and played from a blob URL;
+  // the API never ships base64 audio inside message JSON.
+  const playMessageAudio = async (msgId: string, messageId: string) => {
     stopAudio()
-    const audio = new Audio(url)
-    audio.onended = () => setPlayingAudioId(null)
-    audio.onerror = () => {
+    if (!session) return
+    try {
+      const blob = await fetchBlob(
+        `/api/sessions/${session.id}/messages/${messageId}/audio`,
+      )
+      const url = URL.createObjectURL(blob)
+      audioObjectUrlRef.current = url
+      const audio = new Audio(url)
+      audio.onended = () => setPlayingAudioId(null)
+      audio.onerror = () => {
+        setPlayingAudioId(null)
+        setError("Could not play the tutor audio.")
+      }
+      audioRef.current = audio
+      setPlayingAudioId(msgId)
+      await audio.play()
+    } catch {
       setPlayingAudioId(null)
-      setError("Could not play server audio.")
+      setError("Tutor audio isn't available for this message — browser speech still works.")
     }
-    audioRef.current = audio
-    setPlayingAudioId(msgId)
-    audio.play().catch((err: unknown) => {
-      setPlayingAudioId(null)
-      if (err instanceof DOMException && err.name === "NotAllowedError") return
-      setError("Could not play server audio.")
-    })
   }
 
   // Play browser TTS with utteranceRef to prevent Chrome GC mid-sentence [REV-005]
@@ -202,8 +217,8 @@ export default function ConversationPage() {
       stopAudio()
       return
     }
-    if (msg.audio_url) {
-      playServerAudio(msg.id, msg.audio_url)
+    if (msg.has_audio) {
+      void playMessageAudio(msg.id, msg.id)
     } else {
       playBrowserTTS(msg.id, msg.text)
     }
@@ -307,8 +322,8 @@ export default function ConversationPage() {
       // Auto-play greeting audio if available (or trigger TTS if appropriate)
       const greetingMsg = msgs.find((m) => m.role === "assistant")
       if (greetingMsg) {
-        if (greetingMsg.audio_url) {
-          playServerAudio(greetingMsg.id, greetingMsg.audio_url)
+        if (greetingMsg.has_audio) {
+          void playMessageAudio(greetingMsg.id, greetingMsg.id)
         } else if (typeof window !== "undefined" && "speechSynthesis" in window) {
           playBrowserTTS(greetingMsg.id, greetingMsg.text)
         }
@@ -365,8 +380,8 @@ export default function ConversationPage() {
         const withoutTemp = prev.filter((m) => m.id !== tempId)
         return [...withoutTemp, turn.user_message, turn.assistant_message]
       })
-      if (turn.audio_url) {
-        playServerAudio(turn.assistant_message.id, turn.audio_url)
+      if (turn.assistant_message.has_audio) {
+        void playMessageAudio(turn.assistant_message.id, turn.assistant_message.id)
       }
     } catch (err: unknown) {
       setMessages((prev) => prev.filter((m) => m.id !== tempId))
@@ -669,7 +684,7 @@ export default function ConversationPage() {
                     <div>
                       <p className="text-sm font-medium">{s.scenario_name || "Free Talk"}</p>
                       <p className="text-xs text-muted-foreground">
-                        {new Date(s.started_at).toLocaleString()} · {s.message_count} messages · {s.cefr_level}
+                        {formatServerDateTime(s.started_at)} · {s.message_count} messages · {s.cefr_level}
                       </p>
                     </div>
                     {s.ended_at ? (
@@ -1022,7 +1037,7 @@ export default function ConversationPage() {
                   <button
                     onClick={() => toggleAudioPlayback(msg)}
                     className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                    title={msg.audio_url ? "Play server audio" : "Listen (browser speech)"}
+                    title={msg.has_audio ? "Play tutor audio" : "Listen (browser speech)"}
                   >
                     {playingAudioId === msg.id ? (
                       <>
@@ -1032,7 +1047,7 @@ export default function ConversationPage() {
                     ) : (
                       <>
                         <Volume2 className="h-3 w-3" />
-                        <span>{msg.audio_url ? "Play audio" : "Listen"}</span>
+                        <span>{msg.has_audio ? "Play audio" : "Listen"}</span>
                       </>
                     )}
                   </button>

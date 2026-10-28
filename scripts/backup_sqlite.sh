@@ -14,6 +14,9 @@ set -euo pipefail
 DB_PATH="${1:-backend/data/englishforge.db}"
 OUT_DIR="${2:-backups}"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+# TTS audio lives outside the database (MEDIA_DIR). Back it up together with the
+# DB: restore without it and old messages lose their audio.
+MEDIA_PATH="${MEDIA_DIR:-backend/data/media}"
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
   echo "error: sqlite3 is required (apt install sqlite3 / brew install sqlite)" >&2
@@ -38,5 +41,12 @@ if [[ "$(sqlite3 "$TARGET" 'PRAGMA integrity_check;')" != "ok" ]]; then
 fi
 
 echo "backup written: $TARGET ($(du -h "$TARGET" | cut -f1))"
+
+if [[ -d "$MEDIA_PATH" ]]; then
+  MEDIA_ARCHIVE="$OUT_DIR/media-$STAMP.tar.gz"
+  tar -czf "$MEDIA_ARCHIVE" -C "$(dirname "$MEDIA_PATH")" "$(basename "$MEDIA_PATH")"
+  echo "media archived: $MEDIA_ARCHIVE ($(du -h "$MEDIA_ARCHIVE" | cut -f1))"
+  find "$OUT_DIR" -maxdepth 1 -name 'media-*.tar.gz' -type f -mtime "+$RETENTION_DAYS" -print -delete
+fi
 
 find "$OUT_DIR" -maxdepth 1 -name 'englishforge-*.db' -type f -mtime "+$RETENTION_DAYS" -print -delete

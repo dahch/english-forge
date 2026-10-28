@@ -147,6 +147,11 @@ async def test_full_flow(db, user, monkeypatch):
     assert served.dimension_scores["listening"] == 100.0
     # Perfect read-aloud transcripts → composite 100 across the bank.
     assert served.dimension_scores["pronunciation"] == 100.0
+    # Levels come from difficulty-weighted bands, not raw accuracy: perfect on
+    # a bank that tops out at C1 is C1, never an invented C2.
+    assert served.dimension_bands is not None
+    assert served.dimension_bands["listening"] == "C1"
+    assert served.dimension_bands["pronunciation"] == "C1"
     assert served.estimated_level is not None
     assert 0.05 <= served.confidence <= 0.95
     # Strengths/weaknesses are labels of measured dimensions only.

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import base64
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.concurrency import session_turn_lock
@@ -28,8 +28,9 @@ from app.schemas.session import (
     MessageCreate,
     MessageResponse,
 )
+from app.services.media_store import read_audio, store_audio
 from app.srs.sm2 import next_review_date
-from app.utils import get_tutor_profile_dict, resolve_tts_voice
+from app.utils import bump_daily_words, get_tutor_profile_dict, resolve_tts_voice
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +86,12 @@ async def send_message(
 
     return ConversationTurnResponse(
         user_message=_message_response(user_msg, correction_responses),
-        assistant_message=_message_response(
-            assistant_msg,
-            correction_responses,
-            audio_url=audio_url,
-        ),
+        assistant_message=_message_response(assistant_msg, correction_responses),
         corrections=correction_responses,
         new_vocab=new_vocab_list,
-        audio_url=audio_url,
+        # Audio is fetched lazily from the authenticated endpoint; the turn
+        # never carries a base64 blob.
+        audio_url=None,
     )
 
 
@@ -190,6 +189,8 @@ async def _persist_turn(
         corrections.append(correction)
 
     new_vocab_list = await _persist_vocab(db, current_user.id, assistant_msg, parsed)
+    if new_vocab_list:
+        await bump_daily_words(db, current_user.id, len(new_vocab_list))
 
     # Flush once so generated ids exist before building the response objects.
     await db.flush()
@@ -245,18 +246,27 @@ async def _persist_vocab(
     for key, item in candidates.items():
         if key in existing:
             continue
-        db.add(
-            VocabItem(
-                user_id=user_id,
-                word=item["word"],
-                definition=item["definition"],
-                example=item["example"],
-                source_message_id=assistant_msg.id,
-                ease_factor=2.5,
-                interval_days=0,
-                next_review_at=next_review_date(0),
-            )
-        )
+        # Per-item SAVEPOINT: the unique index (user_id, lower(word)) closes the
+        # SELECT-then-INSERT race, and the loser skips this word instead of
+        # failing the whole conversation turn.
+        try:
+            async with db.begin_nested():
+                db.add(
+                    VocabItem(
+                        user_id=user_id,
+                        word=item["word"],
+                        definition=item["definition"],
+                        example=item["example"],
+                        source_message_id=assistant_msg.id,
+                        ease_factor=2.5,
+                        interval_days=0,
+                        next_review_at=next_review_date(0),
+                    )
+                )
+                await db.flush()
+        except IntegrityError:
+            logger.info("Skipped duplicate vocabulary word %r", item["word"])
+            continue
         existing.add(key)
         created.append(item)
     return created
@@ -283,26 +293,58 @@ async def _attach_audio(
 
     if not audio_bytes:
         return None
-    audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
-    assistant_msg.audio_url = audio_url
+    assistant_msg.audio_url = store_audio(audio_bytes)
     await db.commit()
-    return audio_url
+    return None
 
 
-def _message_response(
-    msg: Message,
-    corrections: list[CorrectionResponse],
-    *,
-    audio_url: str | None = None,
-) -> MessageResponse:
+def _message_response(msg: Message, corrections: list[CorrectionResponse]) -> MessageResponse:
+    # Pass the storage reference so the response validator can derive
+    # has_audio; the serializer never exposes it.
     return MessageResponse(
         id=msg.id,
         session_id=msg.session_id,
         role=msg.role,
         text=msg.text,
-        audio_url=audio_url if audio_url is not None else msg.audio_url,
+        audio_url=msg.audio_url,
         created_at=msg.created_at,
         corrections=corrections,
+    )
+
+
+@router.get("/{session_id}/messages/{message_id}/audio")
+async def get_message_audio(
+    session_id: str,
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve the tutor audio for one message (cookie-authenticated)."""
+    session_result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.user_id == current_user.id)
+    )
+    if not session_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    message = (
+        await db.execute(
+            select(Message).where(
+                Message.id == message_id,
+                Message.session_id == session_id,
+                Message.role == "assistant",
+            )
+        )
+    ).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    audio = read_audio(message.audio_url)
+    if not audio:
+        raise HTTPException(status_code=404, detail="Audio not available")
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
     )
 
 

@@ -236,3 +236,19 @@
 - **Consequences**:
   - Pros: XSS can no longer exfiltrate a long-lived token; sessions are revocable; expiry is transparent; a stolen refresh token is usable at most once and its reuse kills all sessions; user work survives expiry/refresh.
   - Cons: `COOKIE_SECURE` must be enabled on HTTPS deployments; cookie auth needs the CSRF header (clients bypassing the official API client must send it, or use Bearer); rotation requires the client's single-flight refresh to avoid tripping reuse detection with parallel 401s; refresh tokens add a table and a pruning step.
+
+
+## ADR-023: Data Durability — Alembic Baseline, Integrity Constraints, File-Backed Audio and Difficulty-Weighted Bands
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found an unversioned schema (Alembic configured with no revisions, column changes applied by a hand-maintained `_COLUMNS_TO_ADD`), no database-level validation, JSON columns whose corruption could 500 a whole listing, TTS audio stored as base64 inside the database and serialized into every message list, a `new_words` counter nobody wrote, and assessment levels derived from raw accuracy regardless of item difficulty (answering one A2 item correctly implied C2).
+- **Decision**:
+  - Startup still creates tables (`create_all`) and applies the legacy column/index sync, then stamps `0001_baseline` into `alembic_version` when absent. `alembic/env.py` now uses a synchronous engine, so future revisions can be authored and applied normally on both fresh and existing databases.
+  - Fresh databases get CHECK constraints (roles, phases, CEFR levels, non-negative counters) and expression/partial unique indexes: one vocabulary row per user and word (case-insensitive) and one global scenario per name. The indexes are also created at startup on existing databases; duplicates there are reported loudly instead of silently persisting.
+  - All JSON readers go through `app.json_utils.load_json`, which logs corruption with context and returns a safe default (`/lessons/generated` no longer 500s on a corrupt row).
+  - `progress_daily.new_words` is incremented when vocabulary is created (LLM turns and manual additions); duplicate words are rejected with 409 and never double-count.
+  - New TTS audio is written to `MEDIA_DIR` and referenced as `media:<uuid>.mp3`; `MessageResponse` exposes `has_audio` and never serializes the reference or a base64 data URI. A cookie-authenticated `GET /api/sessions/{id}/messages/{id}/audio` serves it; legacy data URIs are still decoded and served.
+  - Assessment levels now aggregate **bands** (`dimension_bands`) instead of raw scores: listening uses the hardest item answered correctly, demoted for poor accuracy; pronunciation uses the item's band demoted by the composite. The 0-100 scores remain for display and confidence.
+- **Consequences**:
+  - Pros: Schema changes have a versioned path; invalid rows are rejected at the DB boundary; one corrupt row cannot break a listing; the database no longer grows by megabytes per conversation; weekly charts report real new words; placement levels stop being inflated by easy items.
+  - Cons: Existing databases keep their old CHECK constraints until rebuilt (application-level validation still applies); the unique indexes require cleaning pre-existing duplicates (startup logs them); audio backups must include `MEDIA_DIR`; `dimension_bands` is an additional column and response field.

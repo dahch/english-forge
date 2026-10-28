@@ -102,7 +102,11 @@ async def test_create_session_tts_synthesis_success(monkeypatch, db: AsyncSessio
     msgs = msg_res.scalars().all()
     assert len(msgs) == 1
     assert msgs[0].audio_url is not None
-    assert msgs[0].audio_url.startswith("data:audio/mpeg;base64,")
+    # Audio is stored as a file reference, never as a base64 blob in the row.
+    assert msgs[0].audio_url.startswith("media:")
+    assert res.initial_message is not None
+    assert res.initial_message.has_audio is True
+    assert res.initial_message.audio_url is None
 
 
 @pytest.mark.asyncio

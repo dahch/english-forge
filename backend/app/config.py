@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # An in-progress assessment with no activity for this long is abandoned
     # automatically so the user is never locked out of starting a new one.
     ASSESSMENT_INACTIVE_DAYS: int = 7
+    # TTS audio is stored as files under this directory (inside the data volume
+    # in Docker) instead of base64 blobs in the database.
+    MEDIA_DIR: str = "data/media"
     # Wall-clock cap for a session's billable minutes (an idle tab left open
     # overnight must not inflate ProgressDaily).
     MAX_SESSION_MINUTES: int = 180
