@@ -16,6 +16,8 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
 - **PWA** — Installable on mobile and desktop
 - **Multi-user** — cookie sessions (HttpOnly access + rotating refresh, CSRF-protected), per-user settings, encrypted API keys
+- **Streaming replies (SSE)** — the tutor's text appears token by token; corrections and new vocabulary arrive with the persisted turn. Falls back to the REST path automatically if the stream fails, and uses a second (non-streamed) call for the review so field names are never shown mid-sentence
+- **Provider tooling** — edit existing providers (blank key keeps the stored one) and probe key/URL/model with a tiny completion that reports latency or a sanitized error
 - **Honest UI feedback** — accessible toasts, per-operation stage and elapsed timers (LLM turns, assessment analysis, lesson/path generation), a server-driven assessment stepper, offline banner, route-level error boundaries, retry instead of "wrong answer" on network failures, and explicit `Base lesson` / `Base curriculum` labels when a model fallback is shown
 
 ## Quick Start
@@ -106,7 +108,7 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
-**WebSocket API status:** `/api/ws/session/{id}` exists for non-browser clients and future token streaming, but the web UI uses the REST endpoints only. It authenticates with the session cookie (or `?token=` for scripts), rejects cross-site `Origin`s, caps frames at 1 MB, and honours revoked sessions (`token_version`).
+**WebSocket API status:** `/api/ws/session/{id}` exists for non-browser clients and now emits the same `assistant_started`/`assistant_delta` events as the web stream. The web UI uses Server-Sent Events instead, because the Next.js proxy cannot upgrade WebSocket connections; both transports share `services/conversation_stream.py`. It authenticates with the session cookie (or `?token=` for scripts), rejects cross-site `Origin`s, caps frames at 1 MB, and honours revoked sessions (`token_version`).
 
 **Note:** Both conversation and assessment pages use universal voice recording: audio captured via `MediaRecorder` (up to 10MB, with live audio level meter and countdown timer) is transcribed server-side via `POST /api/sessions/{session_id}/recordings` or `POST /api/assessment/{id}/recordings` (Moonshine via personal-api, faster-whisper in-process fallback). If `MediaRecorder` is unavailable or fails, conversation recording falls back seamlessly to client-side Web Speech API. The `whisper_server` and `personal_api` modes also run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
 
@@ -118,7 +120,7 @@ Change mode in Settings → Preferences → STT Mode.
 │  React 19, Tailwind 4,      │
 │  shadcn-style UI, dark      │
 └──────────────┬──────────────┘
-               │ REST (cookie session) + WS (experimental)
+               │ REST + SSE streaming (cookie session) · WS (direct clients)
 ┌──────────────▼──────────────┐
 │  Backend (FastAPI, Python)  │  port 8230
 │  JWT auth, multi-user       │

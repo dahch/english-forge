@@ -171,6 +171,86 @@ async function request<T>(
   return res.json()
 }
 
+export type StreamEventHandler = (event: string, data: unknown) => void
+
+function parseSseFrame(frame: string): { event: string; data: string } | null {
+  let event = "message"
+  const dataLines: string[] = []
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue
+    if (line.startsWith("event:")) event = line.slice(6).trim()
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart())
+  }
+  if (dataLines.length === 0) return null
+  return { event, data: dataLines.join("\n") }
+}
+
+// Server-Sent Events over fetch: cookies, CSRF and silent refresh behave
+// exactly like the JSON request helper, but the body is consumed incrementally.
+async function streamRequest(
+  path: string,
+  body: unknown,
+  onEvent: StreamEventHandler,
+  allowRefresh = true,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  }
+  const csrf = readCookie(CSRF_COOKIE)
+  if (csrf) headers[CSRF_HEADER] = csrf
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    credentials: "include",
+  })
+
+  if (res.status === 401) {
+    if (allowRefresh && (await refreshSession())) {
+      return streamRequest(path, body, onEvent, false)
+    }
+    return handleUnauthorized()
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new ApiError(err.detail || "Request failed", res.status)
+  }
+  if (!res.body) {
+    throw new ApiError("This browser cannot stream responses.", 0)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+      let boundary = buffer.indexOf("\n\n")
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const parsed = parseSseFrame(frame)
+        if (parsed) {
+          let payload: unknown = parsed.data
+          try {
+            payload = JSON.parse(parsed.data)
+          } catch {
+            // Non-JSON payloads are passed through as text.
+          }
+          onEvent(parsed.event, payload)
+        }
+        boundary = buffer.indexOf("\n\n")
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
 // Fetch a non-JSON resource (e.g. an audio blob) with the same cookie auth,
 // API base prefix and silent refresh as `request`.
 export async function fetchBlob(path: string, allowRefresh = true): Promise<Blob> {
@@ -254,6 +334,10 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ text }),
       }),
+    // Incremental turn over SSE: assistant_started, assistant_delta,
+    // assistant_response and error events.
+    stream: (sessionId: string, text: string, onEvent: StreamEventHandler) =>
+      streamRequest(`/api/sessions/${sessionId}/messages/stream`, { text }, onEvent),
   },
 
   vocab: {

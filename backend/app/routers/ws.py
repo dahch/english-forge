@@ -13,6 +13,7 @@ from app.config import get_settings
 from app.database import async_session_factory
 from app.models.models import Message, Session, User
 from app.security import decode_access_token
+from app.services.conversation_stream import stream_turn
 from app.services.media_store import store_audio
 from app.services.session_metrics import finalize_session
 from app.llm.router import LLMRouter, parse_llm_json
@@ -121,8 +122,18 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                     if curr_session.ended_at is not None:
                         await websocket.send_json({"type": "error", "message": "Session has ended"})
                         break
-                    response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
-                await websocket.send_json({"type": "assistant_response", **response})
+
+                    async def emit(event: str, payload: dict) -> None:
+                        await websocket.send_json({"type": event, **payload})
+
+                    try:
+                        await stream_turn(turn_db, user, curr_session, text, emit)
+                    except Exception:
+                        logger.exception("Streaming turn failed for session %s", session_id)
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "The tutor could not answer. Please try again.",
+                        })
 
             elif msg_type == "user_audio":
                 import base64
@@ -172,9 +183,11 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                         if curr_session.ended_at is not None:
                             await websocket.send_json({"type": "error", "message": "Session has ended"})
                             break
-                        response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
-                        await turn_db.commit()
-                    await websocket.send_json({"type": "assistant_response", **response})
+
+                        async def emit(event: str, payload: dict) -> None:
+                            await websocket.send_json({"type": event, **payload})
+
+                        await stream_turn(turn_db, user, curr_session, text, emit)
                 except Exception as e:
                     logger.error(f"Turn processing error in session {session_id}: {e}")
                     await websocket.send_json({"type": "error", "message": "Failed to process turn. Please try again."})

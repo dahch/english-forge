@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +32,7 @@ from app.schemas.session import (
     MessageCreate,
     MessageResponse,
 )
+from app.services.conversation_stream import stream_turn
 from app.services.media_store import read_audio, store_audio
 from app.srs.sm2 import next_review_date
 from app.utils import bump_daily_words, get_tutor_profile_dict, resolve_tts_voice
@@ -296,6 +301,87 @@ async def _attach_audio(
     assistant_msg.audio_url = store_audio(audio_bytes)
     await db.commit()
     return None
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/{session_id}/messages/stream")
+async def stream_message(
+    session_id: str,
+    body: MessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a tutor turn over Server-Sent Events.
+
+    The browser cannot reach the backend WebSocket through the Next.js proxy
+    (Next does not upgrade rewritten sockets), but plain HTTP responses do
+    stream — so the web client uses SSE and the same `stream_turn` service is
+    reusable by the WebSocket transport.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    result = await db.execute(
+        select(Session).where(Session.id == session_id, Session.user_id == current_user.id)
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.ended_at:
+        raise HTTPException(status_code=400, detail="Session has ended")
+
+    async def event_stream():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def emit(event: str, data: dict) -> None:
+            await queue.put((event, data))
+
+        async def run_turn() -> None:
+            try:
+                await stream_turn(db, current_user, session, text, emit)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - delivered as an SSE error event
+                logger.exception("Streaming turn failed for session %s", session_id)
+                await queue.put(
+                    ("error", {"detail": "The tutor could not answer. Please try again."})
+                )
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run_turn())
+        try:
+            yield _sse_event("start", {"session_id": session.id})
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    # Comment frame: keeps proxies from closing an idle stream
+                    # while a reasoning model is still thinking.
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    break
+                event, data = item
+                yield _sse_event(event, data)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _message_response(msg: Message, corrections: list[CorrectionResponse]) -> MessageResponse:

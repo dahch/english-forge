@@ -252,3 +252,19 @@
 - **Consequences**:
   - Pros: Schema changes have a versioned path; invalid rows are rejected at the DB boundary; one corrupt row cannot break a listing; the database no longer grows by megabytes per conversation; weekly charts report real new words; placement levels stop being inflated by easy items.
   - Cons: Existing databases keep their old CHECK constraints until rebuilt (application-level validation still applies); the unique indexes require cleaning pre-existing duplicates (startup logs them); audio backups must include `MEDIA_DIR`; `dimension_bands` is an additional column and response field.
+
+
+## ADR-024: Incremental Tutor Replies over SSE, with a Shared Turn Service
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: Conversation turns waited for the complete JSON response (reply + corrections + vocabulary) and then for TTS, so the first visible feedback could be 10-40s away. A WebSocket transport existed but the web app never used it, and Next.js rewrites cannot proxy WebSocket upgrades ("WebSockets won't work" in the Next docs), so the browser could not reach the backend socket through the same origin that holds the session cookies.
+- **Decision**:
+  - The reply is streamed over **Server-Sent Events** (`POST /api/sessions/{id}/messages/stream`): normal HTTP through the existing proxy, cookie-authenticated, CSRF-protected, with keepalive comment frames while a reasoning model is thinking.
+  - The streamed call asks for **plain text** (`build_streaming_system_prompt`); streaming the structured JSON would show braces and field names to the student. A second non-streamed call (`build_correction_analysis_prompt`) extracts corrections and 1-3 vocabulary items, and runs even if the first call succeeded.
+  - All persistence, review and TTS live in `services/conversation_stream.py:stream_turn()`. The SSE endpoint and the WebSocket handler both call it, so the two transports cannot drift; the WebSocket now also emits `assistant_started`/`assistant_delta` for direct clients.
+  - If streaming fails before any token, the client retries transparently through the REST endpoint; if it fails after tokens were shown, it reloads the persisted history instead of trusting partial text.
+  - Settings gains provider editing and a connectivity probe (one tiny completion, 20s timeout, 8/min per user) so a bad key/URL/model is diagnosed before a conversation.
+  - Vocabulary and generated-lesson listings are paginated (`limit`/`offset`) with "Load more" in the UI; direct handler calls keep numeric defaults via `Annotated`.
+- **Consequences**:
+  - Pros: First token arrives as soon as the provider emits it; the web works through the existing same-origin cookie session without exposing tokens; one turn implementation serves SSE, WS and REST fallback; provider failures are testable; long lists stop loading everything at once.
+  - Cons: Each streamed turn uses two LLM calls (reply + review), so cost rises; the review/corrections arrive with the final event, after the text; SSE is one-way (no client-to-server mid-turn messages) — the WebSocket remains the path for that, currently for non-browser clients; transports must keep the event contract in sync (covered by tests).

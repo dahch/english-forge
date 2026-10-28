@@ -100,3 +100,10 @@ Resolve assessment analysis timeouts, eliminate TTS voice typing traps, provide 
      - If cancelled: revert level, no changes applied.
      - If confirmed: proceed with saving settings and regenerating the learning path.
 
+## Iteration 7 — Provider Tooling, Pagination and Streaming
+modules: backend/app/routers/settings.py, backend/app/services/provider_test.py, backend/app/services/conversation_stream.py, backend/app/routers/messages.py, backend/app/routers/ws.py, backend/app/llm/*, frontend/src/app/(main)/settings/page.tsx, frontend/src/app/(main)/conversation/page.tsx, frontend/src/app/(main)/vocab/page.tsx, frontend/src/app/(main)/lessons/page.tsx
+
+1. Settings: edit an existing provider (blank API key means "keep"), reject duplicate names, and add a connectivity probe for saved and unsaved configurations (20s timeout, 8/min per user, sanitized errors, never the key).
+2. Listings: paginate vocabulary and generated lessons with `limit`/`offset` and "Load more" in the UI.
+3. Conversation: stream the tutor reply over SSE (`POST /api/sessions/{id}/messages/stream`) with plain-text streaming plus a second non-streamed review call; share `stream_turn` with the WebSocket transport; fall back to REST before the first token and reload persisted history after a mid-stream failure.
+

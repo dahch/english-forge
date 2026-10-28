@@ -16,7 +16,15 @@ import { startRecording, RecorderError, type RecorderHandle } from "@/lib/record
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
 import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
 import { formatServerDateTime } from "@/lib/datetime"
-import type { Scenario, Message, Session, SessionSummary, CEFRLevel, User } from "@/lib/types"
+import type {
+  Scenario,
+  Message,
+  Session,
+  SessionSummary,
+  ConversationTurn,
+  CEFRLevel,
+  User,
+} from "@/lib/types"
 import { CEFR_LEVELS } from "@/lib/types"
 import {
   Mic,
@@ -354,13 +362,32 @@ export default function ConversationPage() {
     }
   }
 
+  const applyTurn = (
+    turn: ConversationTurn,
+    tempUserId: string,
+    tempAssistantId: string,
+    sessionId: string,
+  ) => {
+    sessionStorage.removeItem(draftKey(sessionId))
+    setMessages((prev) => {
+      const withoutTemps = prev.filter(
+        (m) => m.id !== tempUserId && m.id !== tempAssistantId,
+      )
+      return [...withoutTemps, turn.user_message, turn.assistant_message]
+    })
+    if (turn.assistant_message.has_audio) {
+      void playMessageAudio(turn.assistant_message.id, turn.assistant_message.id)
+    }
+  }
+
   const sendMessage = async () => {
     if (!session || !inputText.trim() || loading || isTranscribing) return
     const text = inputText.trim()
-    const tempId = makeTempMessageId()
+    const tempUserId = makeTempMessageId()
+    const tempAssistantId = `stream-${Date.now()}`
 
     const userMsg: Message = {
-      id: tempId,
+      id: tempUserId,
       session_id: session.id,
       role: "user",
       text,
@@ -368,25 +395,90 @@ export default function ConversationPage() {
       created_at: new Date().toISOString(),
       corrections: [],
     }
-    setMessages((prev) => [...prev, userMsg])
+    const draftMsg: Message = {
+      id: tempAssistantId,
+      session_id: session.id,
+      role: "assistant",
+      text: "",
+      audio_url: null,
+      has_audio: false,
+      created_at: new Date().toISOString(),
+      corrections: [],
+    }
+    setMessages((prev) => [...prev, userMsg, draftMsg])
     setInputText("")
     setLoading(true)
     setError("")
 
+    let sawDelta = false
+    let finalTurn: ConversationTurn | null = null
+
     try {
-      const turn = await api.messages.send(session.id, text)
-      sessionStorage.removeItem(draftKey(session.id))
-      setMessages((prev) => {
-        const withoutTemp = prev.filter((m) => m.id !== tempId)
-        return [...withoutTemp, turn.user_message, turn.assistant_message]
+      await api.messages.stream(session.id, text, (event, payload) => {
+        if (event === "assistant_started") {
+          sawDelta = true
+        } else if (event === "assistant_delta") {
+          sawDelta = true
+          const chunk = (payload as { text?: string }).text ?? ""
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempAssistantId ? { ...m, text: m.text + chunk } : m,
+            ),
+          )
+        } else if (event === "assistant_response") {
+          finalTurn = payload as ConversationTurn
+        } else if (event === "error") {
+          throw new Error(
+            (payload as { detail?: string }).detail ?? "Streaming failed",
+          )
+        }
       })
-      if (turn.assistant_message.has_audio) {
-        void playMessageAudio(turn.assistant_message.id, turn.assistant_message.id)
+
+      if (!finalTurn) {
+        throw new Error("The stream ended before the reply was saved.")
       }
+      applyTurn(finalTurn, tempUserId, tempAssistantId, session.id)
     } catch (err: unknown) {
-      setMessages((prev) => prev.filter((m) => m.id !== tempId))
-      setInputText(text)
       const message = err instanceof Error ? err.message : "Failed to send message"
+
+      if (!sawDelta) {
+        // Nothing reached the screen: retry through the non-streaming endpoint.
+        setMessages((prev) => prev.filter((m) => m.id !== tempAssistantId))
+        try {
+          const turn = await api.messages.send(session.id, text)
+          applyTurn(turn, tempUserId, tempAssistantId, session.id)
+          return
+        } catch {
+          setMessages((prev) =>
+            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          )
+          setInputText(text)
+        }
+      } else {
+        // The reply was partially shown. Reload what the server actually saved
+        // (it persists before finishing) instead of trusting the partial text.
+        try {
+          const fresh = await api.sessions.messages(session.id)
+          const persisted = fresh.some(
+            (m) => m.role === "user" && m.text === text,
+          )
+          if (persisted) {
+            setMessages(fresh)
+            sessionStorage.removeItem(draftKey(session.id))
+          } else {
+            setMessages((prev) =>
+              prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+            )
+            setInputText(text)
+          }
+        } catch {
+          setMessages((prev) =>
+            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          )
+          setInputText(text)
+        }
+      }
+
       setError(message)
       toast({
         title: "Message not sent",
@@ -991,7 +1083,9 @@ export default function ConversationPage() {
               <p>Start the conversation! Type or speak in English.</p>
             </div>
           )}
-          {messages.map((msg) => (
+          {messages
+            .filter((msg) => !(msg.role === "assistant" && msg.text === ""))
+            .map((msg) => (
             <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-[80%] space-y-1`}>
                 <div
@@ -1001,7 +1095,14 @@ export default function ConversationPage() {
                       : "bg-secondary"
                   }`}
                 >
-                  <p className="text-sm">{msg.text}</p>
+                  <p className="text-sm">
+                    {msg.text}
+                    {msg.id.startsWith("stream-") && loading && (
+                      <span className="ml-0.5 animate-pulse" aria-hidden="true">
+                        ▍
+                      </span>
+                    )}
+                  </p>
                 </div>
                 {msg.corrections.length > 0 && (
                   <div>
@@ -1055,7 +1156,8 @@ export default function ConversationPage() {
               </div>
             </div>
           ))}
-          {loading && (
+          {loading &&
+            !messages.some((m) => m.id.startsWith("stream-") && m.text.length > 0) && (
             <div className="flex justify-start">
               <div className="bg-secondary rounded-2xl px-4 py-2">
                 <div className="flex items-center gap-2">
