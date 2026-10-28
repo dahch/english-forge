@@ -158,7 +158,7 @@ pip install -r requirements-dev.txt   # requirements.txt + pytest
 python -m pytest
 ```
 
-Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, Lessons Hub (on-demand topical generation, CEFR level targeting, deterministic A1–C2 fallbacks, library completion tracking with atomic daily streak sync, and answer stripping), assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, and single-query session listing aggregation). The frontend has no test suite — only ESLint (`npm run lint`).
+Test config lives in `backend/pytest.ini` (`testpaths = tests`). The suite covers the LLM router (tolerant JSON parsing, empty-content/retry policies), lesson normalization, Lessons Hub (on-demand topical generation, CEFR level targeting, deterministic A1–C2 fallbacks, library completion tracking with atomic daily streak sync, and answer stripping), assessment logic and scoring, assessment phase-flow integration (in-memory SQLite), pronunciation scoring, personal-api payload contracts, learning paths (schemas, multi-type lazy content generation, lesson-linked conversation session launch, flexible MCQ/letter normalization, CEFR level advancement, and server-side grading), vocabulary SRS (SM-2 interval and ease-factor calculation, due cards retrieval with null/past review dates, atomic daily review incrementation, filter tabs, regex word-boundary fill-in-the-blank quiz generation, and single-query streak aggregation), and conversation sessions (proactive tutor greetings with TTS synthesis, custom scenario LLM greeting generation, session audio recording transcription via `/api/sessions/{id}/recordings`, payload validation and user isolation, single-query session listing aggregation, and week-1 hardening: startup secret/Fernet validation, login rate limiting and email normalisation, bcrypt length limits, assessment abandon/reclaim, idempotent session billing, per-turn lock ordering, TTS-failure resilience and export credential redaction). The frontend has no test suite — only ESLint (`npm run lint`).
 
 ### Maintenance
 
@@ -171,6 +171,30 @@ python scripts/clear_user_data.py --email user@example.com
 
 The script also resets the user's level to A1 and clears `assessment_completed`.
 
+### Backups & data export
+
+The SQLite file is the only copy of everything. Back it up before upgrading:
+
+```bash
+# Docker: consistent copy via SQLite's online backup API (safe while running)
+docker compose exec backend sh -c 'sqlite3 /app/data/englishforge.db ".backup /app/data/backup-$(date -u +%Y%m%dT%H%M%SZ).db"'
+
+# Local checkout
+./scripts/backup_sqlite.sh                      # → backups/englishforge-<timestamp>.db
+./scripts/backup_sqlite.sh backend/data/englishforge.db /var/backups/englishforge
+```
+
+`scripts/backup_sqlite.sh` keeps the last 14 files; copy the directory off-host for real disaster recovery (the volume alone is not a backup).
+
+Users can export everything they own as JSON from `GET /api/settings/export` (Settings → not yet surfaced in the UI). The export includes sessions, messages, vocabulary, assessments, lessons, paths and progress; provider API keys are **never** included (only `has_api_key`).
+
+### Session & security lifecycle
+
+- The backend refuses to start if `JWT_SECRET_KEY` is missing, shorter than 32 bytes, or still the placeholder from `.env.example`.
+- Failed logins are limited per email and per client IP (`AUTH_RATE_LIMIT_*`); registrations are limited per IP. Exceeding a budget returns `429` with `Retry-After`.
+- `DELETE /api/assessment/{id}` abandons an in-progress attempt (soft delete) so a stuck mic/phase can never lock the account out; attempts with no activity for `ASSESSMENT_INACTIVE_DAYS` are reclaimed automatically.
+- `PATCH /api/sessions/{id}/end` is idempotent: repeated calls never bill the same minutes twice, and time after the last message (plus `SESSION_END_GRACE_MINUTES`) is not counted, capped by `MAX_SESSION_MINUTES`.
+
 ### Database
 
 SQLite is the only supported database (`sqlite+aiosqlite:///./data/englishforge.db`, set in `backend/app/config.py`). In Docker the file lives on the `backend_data` volume (`/app/data`). WAL mode + busy_timeout are applied automatically at startup so concurrent reads/writes don't hit "database is locked". The backend refuses to start if `DATABASE_URL` points anywhere else — deployments upgrading from the removed PostgreSQL stack must migrate their data to SQLite manually.
@@ -179,7 +203,7 @@ Schema handling (no manual migrations needed for routine changes):
 
 - Tables are created with `Base.metadata.create_all()` on startup.
 - Columns added to existing tables after first deployment are applied by the startup sync in `backend/app/main.py` (`_COLUMNS_TO_ADD`), guarded by an inspector check so it's safe to run on every launch.
-- Partial unique indexes enforcing invariants (one in-progress assessment, one active learning path per user) are created at startup (`_INDEXES_TO_ADD`) — see ADR-007.
+- Partial unique indexes enforcing invariants (one in-progress assessment, one active learning path per user) are created at startup (`_INDEXES_TO_ADD`) — see ADR-007. Stored index definitions are compared with the expected SQL and replaced when the predicate changes (e.g. the assessment index gaining `abandoned_at IS NULL`).
 - Alembic remains available for full table migrations: `alembic revision --autogenerate -m "description"` and `alembic upgrade head` (run from `backend/`).
 
 ## Documentation
@@ -194,7 +218,14 @@ See `.env.example` for the full list. Required:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing (also derives the Fernet key for API-key encryption when `SETTINGS_ENCRYPTION_KEY` is empty) |
+| `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing. Startup **fails** if it is missing, weak, or still the placeholder. Generate with `openssl rand -hex 32`. |
+| `SETTINGS_ENCRYPTION_KEY` | Strongly recommended | Fernet key for provider API keys. Empty = derived from `JWT_SECRET_KEY`, so rotating the JWT secret makes stored keys unreadable. Validated at startup. |
+| `ALLOW_INSECURE_DEFAULTS` | No (default: `false`) | CI/experiments only: downgrades the weak-secret startup check to a warning. |
+| `AUTH_RATE_LIMIT_ATTEMPTS` / `AUTH_RATE_LIMIT_WINDOW_SECONDS` | No (default: 5 / 900) | Failed-login budget per email and per client IP. |
+| `REGISTER_RATE_LIMIT_ATTEMPTS` / `REGISTER_RATE_LIMIT_WINDOW_SECONDS` | No (default: 5 / 3600) | Registration budget per client IP (successes count). |
+| `TRUST_PROXY_HEADERS` | No (default: `true`) | Read the browser IP from `X-Forwarded-For` (set by the Next.js proxy). Disable only when the backend is exposed directly. |
+| `ASSESSMENT_INACTIVE_DAYS` | No (default: `7`) | In-progress assessments with no activity for this long are abandoned automatically. |
+| `MAX_SESSION_MINUTES` / `SESSION_END_GRACE_MINUTES` | No (default: 180 / 2) | Cap and grace period for a session's billable minutes. |
 | `DATABASE_URL` | No (default: `sqlite+aiosqlite:///./data/englishforge.db`) | SQLAlchemy async URL. Only SQLite is supported — override the file path if needed. |
 | `APP_PIN` | No | Optional PIN for extra protection when exposed outside the LAN. Currently only logged at startup when set — no middleware enforces it yet (TBD). |
 | `PERSONAL_API_URL` | No | TTS/STT via personal-api. For Coolify deployments, this may be set by the platform. |
@@ -203,7 +234,7 @@ See `.env.example` for the full list. Required:
 | `TTS_MODEL` | No (default: `english_2026-04_24l`) | Pocket TTS model id pinned on every `/v1/speak` call (personal-api defaults to a Spanish model). Unknown ids are ignored — hot-swap safe. |
 | `LLM_TIMEOUT_SECONDS` | No (default: `300`) | Per-request timeout for LLM providers. Reasoning models can take a while before producing output — keep generous, or unset to disable the timeout entirely. |
 
-LLM API keys are configured in the app's Settings UI (encrypted in the DB) — see the note under [LLM Providers](#llm-providers).
+LLM API keys are configured in the app's Settings UI (encrypted in the DB). The `*_API_KEY` environment variables act as a **server-wide fallback** for users with no provider configured — leave them empty on a shared instance so accounts cannot spend the owner's quota. See the note under [LLM Providers](#llm-providers).
 
 **Note on `.env` for Coolify**: The `docker-compose.yml` has `env_file:.env` marked as `required: false`. When deploying to Coolify, the `.env` file may be provided by the platform's environment configuration, so it's not strictly required in the compose file itself.
 

@@ -105,7 +105,15 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     audio_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # Python-side default with microsecond precision: SQLite's func.now() only
+    # has second precision, so two messages inserted in the same second would
+    # order randomly by UUID and scramble the conversation on reload.
+    # server_default keeps rows inserted outside the ORM valid.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
 
     session: Mapped["Session"] = relationship(back_populates="messages")
     corrections: Mapped[list["Correction"]] = relationship(back_populates="message", cascade="all, delete-orphan")
@@ -170,6 +178,11 @@ class Assessment(Base):
     # LLM-rubric conversation dims. JSON: {grammar, vocabulary, fluency,
     # listening, pronunciation} — missing keys mean "not assessed".
     dimension_scores: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set when the user explicitly abandons an in-progress assessment or it is
+    # reclaimed after inactivity. The partial unique index only covers
+    # `completed_at IS NULL AND abandoned_at IS NULL`, so abandoning frees the
+    # user to start a fresh attempt without fabricating a completed result.
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="assessments")
     # (created_at, id) — created_at uses func.now() (the transaction

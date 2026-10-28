@@ -284,6 +284,11 @@ export const api = {
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
     reanalyze: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/reanalyze`, { method: "POST" }),
+    // Soft-delete the in-progress attempt so a fresh one can be started. The
+    // backend frees the "one in-progress assessment" invariant here; without
+    // it a stuck attempt could never be retaken.
+    abandon: (id: string) =>
+      request<void>(`/api/assessment/${id}`, { method: "DELETE" }),
   },
 
   learningPath: {

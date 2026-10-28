@@ -113,6 +113,10 @@ export default function AssessmentPage() {
   const [completed, setCompleted] = useState(false)
   const [generatingPath, setGeneratingPath] = useState(false)
   const [reanalyzing, setReanalyzing] = useState(false)
+  // "Start over" confirmation: abandoning is destructive to the current
+  // attempt (not to previous results), so it always asks first.
+  const [showRestartConfirm, setShowRestartConfirm] = useState(false)
+  const [restarting, setRestarting] = useState(false)
 
   // Voice recording state (MediaRecorder → /recordings → editable transcript)
   const [isRecording, setIsRecording] = useState(false)
@@ -144,6 +148,15 @@ export default function AssessmentPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  useEffect(() => {
+    if (!showRestartConfirm) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !restarting) setShowRestartConfirm(false)
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [showRestartConfirm, restarting])
 
   useEffect(() => {
     async function resume() {
@@ -348,6 +361,26 @@ export default function AssessmentPage() {
     }
   }
 
+  // Abandon the in-progress attempt (backend frees the "one in-progress
+  // assessment" invariant) and immediately start a clean one.
+  const restartAssessment = async () => {
+    if (!assessment || restarting) return
+    setRestarting(true)
+    setError("")
+    try {
+      await api.assessment.abandon(assessment.id)
+      setShowRestartConfirm(false)
+      setAssessment(null)
+      setMessages([])
+      setCompleted(false)
+      await start()
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to restart the assessment")
+    } finally {
+      setRestarting(false)
+    }
+  }
+
   const assistantCount = messages.filter((m) => m.role === "assistant" && m.kind === "chat").length
   const lastAnsweredIndex = (() => {
     // Index of the last user message — listening item texts before it can be revealed.
@@ -499,19 +532,31 @@ export default function AssessmentPage() {
             <Badge variant="outline">{Math.min(assistantCount, MAX_ASSESSMENT_QUESTIONS)} / {MAX_ASSESSMENT_QUESTIONS}</Badge>
           )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => completeAssessment(assessment.id)}
-          disabled={loading}
-          title={
-            phase === "conversation" && assistantCount < MIN_ASSESSMENT_EXCHANGES
-              ? `At least ${MIN_ASSESSMENT_EXCHANGES} exchanges are recommended for a reliable level — finishing now lowers the confidence.`
-              : undefined
-          }
-        >
-          Finish & See Results
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowRestartConfirm(true)}
+            disabled={loading || restarting}
+            title="Discard this attempt and start again from the mic check"
+          >
+            <RefreshCw className="h-4 w-4 mr-1" />
+            Start over
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => completeAssessment(assessment.id)}
+            disabled={loading}
+            title={
+              phase === "conversation" && assistantCount < MIN_ASSESSMENT_EXCHANGES
+                ? `At least ${MIN_ASSESSMENT_EXCHANGES} exchanges are recommended for a reliable level — finishing now lowers the confidence.`
+                : undefined
+            }
+          >
+            Finish & See Results
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -624,6 +669,45 @@ export default function AssessmentPage() {
           </div>
         </div>
       </div>
+
+      {showRestartConfirm && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="restart-assessment-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          onClick={() => {
+            if (!restarting) setShowRestartConfirm(false)
+          }}
+        >
+          <Card className="w-full max-w-md" onClick={(event) => event.stopPropagation()}>
+            <CardHeader>
+              <CardTitle id="restart-assessment-title">Start this assessment over?</CardTitle>
+              <CardDescription>
+                The current attempt is discarded and a new one begins with the mic
+                check. Previous completed results are kept.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setShowRestartConfirm(false)}
+                disabled={restarting}
+              >
+                Cancel
+              </Button>
+              <Button onClick={restartAssessment} disabled={restarting}>
+                {restarting ? (
+                  <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                )}
+                {restarting ? "Restarting..." : "Discard & restart"}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   )
 }

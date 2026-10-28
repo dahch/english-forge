@@ -196,3 +196,28 @@
   - Pros: Eliminates proxy timeout failures on long LLM runs; robust recovery if network blips occur; consistent CEFR level across User, Settings, Dashboard, Conversation, and Learning Paths; safe confirmation gate before path regeneration.
   - Cons: Regenerating a learning path replaces the previous active path's pending lessons (completed lesson metrics are preserved in daily progress).
 
+## ADR-020: Fail-Fast Security Bootstrap and Auth Rate Limiting
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found that `config.py` shipped a publicly known default `JWT_SECRET_KEY` and nothing validated it at startup, so a deployment that forgot the variable ran with a signing key anyone could use to forge tokens for any user. The Fernet key for provider credentials was derived from that same secret, so rotating the JWT secret silently destroyed every stored API key. Login/register had no throttling, passwords had no upper bound (bcrypt silently truncates at 72 bytes), emails were stored case-sensitively, and `PATCH /auth/me` rotated the password with nothing but a bearer token.
+- **Decision**:
+  - `validate_security_settings()` runs first in the lifespan and aborts startup when `JWT_SECRET_KEY` is empty, shorter than 32 bytes, or a known placeholder; `ALLOW_INSECURE_DEFAULTS=true` downgrades this to a warning for CI only. A malformed `SETTINGS_ENCRYPTION_KEY` also aborts.
+  - `SETTINGS_ENCRYPTION_KEY` is the supported key; the derived-from-JWT fallback remains for existing databases but logs a warning, and startup reports provider keys that no longer decrypt.
+  - A dependency-free sliding-window limiter (`app/rate_limit.py`) caps failed logins per normalised email and per client IP, and registrations per IP, returning `429` + `Retry-After`. Success clears the email budget; the client IP is read from `X-Forwarded-For` only when `TRUST_PROXY_HEADERS` is enabled.
+  - Passwords are capped at 72 bytes at the schema *and* in `hash_password` (reject, never truncate), need 10 characters on register/change, and changing a password requires the current one.
+  - Emails are lower-cased/trimmed on register and login (queries compare `lower(email)`), so existing mixed-case rows keep working.
+- **Consequences**:
+  - Pros: A misconfigured deployment fails loudly instead of running with a forgeable secret; credential rotation no longer destroys provider keys silently; brute force and account farming are bounded; long passwords cannot collide via bcrypt truncation.
+  - Cons: Existing deployments must set `JWT_SECRET_KEY` before upgrading (intended); the limiter is per-process (documented single worker) and can lock an email out for the window; setting `TRUST_PROXY_HEADERS` incorrectly lets clients spoof their IP.
+
+## ADR-021: Transactional Turn Boundaries, Idempotent Session Billing and Assessment Recovery
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: Conversation turns inserted the user message and then held SQLite's single write transaction open across the LLM call (up to `LLM_TIMEOUT_SECONDS`) and the TTS polling loop (up to 30 s), so any concurrent write failed or waited. `PATCH /sessions/{id}/end` recomputed wall-clock duration on every call and billed it again, so retries/two tabs inflated `progress_daily.minutes_spoken`, and an idle tab counted as practice. The partial unique index allowing one in-progress assessment per user had no escape hatch: abandoning an attempt, a broken microphone or a corrupted phase locked the account out of ever starting a new assessment.
+- **Decision**:
+  - Turns are serialized per session (`app/concurrency.py`), read history, call the LLM **without** an open write transaction, then persist the whole turn (user message, reply, corrections, vocabulary) in one short transaction and commit. TTS runs afterwards and only updates `audio_url`; a TTS failure logs and returns `audio_url=null` instead of failing the turn. Session creation commits the greeting before synthesis.
+  - `services/session_metrics.py` owns finalisation: idempotent (already-ended sessions are not billed again), duration ends at the last message + `SESSION_END_GRACE_MINUTES`, and the result is capped at `MAX_SESSION_MINUTES`. REST and WebSocket paths share it.
+  - `DELETE /api/assessment/{id}` sets `abandoned_at` (soft delete, 409 if already completed); `/current`, `/message`, `/complete`, `/reanalyze`, recordings and audio ignore abandoned rows. `POST /start` reclaims attempts with no activity for `ASSESSMENT_INACTIVE_DAYS` before checking the in-progress slot. The partial index predicate gains `AND abandoned_at IS NULL`; startup compares stored index SQL with the expected definition and replaces outdated indexes idempotently.
+- **Consequences**:
+  - Pros: No long-held write locks; concurrent sessions stay responsive. Session minutes are billed once and reflect practice rather than idle time. An assessment can always be restarted, with the old conversation kept for export/diagnostics.
+  - Cons: The per-session lock and limiter are process-local (single-worker assumption); a TTS outage now yields silent text-only replies (the client already falls back to browser speech) — surfacing it in the UI is part of the next iteration.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,8 +17,9 @@ from app.schemas.session import (
     MessageResponse,
 )
 from app.integrations.tts_personal_api import TTSPersonalAPI
+from app.services.session_metrics import finalize_session
 from app.services.stt import transcribe_audio
-from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
+from app.utils import get_tutor_profile_dict, resolve_tts_voice
 from app.llm.router import LLMRouter
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -113,34 +113,33 @@ async def create_session(
     await db.flush()
     await db.refresh(session)
 
-    audio_url = None
+    initial_msg = Message(session_id=session.id, role="assistant", text=greeting)
+    db.add(initial_msg)
+    await db.flush()
+
+    # Commit session+greeting BEFORE the TTS round-trip. Synthesis polls
+    # personal-api for up to TTS_JOB_TIMEOUT_SECONDS; holding SQLite's single
+    # writer for that long would block every other write in the process.
+    await db.commit()
+
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
         audio_bytes = await tts.synthesize(greeting, voice=voice)
         if audio_bytes:
             import base64
-            audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
+            initial_msg.audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
+            await db.commit()
     except Exception as e:
         logger.warning(f"TTS synthesis failed for opening session greeting: {e}")
 
-    initial_msg = Message(
-        session_id=session.id,
-        role="assistant",
-        text=greeting,
-        audio_url=audio_url,
-    )
-    db.add(initial_msg)
-    await db.flush()
-
+    # Re-select so the response carries the stored audio_url (if any).
     msg_result = await db.execute(
         select(Message)
         .options(selectinload(Message.corrections))
         .where(Message.id == initial_msg.id)
     )
     greeting_msg = msg_result.scalar_one()
-
-    session.message_count = 1
 
     resp = SessionResponse(
         id=session.id,
@@ -241,7 +240,9 @@ async def end_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    session.ended_at = datetime.now(timezone.utc)
+    # End + bill in one idempotent step: a second PATCH (two tabs, retried
+    # request) must not add the same minutes to ProgressDaily again.
+    duration = await finalize_session(db, session)
 
     msg_result = await db.execute(
         select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
@@ -277,18 +278,6 @@ async def end_session(
         {"word": v.word, "definition": v.definition, "example": v.example}
         for v in new_vocab_items
     ]
-
-    # started_at comes from the DB as a naive datetime (TIMESTAMP WITHOUT TIME
-    # ZONE) while ended_at was assigned timezone-aware above — normalize both
-    # before subtracting or Python raises TypeError.
-    duration = 0.0
-    if session.ended_at and session.started_at:
-        ended = session.ended_at if session.ended_at.tzinfo else session.ended_at.replace(tzinfo=timezone.utc)
-        started = session.started_at if session.started_at.tzinfo else session.started_at.replace(tzinfo=timezone.utc)
-        duration = (ended - started).total_seconds() / 60.0
-
-    if duration > 0:
-        await bump_daily_minutes(db, current_user.id, int(round(duration)))
 
     await db.flush()
 

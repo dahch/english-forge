@@ -47,7 +47,9 @@ class SessionCreate(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    text: str = Field(..., min_length=1)
+    # Same cap as assessment turns: an unbounded message is a cost/DoS vector
+    # for the LLM and bloats the history sent on every subsequent turn.
+    text: str = Field(..., min_length=1, max_length=2000)
 
 
 class CorrectionResponse(BaseModel):

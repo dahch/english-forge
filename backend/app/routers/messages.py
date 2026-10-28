@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-import json
+import base64
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
+from app.concurrency import session_turn_lock
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.integrations.tts_personal_api import TTSPersonalAPI
+from app.llm.prompts import build_system_prompt
+from app.llm.router import LLMRouter, parse_llm_json
 from app.models.models import (
     Correction,
     Message,
@@ -18,8 +21,6 @@ from app.models.models import (
     Session,
     User,
     VocabItem,
-    ProviderConfig,
-    ProgressDaily,
 )
 from app.schemas.session import (
     ConversationTurnResponse,
@@ -27,15 +28,16 @@ from app.schemas.session import (
     MessageCreate,
     MessageResponse,
 )
-from app.llm.router import LLMRouter, parse_llm_json
-from app.llm.prompts import build_system_prompt
-from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.srs.sm2 import next_review_date
 from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
 
-logger = logging.getLogger(__name__)
+_FALLBACK_REPLY = (
+    "Sorry, I lost my train of thought for a second — tell me a bit more about that."
+)
 
 
 @router.post("/{session_id}/messages", response_model=ConversationTurnResponse)
@@ -45,6 +47,10 @@ async def send_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
     result = await db.execute(
         select(Session).where(Session.id == session_id, Session.user_id == current_user.id)
     )
@@ -54,20 +60,55 @@ async def send_message(
     if session.ended_at:
         raise HTTPException(status_code=400, detail="Session has ended")
 
-    user_msg = Message(session_id=session_id, role="user", text=body.text)
-    db.add(user_msg)
-    await db.flush()
+    # One turn per session at a time: the read-history → LLM → persist sequence
+    # must not interleave, or two tabs double-post and the replies land in an
+    # arbitrary order.
+    async with session_turn_lock(session_id):
+        parsed, provider_used, profile_dict = await _generate_reply(
+            db, current_user, session, text
+        )
+        reply = (parsed.get("reply") or "").strip() or _FALLBACK_REPLY
 
+        (
+            user_msg,
+            assistant_msg,
+            correction_responses,
+            new_vocab_list,
+        ) = await _persist_turn(db, current_user, session, text, reply, parsed, provider_used)
+
+        # Release the write transaction BEFORE talking to the TTS service: the
+        # previous code held SQLite's single writer for the whole synthesis
+        # (up to 30s of polling), blocking every other write in the process.
+        await db.commit()
+
+    audio_url = await _attach_audio(db, current_user, assistant_msg, profile_dict)
+
+    return ConversationTurnResponse(
+        user_message=_message_response(user_msg, correction_responses),
+        assistant_message=_message_response(
+            assistant_msg,
+            correction_responses,
+            audio_url=audio_url,
+        ),
+        corrections=correction_responses,
+        new_vocab=new_vocab_list,
+        audio_url=audio_url,
+    )
+
+
+async def _generate_reply(
+    db: AsyncSession,
+    current_user: User,
+    session: Session,
+    text: str,
+) -> tuple[dict, str, dict | None]:
+    """Build the prompt and call the LLM. Read-only: no writes before the call."""
     history_result = await db.execute(
-        select(Message)
-        .where(Message.session_id == session_id)
-        .order_by(Message.created_at)
+        select(Message).where(Message.session_id == session.id).order_by(Message.created_at)
     )
     history = history_result.scalars().all()
-
-    messages_for_llm = []
-    for m in history:
-        messages_for_llm.append({"role": m.role, "content": m.text})
+    messages_for_llm = [{"role": m.role, "content": m.text} for m in history]
+    messages_for_llm.append({"role": "user", "content": text})
 
     scenario_prompt = None
     scenario_key = None
@@ -81,7 +122,6 @@ async def send_message(
                 scenario_key = scenario.name.lower().replace(" ", "_").replace("-", "_")
 
     profile_dict = await get_tutor_profile_dict(db, current_user.id)
-
     system_prompt = build_system_prompt(
         scenario_key=scenario_key,
         scenario_custom_prompt=scenario_prompt,
@@ -100,117 +140,169 @@ async def send_message(
         )
         parsed = parse_llm_json(llm_result["content"])
         provider_used = llm_result.get("provider", "unknown")
-    except Exception as e:
-        logger.error(f"Conversation LLM call failed for session {session_id}: {e}")
+    except Exception as e:  # noqa: BLE001 - degraded reply beats a failed turn
+        logger.error("Conversation LLM call failed for session %s: %s", session.id, e)
 
-    reply = (parsed.get("reply") or "").strip()
-    if not reply:
-        # All providers failed (or returned unusable output) — keep the
-        # conversation alive with a recovery line instead of a 500; the
-        # student's next message retries the LLM with full history.
-        reply = "Sorry, I lost my train of thought for a second — tell me a bit more about that."
+    return parsed, provider_used, profile_dict
 
-    session.provider_used = provider_used
 
+async def _persist_turn(
+    db: AsyncSession,
+    current_user: User,
+    session: Session,
+    text: str,
+    reply: str,
+    parsed: dict,
+    provider_used: str,
+) -> tuple[Message, Message, list[CorrectionResponse], list[dict]]:
+    """Write the whole turn in one short transaction.
+
+    Timestamps are assigned in Python with microsecond precision so the user
+    message always sorts before the assistant reply, even within the same
+    second (SQLite's func.now() only has second resolution).
+    """
+    now = datetime.now(timezone.utc)
+    user_msg = Message(session_id=session.id, role="user", text=text, created_at=now)
+    # +1µs guarantees the reply sorts after the user message even when both are
+    # inserted in the same statement batch.
     assistant_msg = Message(
-        session_id=session_id,
+        session_id=session.id,
         role="assistant",
         text=reply,
+        created_at=now + timedelta(microseconds=1),
     )
-    db.add(assistant_msg)
+    session.provider_used = provider_used
+    db.add_all([user_msg, assistant_msg])
     await db.flush()
 
-    corrections_data = parsed.get("corrections", [])
-    correction_responses = []
-    for c in corrections_data:
-        corr = Correction(
+    corrections: list[Correction] = []
+    for raw in parsed.get("corrections") or []:
+        if not isinstance(raw, dict):
+            continue
+        correction = Correction(
             message_id=user_msg.id,
-            error_type=c.get("error_type", "unknown"),
-            original_fragment=c.get("original", ""),
-            correction=c.get("correction", ""),
-            explanation=c.get("explanation", ""),
+            error_type=str(raw.get("error_type") or "unknown")[:100],
+            original_fragment=str(raw.get("original") or ""),
+            correction=str(raw.get("correction") or ""),
+            explanation=str(raw.get("explanation") or ""),
         )
-        db.add(corr)
-        await db.flush()
-        correction_responses.append(CorrectionResponse(
-            id=corr.id,
-            error_type=corr.error_type,
-            original_fragment=corr.original_fragment,
-            correction=corr.correction,
-            explanation=corr.explanation,
-        ))
+        db.add(correction)
+        corrections.append(correction)
 
-    new_vocab_data = parsed.get("new_vocab", [])
-    new_vocab_list = []
-    for v in new_vocab_data:
-        existing = await db.execute(
-            select(VocabItem).where(
-                VocabItem.user_id == current_user.id,
-                VocabItem.word == v.get("word", ""),
+    new_vocab_list = await _persist_vocab(db, current_user.id, assistant_msg, parsed)
+
+    # Flush once so generated ids exist before building the response objects.
+    await db.flush()
+    correction_responses = [
+        CorrectionResponse(
+            id=c.id,
+            error_type=c.error_type,
+            original_fragment=c.original_fragment,
+            correction=c.correction,
+            explanation=c.explanation,
+        )
+        for c in corrections
+    ]
+    return user_msg, assistant_msg, correction_responses, new_vocab_list
+
+
+async def _persist_vocab(
+    db: AsyncSession,
+    user_id: str,
+    assistant_msg: Message,
+    parsed: dict,
+) -> list[dict]:
+    """Insert new vocabulary, deduplicated in one query instead of N."""
+    candidates: dict[str, dict] = {}
+    for raw in parsed.get("new_vocab") or []:
+        if not isinstance(raw, dict):
+            continue
+        word = str(raw.get("word") or "").strip()
+        if not word:
+            continue
+        key = word.lower()
+        if key not in candidates:
+            candidates[key] = {
+                "word": word,
+                "definition": str(raw.get("definition") or "").strip(),
+                "example": str(raw.get("example") or "").strip(),
+            }
+
+    if not candidates:
+        return []
+
+    # Only fetch the candidate words, not the whole collection: a mature
+    # vocabulary list is thousands of rows and this runs on every turn.
+    existing_result = await db.execute(
+        select(VocabItem.word).where(
+            VocabItem.user_id == user_id,
+            func.lower(VocabItem.word).in_(list(candidates)),
+        )
+    )
+    existing = {w.lower() for w in existing_result.scalars().all() if w}
+
+    created: list[dict] = []
+    for key, item in candidates.items():
+        if key in existing:
+            continue
+        db.add(
+            VocabItem(
+                user_id=user_id,
+                word=item["word"],
+                definition=item["definition"],
+                example=item["example"],
+                source_message_id=assistant_msg.id,
+                ease_factor=2.5,
+                interval_days=0,
+                next_review_at=next_review_date(0),
             )
         )
-        if existing.scalar_one_or_none():
-            continue
+        existing.add(key)
+        created.append(item)
+    return created
 
-        vocab = VocabItem(
-            user_id=current_user.id,
-            word=v.get("word", ""),
-            definition=v.get("definition", ""),
-            example=v.get("example", ""),
-            source_message_id=assistant_msg.id,
-            ease_factor=2.5,
-            interval_days=0,
-            next_review_at=next_review_date(0),
-        )
-        db.add(vocab)
-        new_vocab_list.append({
-            "word": vocab.word,
-            "definition": vocab.definition,
-            "example": vocab.example,
-        })
 
-    audio_url = None
+async def _attach_audio(
+    db: AsyncSession,
+    current_user: User,
+    assistant_msg: Message,
+    profile_dict: dict | None,
+) -> str | None:
+    """Synthesize the reply audio after the turn is committed.
+
+    A TTS outage must never fail or roll back the conversation, so failures are
+    logged and simply leave the client to fall back to browser speech.
+    """
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
-        audio_bytes = await tts.synthesize(reply, voice=voice)
-        if audio_bytes:
-            import base64
-            audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
-            assistant_msg.audio_url = audio_url
-    except Exception:
-        pass
+        audio_bytes = await tts.synthesize(assistant_msg.text, voice=voice)
+    except Exception as e:  # noqa: BLE001 - audio is best-effort
+        logger.warning("TTS synthesis failed for message %s: %s", assistant_msg.id, e)
+        return None
 
-    await db.flush()
-    await db.refresh(user_msg)
-    await db.refresh(assistant_msg)
+    if not audio_bytes:
+        return None
+    audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
+    assistant_msg.audio_url = audio_url
+    await db.commit()
+    return audio_url
 
-    user_message_response = MessageResponse(
-        id=user_msg.id,
-        session_id=user_msg.session_id,
-        role=user_msg.role,
-        text=user_msg.text,
-        audio_url=user_msg.audio_url,
-        created_at=user_msg.created_at,
-        corrections=correction_responses,
-    )
 
-    return ConversationTurnResponse(
-        user_message=user_message_response,
-        assistant_message=MessageResponse(
-            id=assistant_msg.id,
-            session_id=assistant_msg.session_id,
-            role=assistant_msg.role,
-            text=assistant_msg.text,
-            audio_url=assistant_msg.audio_url,
-            created_at=assistant_msg.created_at,
-            # Corrections belong to the user's message only — duplicating them
-            # here made the UI render the same correction twice.
-            corrections=[],
-        ),
-        corrections=correction_responses,
-        new_vocab=new_vocab_list,
-        audio_url=audio_url,
+def _message_response(
+    msg: Message,
+    corrections: list[CorrectionResponse],
+    *,
+    audio_url: str | None = None,
+) -> MessageResponse:
+    return MessageResponse(
+        id=msg.id,
+        session_id=msg.session_id,
+        role=msg.role,
+        text=msg.text,
+        audio_url=audio_url if audio_url is not None else msg.audio_url,
+        created_at=msg.created_at,
+        corrections=corrections,
     )
 
 
@@ -227,34 +319,37 @@ async def list_messages(
         raise HTTPException(status_code=404, detail="Session not found")
 
     msg_result = await db.execute(
-        select(Message)
-        .where(Message.session_id == session_id)
-        .order_by(Message.created_at)
+        select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
     )
     messages = msg_result.scalars().all()
 
-    responses = []
-    for m in messages:
-        corr_result = await db.execute(
-            select(Correction).where(Correction.message_id == m.id)
+    corr_result = await db.execute(
+        select(Correction)
+        .join(Message, Correction.message_id == Message.id)
+        .where(Message.session_id == session_id)
+        .order_by(Correction.id)
+    )
+    corrections_by_message: dict[str, list[CorrectionResponse]] = {}
+    for c in corr_result.scalars().all():
+        corrections_by_message.setdefault(c.message_id, []).append(
+            CorrectionResponse(
+                id=c.id,
+                error_type=c.error_type,
+                original_fragment=c.original_fragment,
+                correction=c.correction,
+                explanation=c.explanation,
+            )
         )
-        corrections = corr_result.scalars().all()
-        responses.append(MessageResponse(
+
+    return [
+        MessageResponse(
             id=m.id,
             session_id=m.session_id,
             role=m.role,
             text=m.text,
             audio_url=m.audio_url,
             created_at=m.created_at,
-            corrections=[
-                CorrectionResponse(
-                    id=c.id,
-                    error_type=c.error_type,
-                    original_fragment=c.original_fragment,
-                    correction=c.correction,
-                    explanation=c.explanation,
-                )
-                for c in corrections
-            ],
-        ))
-    return responses
+            corrections=corrections_by_message.get(m.id, []),
+        )
+        for m in messages
+    ]
