@@ -14,6 +14,17 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
     }
   }, [router])
 
+  // Signing out in one tab must not leave other tabs with a dead session.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === "ef_auth" && event.newValue === null) {
+        router.replace("/login")
+      }
+    }
+    window.addEventListener("storage", onStorage)
+    return () => window.removeEventListener("storage", onStorage)
+  }, [router])
+
   return (
     <div className="flex min-h-screen">
       <Sidebar />

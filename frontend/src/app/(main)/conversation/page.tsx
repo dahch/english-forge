@@ -41,6 +41,18 @@ function makeTempMessageId() {
   return `temp-${Date.now()}`
 }
 
+// Unsent text is the most painful thing to lose on a 401 redirect, a refresh or
+// a tab switch: keep a per-session draft in sessionStorage (scoped to the tab,
+// wiped when the browser closes).
+function draftKey(sessionId: string): string {
+  return `ef_draft_${sessionId}`
+}
+
+function readDraft(sessionId: string): string {
+  if (typeof window === "undefined") return ""
+  return sessionStorage.getItem(draftKey(sessionId)) ?? ""
+}
+
 function formatTimer(seconds: number): string {
   const mins = Math.floor(seconds / 60)
   const secs = Math.floor(seconds % 60)
@@ -210,6 +222,7 @@ export default function ConversationPage() {
       setCefrLevel((s.cefr_level as CEFRLevel) || "A1")
       setSummary(null)
       setActiveSessionId(s.id)
+      setInputText(readDraft(s.id))
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to load session")
       setActiveSessionId(null)
@@ -258,6 +271,17 @@ export default function ConversationPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
+  // Persist the draft shortly after typing stops (no state updates here).
+  useEffect(() => {
+    if (!session?.id) return
+    const key = draftKey(session.id)
+    const timer = setTimeout(() => {
+      if (inputText.trim()) sessionStorage.setItem(key, inputText)
+      else sessionStorage.removeItem(key)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [inputText, session?.id])
+
   const startSession = async () => {
     setError("")
     setLoading(true)
@@ -267,6 +291,7 @@ export default function ConversationPage() {
       setSession(s)
       setActiveSessionId(s.id)
       setSummary(null)
+      setInputText(readDraft(s.id))
       setRecentSessions((prev) => [s, ...prev])
 
       // Immediately populate initial proactive greeting if present in response [REV-009],
@@ -335,6 +360,7 @@ export default function ConversationPage() {
 
     try {
       const turn = await api.messages.send(session.id, text)
+      sessionStorage.removeItem(draftKey(session.id))
       setMessages((prev) => {
         const withoutTemp = prev.filter((m) => m.id !== tempId)
         return [...withoutTemp, turn.user_message, turn.assistant_message]
@@ -527,6 +553,7 @@ export default function ConversationPage() {
     stopAudio()
     setSession(null)
     setMessages([])
+    setInputText("")
     setSummary(null)
     setActiveSessionId(null)
     setShowBriefing(false)

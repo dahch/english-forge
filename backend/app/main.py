@@ -111,6 +111,9 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     "users": [
         ("current_level", "VARCHAR(2) NOT NULL DEFAULT 'A1'"),
         ("assessment_completed", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        # Access tokens embed this value; bumping it revokes every session
+        # without a denylist (ADR-022).
+        ("token_version", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "progress_daily": [
         ("lessons_completed", "INTEGER NOT NULL DEFAULT 0"),

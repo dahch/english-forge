@@ -7,7 +7,9 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth_cookies import ACCESS_COOKIE_NAME
 from app.concurrency import session_turn_lock
+from app.config import get_settings
 from app.database import async_session_factory
 from app.models.models import Message, Session, User
 from app.security import decode_access_token
@@ -34,11 +36,40 @@ async def _get_user_from_token(token: str) -> User | None:
         return None
     async with async_session_factory() as db:
         result = await db.execute(select(User).where(User.id == user_id))
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        if user is None:
+            return None
+        # Same revocation rule as the HTTP dependency.
+        if int(payload.get("ver", 0)) != int(user.token_version or 0):
+            return None
+        return user
+
+
+MAX_WS_MESSAGE_BYTES = 1_000_000
+
+
+def _origin_allowed(websocket: WebSocket) -> bool:
+    """Reject cross-site socket upgrades when the browser sends an Origin.
+
+    WebSockets are not covered by CORS: without this, any site could open a
+    socket with the user's cookies. Non-browser clients (no Origin) still need
+    a valid token, so they are allowed.
+    """
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    return origin in get_settings().cors_origins_list
 
 
 @router.websocket("/api/ws/session/{session_id}")
 async def websocket_session(websocket: WebSocket, session_id: str, token: str = ""):
+    if not _origin_allowed(websocket):
+        await websocket.close(code=4403, reason="Origin not allowed")
+        return
+
+    # Cookie first (the browser never exposes an HttpOnly token to JS); the
+    # query param stays for non-browser clients and older integrations.
+    token = token or websocket.cookies.get(ACCESS_COOKIE_NAME) or ""
     user = await _get_user_from_token(token)
     if not user:
         await websocket.close(code=4001, reason="Unauthorized")
@@ -58,6 +89,9 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_json({"type": "error", "message": "Message too large"})
+                continue
             try:
                 data = json.loads(raw)
                 if not isinstance(data, dict):

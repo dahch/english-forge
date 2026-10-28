@@ -22,7 +22,20 @@ class Settings(BaseSettings):
     # the app run with a publicly known signing key.
     JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
-    TOKEN_EXPIRE_MINUTES: int = 1440
+    # Access tokens are short-lived and renewed transparently by the refresh
+    # token cookie (see ADR-022). A long-lived access token in localStorage was
+    # the previous design.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    # Cap concurrent devices; the oldest refresh tokens are revoked beyond this.
+    MAX_REFRESH_TOKENS_PER_USER: int = 10
+
+    # --- Session cookies ----------------------------------------------------
+    # Set COOKIE_SECURE=true on any HTTPS deployment. It defaults to false so
+    # plain-HTTP local development still receives the cookie.
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: str = "lax"
+    COOKIE_DOMAIN: str = ""
 
     # Escape hatch for CI/local experiments only. Never set this in production:
     # it downgrades the startup validation to a warning.

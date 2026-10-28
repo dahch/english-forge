@@ -221,3 +221,18 @@
 - **Consequences**:
   - Pros: No long-held write locks; concurrent sessions stay responsive. Session minutes are billed once and reflect practice rather than idle time. An assessment can always be restarted, with the old conversation kept for export/diagnostics.
   - Cons: The per-session lock and limiter are process-local (single-worker assumption); a TTS outage now yields silent text-only replies (the client already falls back to browser speech) — surfacing it in the UI is part of the next iteration.
+
+
+## ADR-022: HttpOnly Cookie Sessions with Rotating Refresh Tokens
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found the 24-hour JWT stored in `localStorage` and sent as a bearer header: readable by any XSS, impossible to revoke, and expiring with a hard redirect that discarded the user's unsent text. Password changes did not invalidate existing tokens and there was no way to sign out other devices.
+- **Decision**:
+  - Browser sessions move to cookies: `ef_access` (HttpOnly, 15 min, path `/`) and `ef_refresh` (HttpOnly, 30 days, path `/api/auth`). A readable `ef_csrf` cookie is echoed in `X-CSRF-Token` for unsafe methods (double-submit); Bearer auth remains for scripts and is exempt from CSRF.
+  - Refresh tokens are random 48-byte values stored only as SHA-256 in `refresh_tokens`, capped per user, pruned on issue, and rotated on every refresh. Presenting a revoked token is treated as theft: every session for the user is revoked and `users.token_version` is bumped, which invalidates outstanding access tokens without a denylist.
+  - `PATCH /auth/me` with a new password bumps `token_version`, revokes other devices, and re-issues cookies to the current one. `POST /auth/logout` revokes the presented refresh token and clears the cookies.
+  - The API client performs a single-flight silent refresh on 401 and retries the request once; if refresh fails it preserves a `?next=` return path instead of dumping the user on a blank login. The frontend keeps only a non-sensitive `ef_auth` flag so the shell can redirect before the first request.
+  - Unsent conversation text is stored per session in `sessionStorage` and restored on reload/session switch; signing out in one tab syncs to the others via the `storage` event.
+- **Consequences**:
+  - Pros: XSS can no longer exfiltrate a long-lived token; sessions are revocable; expiry is transparent; a stolen refresh token is usable at most once and its reuse kills all sessions; user work survives expiry/refresh.
+  - Cons: `COOKIE_SECURE` must be enabled on HTTPS deployments; cookie auth needs the CSRF header (clients bypassing the official API client must send it, or use Bearer); rotation requires the client's single-flight refresh to avoid tripping reuse detection with parallel 401s; refresh tokens add a table and a pruning step.

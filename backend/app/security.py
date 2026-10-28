@@ -87,7 +87,10 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     to_encode.update(
         {
             "iat": now,
-            "exp": now + (expires_delta or timedelta(minutes=settings.TOKEN_EXPIRE_MINUTES)),
+            "exp": now + (
+                expires_delta
+                or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+            ),
             "jti": str(uuid.uuid4()),
             "type": "access",
         }

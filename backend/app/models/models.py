@@ -35,6 +35,10 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="A1")
     assessment_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Bumped on password change / "sign out everywhere". Access tokens carry the
+    # value they were issued with, so a stale one stops matching immediately
+    # without a per-token denylist.
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -43,11 +47,36 @@ class User(Base):
     progress_entries: Mapped[list["ProgressDaily"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     settings: Mapped[list["Setting"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     provider_configs: Mapped[list["ProviderConfig"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tutor_profile: Mapped["TutorProfile | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
     assessments: Mapped[list["Assessment"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     generated_lessons: Mapped[list["GeneratedLesson"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     library_completions: Mapped[list["LibraryLessonCompletion"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class RefreshToken(Base):
+    """Rotating refresh token, stored hashed.
+
+    Only the SHA-256 of the raw token is persisted, so a database leak does not
+    hand out usable sessions. Rotation revokes the presented token and issues a
+    replacement; presenting an already-revoked token is treated as theft and
+    revokes every token for that user (ADR-022).
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    replaced_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="refresh_tokens")
 
 
 class TutorProfile(Base):

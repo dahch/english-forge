@@ -15,7 +15,7 @@ Practice English conversation with an AI tutor via voice or text. Get real-time 
 - **Lessons Hub** — Interactive grammar and vocabulary hub featuring three integrated modes: curated static library with completion tracking and daily streak sync; on-demand topical and CEFR-targeted (A1–C2) AI lesson generation (without requiring prior conversation error history) with deterministic seed fallbacks; and Learning Path curriculum progression. All exercises enforce server-side evaluation with upfront answer and explanation stripping to prevent answer pre-disclosure.
 - **Dashboard** — Progress stats, weekly charts, CEFR level estimation
 - **PWA** — Installable on mobile and desktop
-- **Multi-user** — JWT auth, per-user settings, encrypted API keys
+- **Multi-user** — cookie sessions (HttpOnly access + rotating refresh, CSRF-protected), per-user settings, encrypted API keys
 - **Honest UI feedback** — accessible toasts, per-operation stage and elapsed timers (LLM turns, assessment analysis, lesson/path generation), a server-driven assessment stepper, offline banner, route-level error boundaries, retry instead of "wrong answer" on network failures, and explicit `Base lesson` / `Base curriculum` labels when a model fallback is shown
 
 ## Quick Start
@@ -106,6 +106,8 @@ If you have Pocket TTS running via `personal-api` on the `coolify` Docker networ
 
 Change mode in Settings → Preferences → STT Mode.
 
+**WebSocket API status:** `/api/ws/session/{id}` exists for non-browser clients and future token streaming, but the web UI uses the REST endpoints only. It authenticates with the session cookie (or `?token=` for scripts), rejects cross-site `Origin`s, caps frames at 1 MB, and honours revoked sessions (`token_version`).
+
 **Note:** Both conversation and assessment pages use universal voice recording: audio captured via `MediaRecorder` (up to 10MB, with live audio level meter and countdown timer) is transcribed server-side via `POST /api/sessions/{session_id}/recordings` or `POST /api/assessment/{id}/recordings` (Moonshine via personal-api, faster-whisper in-process fallback). If `MediaRecorder` is unavailable or fails, conversation recording falls back seamlessly to client-side Web Speech API. The `whisper_server` and `personal_api` modes also run server-side in the backend's WebSocket flow. `whisper_wasm` is selectable in Settings but has no client implementation yet. Every personal-api transcription call sends `language=en` (`STT_LANGUAGE`), which unlocks real Moonshine word timestamps for English — the input to the pronunciation fluency metrics.
 
 ## Architecture
@@ -116,7 +118,7 @@ Change mode in Settings → Preferences → STT Mode.
 │  React 19, Tailwind 4,      │
 │  shadcn-style UI, dark      │
 └──────────────┬──────────────┘
-               │ REST + WebSocket (JWT)
+               │ REST (cookie session) + WS (experimental)
 ┌──────────────▼──────────────┐
 │  Backend (FastAPI, Python)  │  port 8230
 │  JWT auth, multi-user       │
@@ -192,6 +194,8 @@ Users can export everything they own as JSON from `GET /api/settings/export` (Se
 ### Session & security lifecycle
 
 - The backend refuses to start if `JWT_SECRET_KEY` is missing, shorter than 32 bytes, or still the placeholder from `.env.example`.
+- Sessions are HttpOnly cookies: a 15-minute access cookie plus a rotating refresh cookie scoped to `/api/auth`. The browser never stores a bearer token; a reused refresh token is treated as theft and revokes every session. Unsafe requests must echo the `ef_csrf` cookie in `X-CSRF-Token` (the API client does this automatically); Bearer auth stays available for scripts.
+- The web client refreshes transparently on a 401 and retries once; if the session is gone it returns to login with `?next=` pointing at the page (and unsent chat text is restored from a per-session draft). Signing out in one tab signs out the others.
 - Failed logins are limited per email and per client IP (`AUTH_RATE_LIMIT_*`); registrations are limited per IP. Exceeding a budget returns `429` with `Retry-After`.
 - `DELETE /api/assessment/{id}` abandons an in-progress attempt (soft delete) so a stuck mic/phase can never lock the account out; attempts with no activity for `ASSESSMENT_INACTIVE_DAYS` are reclaimed automatically.
 - `PATCH /api/sessions/{id}/end` is idempotent: repeated calls never bill the same minutes twice, and time after the last message (plus `SESSION_END_GRACE_MINUTES`) is not counted, capped by `MAX_SESSION_MINUTES`.
@@ -220,6 +224,10 @@ See `.env.example` for the full list. Required:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `JWT_SECRET_KEY` | **Yes** | Secret for JWT signing. Startup **fails** if it is missing, weak, or still the placeholder. Generate with `openssl rand -hex 32`. |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | No (default: 15 / 30) | Access-token lifetime and how long a device stays signed in. Refresh tokens rotate on every use. |
+| `COOKIE_SECURE` | No (default: `false`) | Set to `true` on HTTPS deployments so session cookies carry `Secure`. |
+| `COOKIE_SAMESITE` / `COOKIE_DOMAIN` | No (default: `lax` / host-only) | Session cookie attributes for reverse-proxy setups. |
+| `MAX_REFRESH_TOKENS_PER_USER` | No (default: `10`) | Concurrent devices; older refresh tokens are revoked beyond this. |
 | `SETTINGS_ENCRYPTION_KEY` | Strongly recommended | Fernet key for provider API keys. Empty = derived from `JWT_SECRET_KEY`, so rotating the JWT secret makes stored keys unreadable. Validated at startup. |
 | `ALLOW_INSECURE_DEFAULTS` | No (default: `false`) | CI/experiments only: downgrades the weak-secret startup check to a warning. |
 | `AUTH_RATE_LIMIT_ATTEMPTS` / `AUTH_RATE_LIMIT_WINDOW_SECONDS` | No (default: 5 / 900) | Failed-login budget per email and per client IP. |

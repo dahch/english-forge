@@ -177,11 +177,11 @@ async def test_failed_logins_are_rate_limited(db: AsyncSession, user: User):
 
     for _ in range(5):
         with pytest.raises(HTTPException) as exc:
-            await login(body=body, request=_request(), db=db)
+            await login(body=body, request=_request(), response=Response(), db=db)
         assert exc.value.status_code == 401
 
     with pytest.raises(HTTPException) as exc:
-        await login(body=body, request=_request(), db=db)
+        await login(body=body, request=_request(), response=Response(), db=db)
     assert exc.value.status_code == 429
     assert exc.value.headers and "Retry-After" in exc.value.headers
 
@@ -191,11 +191,12 @@ async def test_successful_login_clears_email_budget(db: AsyncSession, user: User
     bad = UserLogin(email=user.email, password="wrong-password")
     for _ in range(4):
         with pytest.raises(HTTPException):
-            await login(body=bad, request=_request(), db=db)
+            await login(body=bad, request=_request(), response=Response(), db=db)
 
     ok = await login(
         body=UserLogin(email=user.email, password="correct horse battery"),
         request=_request(),
+        response=Response(),
         db=db,
     )
     assert ok.access_token
@@ -203,7 +204,7 @@ async def test_successful_login_clears_email_budget(db: AsyncSession, user: User
     # Budget was reset: four more failures are still 401, not 429.
     for _ in range(4):
         with pytest.raises(HTTPException) as exc:
-            await login(body=bad, request=_request(), db=db)
+            await login(body=bad, request=_request(), response=Response(), db=db)
         assert exc.value.status_code == 401
 
 
