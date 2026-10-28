@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
 import type { VocabItem, QuizQuestion, QuizResult } from "@/lib/types"
 import {
   BookOpen,
@@ -40,6 +41,7 @@ interface ReviewStats {
 function VocabContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const { toast } = useToast()
 
   // Vocab list state
   const [allVocab, setAllVocab] = useState<VocabItem[]>([])
@@ -51,6 +53,8 @@ function VocabContent() {
   const [newIpa, setNewIpa] = useState("")
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
+  // Deleting a word also deletes its SRS history, so it asks first.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
   // View mode
   const [viewMode, setViewMode] = useState<ViewMode>("list")
@@ -407,9 +411,16 @@ function VocabContent() {
       setNewExample("")
       setNewIpa("")
       setShowAdd(false)
+      toast({
+        title: "Word added",
+        description: `"${newWord.trim()}" is scheduled for review today.`,
+        variant: "success",
+      })
       loadVocab()
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to add word")
+      const message = err instanceof Error ? err.message : "Failed to add word"
+      setError(message)
+      toast({ title: "Could not add the word", description: message, variant: "error" })
     }
   }
 
@@ -418,9 +429,13 @@ function VocabContent() {
     setError("")
     try {
       await api.vocab.delete(id)
+      setConfirmDeleteId(null)
+      toast({ title: "Word deleted", variant: "success" })
       loadVocab()
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to delete word")
+      const message = err instanceof Error ? err.message : "Failed to delete word"
+      setError(message)
+      toast({ title: "Could not delete the word", description: message, variant: "error" })
     }
   }
 
@@ -1179,16 +1194,35 @@ function VocabContent() {
                   )}
                 </div>
 
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="text-muted-foreground hover:text-destructive shrink-0"
-                  onClick={() => deleteVocab(item.id)}
-                  title="Delete word"
-                  aria-label={`Delete ${item.word}`}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
+                {confirmDeleteId === item.id ? (
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      onClick={() => deleteVocab(item.id)}
+                    >
+                      Delete
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setConfirmDeleteId(null)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                ) : (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="text-muted-foreground hover:text-destructive shrink-0"
+                    onClick={() => setConfirmDeleteId(item.id)}
+                    title="Delete word"
+                    aria-label={`Delete ${item.word}`}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                )}
               </CardContent>
             </Card>
           ))}

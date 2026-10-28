@@ -11,8 +11,10 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, setActiveSessionId, getActiveSessionId } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
 import { startRecording, RecorderError, type RecorderHandle } from "@/lib/recorder"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
+import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
 import type { Scenario, Message, Session, SessionSummary, CEFRLevel, User } from "@/lib/types"
 import { CEFR_LEVELS } from "@/lib/types"
 import {
@@ -48,6 +50,7 @@ function formatTimer(seconds: number): string {
 const MAX_RECORD_SECONDS = 30
 
 export default function ConversationPage() {
+  const { toast } = useToast()
   const [user, setUser] = useState<User | null>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [selectedScenario, setSelectedScenario] = useState<string>("")
@@ -78,6 +81,10 @@ export default function ConversationPage() {
   const [recordSeconds, setRecordSeconds] = useState(0)
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isListeningFallback, setIsListeningFallback] = useState(false)
+
+  // Elapsed time for the tutor's turn: the HTTP call can take 60s+ with
+  // reasoning models, and bare dots look frozen.
+  const thinkingSeconds = useElapsed(loading)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sttRef = useRef<WebSpeechSTT | null>(null)
@@ -338,7 +345,13 @@ export default function ConversationPage() {
     } catch (err: unknown) {
       setMessages((prev) => prev.filter((m) => m.id !== tempId))
       setInputText(text)
-      setError(err instanceof Error ? err.message : "Failed to send message")
+      const message = err instanceof Error ? err.message : "Failed to send message"
+      setError(message)
+      toast({
+        title: "Message not sent",
+        description: `${message} Your text was restored so you can retry.`,
+        variant: "error",
+      })
     } finally {
       setLoading(false)
     }
@@ -915,8 +928,21 @@ export default function ConversationPage() {
         </div>
       )}
 
+      {session.ended_at && (
+        <div className="mx-4 mt-2 flex flex-wrap items-center gap-2 rounded-md border bg-secondary/60 p-3 text-sm">
+          <Info className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="flex-1">
+            This session has ended. Corrections and vocabulary are saved — start a new
+            session to keep practicing.
+          </span>
+          <Button variant="outline" size="sm" onClick={newSession}>
+            New session
+          </Button>
+        </div>
+      )}
+
       <ScrollArea className="flex-1 p-4">
-        <div className="max-w-2xl mx-auto space-y-4">
+        <div className="max-w-2xl mx-auto space-y-4" role="log" aria-live="polite" aria-relevant="additions">
           {messages.length === 0 && (
             <div className="text-center py-12 text-muted-foreground">
               <Mic className="h-12 w-12 mx-auto mb-4 opacity-50" />
@@ -990,11 +1016,24 @@ export default function ConversationPage() {
           {loading && (
             <div className="flex justify-start">
               <div className="bg-secondary rounded-2xl px-4 py-2">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                <div className="flex items-center gap-2">
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {isTranscribing
+                      ? "Transcribing your voice…"
+                      : `Tutor is thinking… ${formatElapsed(thinkingSeconds)}`}
+                  </span>
                 </div>
+                {!isTranscribing && thinkingSeconds >= 20 && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Still working — reasoning models can take up to a minute. Your
+                    message is safe.
+                  </p>
+                )}
               </div>
             </div>
           )}

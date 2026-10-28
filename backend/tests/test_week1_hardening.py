@@ -235,7 +235,7 @@ async def test_abandon_frees_the_in_progress_slot(db: AsyncSession, user: User):
     second = await start_assessment(response=Response(), current_user=user, db=db)
     await db.commit()
     assert second.id != first.id
-    assert second.abandoned_at is None
+    assert second.phase == "mic_check"
 
 
 @pytest.mark.asyncio

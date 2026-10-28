@@ -533,7 +533,9 @@ async def generate_lesson(
     normalized = normalize_llm_lesson(lesson_data) if lesson_data else None
 
     # Fallback to robust deterministic template if LLM failed, timed out, or returned no exercises
+    used_fallback = False
     if not normalized or not normalized.get("exercises"):
+        used_fallback = True
         fallback = FALLBACK_LESSONS_BY_LEVEL.get(target_level, FALLBACK_LESSONS_BY_LEVEL["B1"])
         normalized = {
             "title": f"{custom_topic.title()} ({target_level})" if custom_topic else fallback["title"],
@@ -561,4 +563,7 @@ async def generate_lesson(
 
     result = _serialize_generated_lesson(stored)
     result["generated"] = True
+    # Honesty signal for the client: "fallback" means the model failed or timed
+    # out and this is the deterministic template, not personalized content.
+    result["source"] = "fallback" if used_fallback else "llm"
     return result

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
 import type { ProviderConfig, TutorProfile, User } from "@/lib/types"
 import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
 
@@ -25,6 +26,7 @@ const PERSONALITY_PRESETS = [
 ]
 
 export default function SettingsPage() {
+  const { toast } = useToast()
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [currentUser, setCurrentUser] = useState<User | null>(null)
@@ -49,6 +51,11 @@ export default function SettingsPage() {
   const [showAddProvider, setShowAddProvider] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [clearing, setClearing] = useState(false)
+  // Load failures used to be console.error only: the form silently rendered
+  // defaults and users could save over settings they never saw.
+  const [loadError, setLoadError] = useState("")
+  const [loadingSettings, setLoadingSettings] = useState(true)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [newProvider, setNewProvider] = useState({
     provider_name: "",
     api_key: "",
@@ -59,61 +66,106 @@ export default function SettingsPage() {
     task_routing: "conversation,correction,lesson",
   })
 
-  useEffect(() => {
-    api.settings.getProviders().then(setProviders).catch(console.error)
-    api.settings.get().then((data) => {
+  const loadSettings = useCallback(async () => {
+    // Deliberately no setState before the first await: the effect runs this on
+    // mount and must not cascade renders synchronously (react-hooks lint), and
+    // `loadingSettings` already starts true.
+    const [providersRes, settingsRes, meRes, pathRes, tutorRes] = await Promise.allSettled([
+      api.settings.getProviders(),
+      api.settings.get(),
+      api.auth.me(),
+      api.learningPath.current(),
+      api.tutorProfile.get(),
+    ])
+
+    if (providersRes.status === "fulfilled") setProviders(providersRes.value)
+    if (settingsRes.status === "fulfilled") {
       const map: Record<string, string> = {}
-      data.forEach((s) => { map[s.key] = s.value })
+      settingsRes.value.forEach((s) => {
+        map[s.key] = s.value
+      })
       setSettings(map)
-      if (map.default_cefr) {
-        setSavedCefr(map.default_cefr)
-      }
-    }).catch(console.error)
-    api.auth.me().then((u) => {
-      setCurrentUser(u)
-      setSavedCefr((prev) => (prev && prev !== "A1" ? prev : u.current_level || "A1"))
-    }).catch(console.error)
-    api.learningPath.current().then((p) => {
-      if (p && p.id && p.is_active) {
-        setHasActivePath(true)
-      }
-    }).catch(() => {
-      setHasActivePath(false)
-    })
-    api.tutorProfile.get().then((p) => {
-      setTutorProfile(p)
+      if (map.default_cefr) setSavedCefr(map.default_cefr)
+    }
+    if (meRes.status === "fulfilled") {
+      const loadedUser = meRes.value
+      setCurrentUser(loadedUser)
+      setSavedCefr((prev) => (prev && prev !== "A1" ? prev : loadedUser.current_level || "A1"))
+    }
+    setHasActivePath(pathRes.status === "fulfilled" && Boolean(pathRes.value?.is_active))
+    if (tutorRes.status === "fulfilled") {
+      const profile = tutorRes.value
+      setTutorProfile(profile)
       setTutorForm({
-        name: p.name || "",
-        age: p.age,
-        gender: p.gender || "",
-        personality: p.personality || "",
-        voice: p.voice || "",
+        name: profile.name || "",
+        age: profile.age,
+        gender: profile.gender || "",
+        personality: profile.personality || "",
+        voice: profile.voice || "",
       })
       setCustomPersonality(
-        !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
+        !!profile.personality && !PERSONALITY_PRESETS.includes(profile.personality.toLowerCase()),
       )
-    }).catch(console.error)
+    }
+
+    const failed = [providersRes, settingsRes, meRes, tutorRes].find(
+      (result) => result.status === "rejected",
+    )
+    if (failed && failed.status === "rejected") {
+      setLoadError(
+        failed.reason instanceof Error
+          ? failed.reason.message
+          : "Some settings could not be loaded. Retry before changing anything.",
+      )
+    }
+    setLoadingSettings(false)
   }, [])
 
+  useEffect(() => {
+    // Initial fetch on mount. The lint rule matches setState anywhere in the
+    // callee, but every state update here happens after the awaited
+    // Promise.allSettled — nothing is set synchronously during the effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadSettings()
+  }, [loadSettings])
+
   const addProvider = async () => {
-    if (!newProvider.provider_name || !newProvider.api_key || !newProvider.base_url || !newProvider.model) return
+    if (!newProvider.provider_name || !newProvider.api_key || !newProvider.base_url || !newProvider.model) {
+      const message = "Provider name, API key, base URL and model are all required."
+      setError(message)
+      toast({ title: "Provider not saved", description: message, variant: "error" })
+      return
+    }
+    const providerName = newProvider.provider_name
     try {
       await api.settings.createProvider(newProvider)
       const updated = await api.settings.getProviders()
       setProviders(updated)
       setShowAddProvider(false)
       setNewProvider({ provider_name: "", api_key: "", base_url: "", model: "", protocol: "openai", priority: 0, task_routing: "conversation,correction,lesson" })
+      toast({ title: "Provider saved", description: providerName, variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save provider")
+      const message = err instanceof Error ? err.message : "Failed to save provider"
+      setError(message)
+      toast({ title: "Could not save the provider", description: message, variant: "error" })
     }
   }
 
   const deleteProvider = async (id: string) => {
+    const removed = providers.find((provider) => provider.id === id)
     try {
       await api.settings.deleteProvider(id)
-      setProviders(providers.filter((p) => p.id !== id))
+      setProviders((current) => current.filter((provider) => provider.id !== id))
+      setConfirmDeleteId(null)
+      toast({
+        title: "Provider removed",
+        description: removed ? `${removed.provider_name} and its stored API key were deleted.` : undefined,
+        variant: "success",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to delete provider")
+      const message = err instanceof Error ? err.message : "Failed to delete provider"
+      setError(message)
+      toast({ title: "Could not remove the provider", description: message, variant: "error" })
     }
   }
 
@@ -143,8 +195,15 @@ export default function SettingsPage() {
       setPendingCefr(null)
       setPreferencesSaved(true)
       setTimeout(() => setPreferencesSaved(false), 2000)
+      toast({
+        title: "Preferences saved",
+        description: `Default level is now ${pendingCefr}; your learning path was regenerated.`,
+        variant: "success",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to update preferences and regenerate path")
+      const message = err instanceof Error ? err.message : "Failed to update preferences and regenerate path"
+      setError(message)
+      toast({ title: "Could not save preferences", description: message, variant: "error" })
     } finally {
       setSavingPreferences(false)
     }
@@ -169,8 +228,11 @@ export default function SettingsPage() {
       }
       setPreferencesSaved(true)
       setTimeout(() => setPreferencesSaved(false), 2000)
+      toast({ title: "Preferences saved", variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save preferences")
+      const message = err instanceof Error ? err.message : "Failed to save preferences"
+      setError(message)
+      toast({ title: "Could not save preferences", description: message, variant: "error" })
     } finally {
       setSavingPreferences(false)
     }
@@ -186,8 +248,11 @@ export default function SettingsPage() {
       setTutorProfile(updated)
       setTutorSaved(true)
       setTimeout(() => setTutorSaved(false), 2000)
+      toast({ title: "Tutor profile saved", variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save tutor profile")
+      const message = err instanceof Error ? err.message : "Failed to save tutor profile"
+      setError(message)
+      toast({ title: "Could not save the tutor profile", description: message, variant: "error" })
     }
   }
 
@@ -197,11 +262,18 @@ export default function SettingsPage() {
     try {
       await api.settings.clearData()
       setSuccess("All data cleared successfully. Refreshing...")
+      toast({
+        title: "All learning data cleared",
+        description: "Your account and provider keys were kept.",
+        variant: "success",
+      })
       setTimeout(() => {
         window.location.reload()
       }, 1500)
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to clear data")
+      const message = err instanceof Error ? err.message : "Failed to clear data"
+      setError(message)
+      toast({ title: "Could not clear your data", description: message, variant: "error" })
     } finally {
       setClearing(false)
       setShowClearConfirm(false)
@@ -221,6 +293,30 @@ export default function SettingsPage() {
           {error}
           <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setError("")}>Dismiss</Button>
         </div>
+      )}
+
+      {loadError && (
+        <div role="alert" className="flex items-center gap-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{loadError}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoadError("")
+              setLoadingSettings(true)
+              void loadSettings()
+            }}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {loadingSettings && (
+        <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+          Loading your settings…
+        </p>
       )}
 
       {success && (
@@ -258,9 +354,27 @@ export default function SettingsPage() {
                 <p className="text-xs text-muted-foreground break-all">{p.base_url}</p>
                 <p className="text-xs text-muted-foreground">Tasks: {p.task_routing}</p>
               </div>
-              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)} className="self-end sm:self-center shrink-0">
-                <Trash2 className="h-4 w-4 text-destructive" />
-              </Button>
+              {confirmDeleteId === p.id ? (
+                <div className="flex items-center gap-1 self-end sm:self-center shrink-0">
+                  <Button size="sm" variant="destructive" onClick={() => deleteProvider(p.id)}>
+                    Delete
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setConfirmDeleteId(null)}>
+                    Cancel
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setConfirmDeleteId(p.id)}
+                  aria-label={`Delete ${p.provider_name}`}
+                  title="Delete this provider and its stored API key"
+                  className="self-end sm:self-center shrink-0"
+                >
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                </Button>
+              )}
             </div>
           ))}
 

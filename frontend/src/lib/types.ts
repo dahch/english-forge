@@ -104,6 +104,9 @@ export interface GeneratedLesson {
   completed: boolean
   completed_at: string | null
   created_at: string
+  // "fallback" means the model failed/timed out and the deterministic template
+  // was stored instead — the UI must say so, never pass it off as personalized.
+  source?: "llm" | "fallback"
 }
 
 export interface LibraryLesson {
@@ -219,6 +222,10 @@ export interface Assessment {
   dimension_scores: DimensionScores | null
   messages: AssessmentMessage[]
   is_complete?: boolean
+  // Server-computed progress for the section stepper ("item X of Y").
+  section_step?: number
+  section_total?: number
+  questions_asked?: number
 }
 
 // Result of POST /assessment/{id}/recordings — STT transcript with Moonshine
@@ -239,6 +246,9 @@ export interface LearningPath {
   created_at: string
   completed_at: string | null
   is_active: boolean
+  // Transient provenance: "curriculum" = deterministic seed because the model
+  // failed/timed out; "unknown" for paths read back from the DB.
+  generation_source?: "llm" | "curriculum" | "unknown"
   path_lessons: PathLesson[]
 }
 

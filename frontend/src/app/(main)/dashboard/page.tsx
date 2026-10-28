@@ -34,16 +34,28 @@ export default function DashboardPage() {
 
   useEffect(() => {
     async function load() {
-      try {
-        const [s, c, w] = await Promise.all([api.dashboard.stats(), api.dashboard.cefr(), api.dashboard.weekly(8)])
-        setStats(s)
-        setCefr(c)
-        setWeekly(w)
-      } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : "Failed to load dashboard")
-      } finally {
-        setLoading(false)
+      // Independent panels: one failing endpoint must not blank the whole
+      // dashboard (Promise.all did exactly that).
+      const [statsRes, cefrRes, weeklyRes] = await Promise.allSettled([
+        api.dashboard.stats(),
+        api.dashboard.cefr(),
+        api.dashboard.weekly(8),
+      ])
+      if (statsRes.status === "fulfilled") setStats(statsRes.value)
+      if (cefrRes.status === "fulfilled") setCefr(cefrRes.value)
+      if (weeklyRes.status === "fulfilled") setWeekly(weeklyRes.value)
+
+      const failed = [statsRes, cefrRes, weeklyRes].find(
+        (result) => result.status === "rejected",
+      )
+      if (failed && failed.status === "rejected") {
+        setError(
+          failed.reason instanceof Error
+            ? `Some dashboard data couldn't load: ${failed.reason.message}`
+            : "Some dashboard data couldn't load.",
+        )
       }
+      setLoading(false)
     }
     load()
   }, [])

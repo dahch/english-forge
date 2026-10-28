@@ -22,7 +22,11 @@ from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import Assessment, AssessmentMessage, User
+from app.services.assessment_bank import LISTENING_ITEMS, SPEAKING_ITEMS
 from app.services.assessment_flow import (
+    KIND_CHAT,
+    MAX_ASSESSMENT_EXCHANGES,
+    PHASE_CONVERSATION,
     PHASE_MIC_CHECK,
     analyze_assessment,
     ensure_message_audio,
@@ -138,6 +142,12 @@ class AssessmentResponse(BaseModel):
     # Transient signal: every section is done and the client should call
     # /complete. Defaults to False for endpoints that don't compute it.
     is_complete: bool = False
+    # Server-computed progress for the section stepper. The client must not
+    # infer it from the message list: phases can end early (listening) or be
+    # skipped via a short "I'm done", and question counting differs per kind.
+    section_step: int = 0
+    section_total: int = 0
+    questions_asked: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -196,7 +206,7 @@ async def get_current_assessment(
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise HTTPException(status_code=404, detail="No assessment found")
-    return assessment
+    return _serialize_assessment(assessment)
 
 
 @router.post("/start", response_model=AssessmentResponse, status_code=201)
@@ -226,7 +236,7 @@ async def start_assessment(
     existing = existing_result.scalar_one_or_none()
     if existing:
         response.status_code = 200
-        return existing
+        return _serialize_assessment(existing)
 
     # The partial unique index (uq_assessments_user_in_progress, created at
     # startup) makes this insert atomic: a double-click that passes the
@@ -251,13 +261,13 @@ async def start_assessment(
         existing = existing_result.scalar_one_or_none()
         if existing:
             response.status_code = 200
-            return existing
+            return _serialize_assessment(existing)
         raise
     await db.flush()
 
     # The first message is a deterministic mic check — no LLM round-trip. It
     # validates permissions/volume/STT before the interview starts.
-    return await handle_start(db, assessment)
+    return _serialize_assessment(await handle_start(db, assessment))
 
 
 @router.get("/{assessment_id}/messages/{message_id}/audio")
@@ -290,6 +300,37 @@ async def get_message_audio(
     if not audio:
         raise HTTPException(status_code=503, detail="Audio generation is unavailable right now")
     return Response(content=audio, media_type="audio/mpeg")
+
+
+# Items per phase: the denominator of "item X of Y" in the UI.
+_PHASE_TOTALS = {
+    PHASE_MIC_CHECK: 1,
+    PHASE_CONVERSATION: MAX_ASSESSMENT_EXCHANGES,
+    "listening": len(LISTENING_ITEMS),
+    "speaking": len(SPEAKING_ITEMS),
+}
+
+
+def _serialize_assessment(
+    assessment: Assessment, *, is_complete: bool = False
+) -> AssessmentResponse:
+    """ORM → response plus the progress the client renders.
+
+    Every endpoint returning an assessment goes through this, so the stepper
+    and the "Finish" availability are driven by server state instead of the
+    client guessing from messages.
+    """
+    response = AssessmentResponse.model_validate(assessment)
+    response.is_complete = is_complete
+    phase = assessment.phase or PHASE_CONVERSATION
+    response.section_step = assessment.section_step or 0
+    response.section_total = _PHASE_TOTALS.get(phase, 0)
+    response.questions_asked = sum(
+        1
+        for message in assessment.messages
+        if message.role == "assistant" and message.kind == KIND_CHAT
+    )
+    return response
 
 
 async def _read_limited(file: UploadFile, max_bytes: int) -> tuple[bytes, bool]:
@@ -384,9 +425,7 @@ async def assessment_message(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    resp = AssessmentResponse.model_validate(assessment)
-    resp.is_complete = is_complete
-    return resp
+    return _serialize_assessment(assessment, is_complete=is_complete)
 
 
 @router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
@@ -410,7 +449,7 @@ async def complete_assessment(
         # Idempotent re-complete: return the stored result. Must re-select with
         # eager loading — serializing the bare ORM object would lazy-load
         # `messages` outside the greenlet (MissingGreenlet → 500).
-        return await reload_assessment(db, assessment.id)
+        return _serialize_assessment(await reload_assessment(db, assessment.id))
 
     # Evidence integrity: an assessment that never left the mic check has no
     # measured evidence at all. Reject /complete so a bare start→complete can't
@@ -431,7 +470,7 @@ async def complete_assessment(
     assessment.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
-    return await reload_assessment(db, assessment.id)
+    return _serialize_assessment(await reload_assessment(db, assessment.id))
 
 
 @router.post("/{assessment_id}/reanalyze", response_model=AssessmentResponse)
@@ -477,7 +516,7 @@ async def reanalyze_assessment(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    return await reload_assessment(db, assessment.id)
+    return _serialize_assessment(await reload_assessment(db, assessment.id))
 
 
 @router.delete("/{assessment_id}", status_code=204)
