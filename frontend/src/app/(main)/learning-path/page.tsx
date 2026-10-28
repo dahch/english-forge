@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import { api, ApiError, setActiveSessionId } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
+import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
 import type { LearningPath, PathLesson, PathLessonDetail, VocabItemPayload } from "@/lib/types"
 import {
   MapPin,
@@ -28,6 +30,7 @@ import {
   PenLine,
   ArrowRight,
   BookOpen,
+  RefreshCw,
 } from "lucide-react"
 
 const typeIcons: Record<string, string> = {
@@ -41,8 +44,11 @@ const typeIcons: Record<string, string> = {
 
 export default function LearningPathPage() {
   const router = useRouter()
+  const { toast } = useToast()
   const [path, setPath] = useState<LearningPath | null>(null)
   const [loading, setLoading] = useState(true)
+  // Separate flag so the skeleton can say "generating" (vs "loading").
+  const [generating, setGenerating] = useState(false)
   const [error, setError] = useState("")
   const [advancing, setAdvancing] = useState(false)
   const [completing, setCompleting] = useState<string | null>(null)
@@ -54,7 +60,12 @@ export default function LearningPathPage() {
   const [exerciseResults, setExerciseResults] = useState<
     Record<number, { correct: boolean; correct_answer: string; explanation: string }>
   >({})
+  // A failed request is NOT a wrong answer: keep it in its own state so the UI
+  // can offer "Retry" instead of painting the network error as incorrect.
+  const [exerciseErrors, setExerciseErrors] = useState<Record<number, string>>({})
   const [checking, setChecking] = useState<Record<number, boolean>>({})
+  const generatingSeconds = useElapsed(generating)
+  const lessonSeconds = useElapsed(lessonLoading)
 
   // Multi-type interactive state
   const [startingConversation, setStartingConversation] = useState(false)
@@ -90,14 +101,32 @@ export default function LearningPathPage() {
 
   const generatePath = async () => {
     setLoading(true)
+    setGenerating(true)
     setError("")
     try {
       const p = await api.learningPath.generate()
       setPath(p)
+      if (p.generation_source === "curriculum") {
+        toast({
+          title: "Base curriculum generated",
+          description:
+            "The model didn't answer, so a default plan was used. Try generating again for a personalized one.",
+          variant: "info",
+        })
+      } else if (p.generation_source === "llm") {
+        toast({
+          title: "Learning path ready",
+          description: `${p.lessons_required} lessons from ${p.current_level} to ${p.target_level}.`,
+          variant: "success",
+        })
+      }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to generate path")
+      const message = err instanceof Error ? err.message : "Failed to generate path"
+      setError(message)
+      toast({ title: "Could not generate the path", description: message, variant: "error" })
     } finally {
       setLoading(false)
+      setGenerating(false)
     }
   }
 
@@ -127,6 +156,7 @@ export default function LearningPathPage() {
     setError("")
     setExerciseAnswers({})
     setExerciseResults({})
+    setExerciseErrors({})
     setAddedVocabCount(null)
     setIsPlayingAudio(false)
     setShowTranscript(false)
@@ -143,7 +173,9 @@ export default function LearningPathPage() {
         }
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to load lesson")
+      const message = err instanceof Error ? err.message : "Failed to load lesson"
+      setError(message)
+      toast({ title: "Could not open the lesson", description: message, variant: "error" })
       setActiveLesson(null)
     } finally {
       setLessonLoading(false)
@@ -156,18 +188,15 @@ export default function LearningPathPage() {
     if (!answer.trim()) return
 
     setChecking((prev) => ({ ...prev, [index]: true }))
+    setExerciseErrors((prev) => ({ ...prev, [index]: "" }))
     try {
       const result = await api.learningPath.checkLessonExercise(path.id, activeLesson.id, index, answer)
       setExerciseResults((prev) => ({ ...prev, [index]: result }))
       setHasEngaged(true)
     } catch (err: unknown) {
-      setExerciseResults((prev) => ({
+      setExerciseErrors((prev) => ({
         ...prev,
-        [index]: {
-          correct: false,
-          correct_answer: "",
-          explanation: err instanceof Error ? err.message : "Check failed",
-        },
+        [index]: err instanceof Error ? err.message : "Could not check the answer. Try again.",
       }))
     } finally {
       setChecking((prev) => ({ ...prev, [index]: false }))
@@ -181,8 +210,11 @@ export default function LearningPathPage() {
       const p = await api.learningPath.completeLesson(path.id, activeLesson.id)
       setPath(p)
       setActiveLesson(null)
+      toast({ title: "Lesson completed", description: activeLesson.topic, variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to complete lesson")
+      const message = err instanceof Error ? err.message : "Failed to complete lesson"
+      setError(message)
+      toast({ title: "Could not complete the lesson", description: message, variant: "error" })
     } finally {
       setCompleting(null)
     }
@@ -214,8 +246,15 @@ export default function LearningPathPage() {
       const res = await api.learningPath.addVocabBatch(items)
       setAddedVocabCount(res.count)
       setHasEngaged(true)
+      toast({
+        title: res.count ? `${res.count} words added to your vocabulary` : "No new words to add",
+        description: res.count ? "They're scheduled for spaced repetition." : undefined,
+        variant: res.count ? "success" : "info",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to add vocabulary items")
+      const message = err instanceof Error ? err.message : "Failed to add vocabulary items"
+      setError(message)
+      toast({ title: "Could not add vocabulary", description: message, variant: "error" })
     } finally {
       setAddingVocab(false)
     }
@@ -271,8 +310,15 @@ export default function LearningPathPage() {
     try {
       const p = await api.learningPath.advance(path.id)
       setPath(p)
+      toast({
+        title: "Level up!",
+        description: `Your new path goes from ${p.current_level} to ${p.target_level}.`,
+        variant: "success",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to advance")
+      const message = err instanceof Error ? err.message : "Failed to advance"
+      setError(message)
+      toast({ title: "Could not advance", description: message, variant: "error" })
     } finally {
       setAdvancing(false)
     }
@@ -282,7 +328,14 @@ export default function LearningPathPage() {
     return (
       <div className="max-w-3xl mx-auto p-6 space-y-6">
         <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-4 w-3/4" />
+        {generating ? (
+          <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+            Generating your curriculum… {formatElapsed(generatingSeconds)}. This can
+            take up to 30 seconds.
+          </p>
+        ) : (
+          <Skeleton className="h-4 w-3/4" />
+        )}
         <Card>
           <CardContent className="p-4 space-y-3">
             <Skeleton className="h-10 w-full" />
@@ -390,6 +443,11 @@ export default function LearningPathPage() {
 
         {lessonLoading || !content ? (
           <div className="space-y-4">
+            <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+              {lessonLoading
+                ? `Building this lesson… ${formatElapsed(lessonSeconds)}`
+                : "Preparing the lesson…"}
+            </p>
             <Skeleton className="h-28 w-full" />
             <Skeleton className="h-28 w-full" />
             <Skeleton className="h-40 w-full" />
@@ -747,7 +805,8 @@ export default function LearningPathPage() {
                       <CardContent className="p-4 space-y-3">
                         <p className="font-medium text-sm sm:text-base">{ex.question}</p>
                         {!result ? (
-                          isMultipleChoice ? (
+                          <div className="space-y-2">
+                          {isMultipleChoice ? (
                             <div className="flex flex-wrap gap-2">
                               {options!.map((opt) => (
                                 <Button
@@ -781,7 +840,25 @@ export default function LearningPathPage() {
                                 {checking[i] ? <Loader2 className="h-4 w-4 animate-spin" /> : "Check"}
                               </Button>
                             </div>
-                          )
+                          )}
+                          {exerciseErrors[i] && (
+                            <div
+                              role="alert"
+                              className="flex items-center gap-2 text-xs text-destructive"
+                            >
+                              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                              <span className="flex-1">{exerciseErrors[i]}</span>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => checkExercise(i)}
+                                disabled={checking[i]}
+                              >
+                                Retry
+                              </Button>
+                            </div>
+                          )}
+                          </div>
                         ) : (
                           <div
                             className={`flex items-start gap-2 text-sm p-3 rounded-md ${
@@ -841,6 +918,27 @@ export default function LearningPathPage() {
           </Button>
         )}
       </div>
+
+      {path.generation_source === "curriculum" && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"
+        >
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">
+            This plan is the default curriculum — the model didn&apos;t answer when it
+            was generated.
+          </span>
+          <Button size="sm" variant="outline" onClick={generatePath} disabled={loading}>
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5 mr-1" />
+            )}
+            {loading ? "Regenerating…" : "Regenerate"}
+          </Button>
+        </div>
+      )}
 
       <Progress value={percent} />
 

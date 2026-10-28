@@ -5,10 +5,11 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.json_utils import as_dict_list, load_json
 from app.llm.router import parse_lesson_json
 from app.models.models import Correction, GeneratedLesson, Message, Session, User, LibraryLessonCompletion
 from app.utils import bump_daily_lessons
@@ -105,17 +107,26 @@ def _serialize_generated_lesson(lesson: GeneratedLesson) -> dict:
     generate endpoints (ADR-003/005). The frontend discriminates generated
     lessons by the presence of `completed`, so every serialized lesson
     carries it."""
+    examples = load_json(
+        lesson.examples,
+        default=[],
+        expected_type=list,
+        context=f"generated_lesson {lesson.id} examples",
+    )
+    exercises = as_dict_list(
+        lesson.exercises, context=f"generated_lesson {lesson.id} exercises"
+    )
     return {
         "id": lesson.id,
         "title": lesson.title,
         "topic": lesson.topic,
         "level": lesson.level,
         "explanation": lesson.explanation,
-        "examples": json.loads(lesson.examples) if lesson.examples else [],
+        "examples": examples,
         # Answers and explanations stripped — delivered upon exercise submission
         "exercises": [
             {k: v for k, v in ex.items() if k not in ("answer", "explanation")}
-            for ex in (json.loads(lesson.exercises) if lesson.exercises else [])
+            for ex in exercises
         ],
         "based_on_errors": lesson.based_on_errors,
         "completed": lesson.completed,
@@ -258,11 +269,15 @@ async def check_exercise(
 async def list_generated_lessons(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     result = await db.execute(
         select(GeneratedLesson)
         .where(GeneratedLesson.user_id == current_user.id)
         .order_by(GeneratedLesson.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     )
     lessons = result.scalars().all()
     return [_serialize_generated_lesson(l) for l in lessons]
@@ -533,7 +548,9 @@ async def generate_lesson(
     normalized = normalize_llm_lesson(lesson_data) if lesson_data else None
 
     # Fallback to robust deterministic template if LLM failed, timed out, or returned no exercises
+    used_fallback = False
     if not normalized or not normalized.get("exercises"):
+        used_fallback = True
         fallback = FALLBACK_LESSONS_BY_LEVEL.get(target_level, FALLBACK_LESSONS_BY_LEVEL["B1"])
         normalized = {
             "title": f"{custom_topic.title()} ({target_level})" if custom_topic else fallback["title"],
@@ -561,4 +578,7 @@ async def generate_lesson(
 
     result = _serialize_generated_lesson(stored)
     result["generated"] = True
+    # Honesty signal for the client: "fallback" means the model failed or timed
+    # out and this is the deterministic template, not personalized content.
+    result["source"] = "fallback" if used_fallback else "llm"
     return result

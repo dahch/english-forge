@@ -55,7 +55,9 @@ export interface Message {
   session_id: string
   role: string
   text: string
+  // Always null from the API; audio is fetched from the authenticated endpoint.
   audio_url: string | null
+  has_audio?: boolean
   created_at: string
   corrections: Correction[]
 }
@@ -104,6 +106,9 @@ export interface GeneratedLesson {
   completed: boolean
   completed_at: string | null
   created_at: string
+  // "fallback" means the model failed/timed out and the deterministic template
+  // was stored instead — the UI must say so, never pass it off as personalized.
+  source?: "llm" | "fallback"
 }
 
 export interface LibraryLesson {
@@ -134,6 +139,15 @@ export interface ProviderConfig {
   priority: number
   task_routing: string
   has_api_key: boolean
+}
+
+export interface ProviderTestResult {
+  ok: boolean
+  provider?: string | null
+  model?: string | null
+  latency_ms?: number | null
+  reply?: string | null
+  error?: string | null
 }
 
 export interface DashboardStats {
@@ -217,8 +231,14 @@ export interface Assessment {
   summary: string | null
   phase: string | null
   dimension_scores: DimensionScores | null
+  // Difficulty-weighted CEFR band per dimension (final level = median).
+  dimension_bands?: Record<string, string | null> | null
   messages: AssessmentMessage[]
   is_complete?: boolean
+  // Server-computed progress for the section stepper ("item X of Y").
+  section_step?: number
+  section_total?: number
+  questions_asked?: number
 }
 
 // Result of POST /assessment/{id}/recordings — STT transcript with Moonshine
@@ -239,6 +259,9 @@ export interface LearningPath {
   created_at: string
   completed_at: string | null
   is_active: boolean
+  // Transient provenance: "curriculum" = deterministic seed because the model
+  // failed/timed out; "unknown" for paths read back from the DB.
+  generation_source?: "llm" | "curriculum" | "unknown"
   path_lessons: PathLesson[]
 }
 

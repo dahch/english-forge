@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -55,6 +56,49 @@ class OpenAICompatibleProvider(ChatProvider):
     @property
     def model_name(self) -> str:
         return self._model
+
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str,
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> AsyncIterator[str]:
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        body = {
+            "model": self._model,
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                json=body,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (event.get("choices") or [{}])[0]
+                    delta = (choice.get("delta") or {}).get("content")
+                    if delta:
+                        yield delta
 
     async def complete(
         self,

@@ -196,3 +196,75 @@
   - Pros: Eliminates proxy timeout failures on long LLM runs; robust recovery if network blips occur; consistent CEFR level across User, Settings, Dashboard, Conversation, and Learning Paths; safe confirmation gate before path regeneration.
   - Cons: Regenerating a learning path replaces the previous active path's pending lessons (completed lesson metrics are preserved in daily progress).
 
+## ADR-020: Fail-Fast Security Bootstrap and Auth Rate Limiting
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found that `config.py` shipped a publicly known default `JWT_SECRET_KEY` and nothing validated it at startup, so a deployment that forgot the variable ran with a signing key anyone could use to forge tokens for any user. The Fernet key for provider credentials was derived from that same secret, so rotating the JWT secret silently destroyed every stored API key. Login/register had no throttling, passwords had no upper bound (bcrypt silently truncates at 72 bytes), emails were stored case-sensitively, and `PATCH /auth/me` rotated the password with nothing but a bearer token.
+- **Decision**:
+  - `validate_security_settings()` runs first in the lifespan and aborts startup when `JWT_SECRET_KEY` is empty, shorter than 32 bytes, or a known placeholder; `ALLOW_INSECURE_DEFAULTS=true` downgrades this to a warning for CI only. A malformed `SETTINGS_ENCRYPTION_KEY` also aborts.
+  - `SETTINGS_ENCRYPTION_KEY` is the supported key; the derived-from-JWT fallback remains for existing databases but logs a warning, and startup reports provider keys that no longer decrypt.
+  - A dependency-free sliding-window limiter (`app/rate_limit.py`) caps failed logins per normalised email and per client IP, and registrations per IP, returning `429` + `Retry-After`. Success clears the email budget; the client IP is read from `X-Forwarded-For` only when `TRUST_PROXY_HEADERS` is enabled.
+  - Passwords are capped at 72 bytes at the schema *and* in `hash_password` (reject, never truncate), need 10 characters on register/change, and changing a password requires the current one.
+  - Emails are lower-cased/trimmed on register and login (queries compare `lower(email)`), so existing mixed-case rows keep working.
+- **Consequences**:
+  - Pros: A misconfigured deployment fails loudly instead of running with a forgeable secret; credential rotation no longer destroys provider keys silently; brute force and account farming are bounded; long passwords cannot collide via bcrypt truncation.
+  - Cons: Existing deployments must set `JWT_SECRET_KEY` before upgrading (intended); the limiter is per-process (documented single worker) and can lock an email out for the window; setting `TRUST_PROXY_HEADERS` incorrectly lets clients spoof their IP.
+
+## ADR-021: Transactional Turn Boundaries, Idempotent Session Billing and Assessment Recovery
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: Conversation turns inserted the user message and then held SQLite's single write transaction open across the LLM call (up to `LLM_TIMEOUT_SECONDS`) and the TTS polling loop (up to 30 s), so any concurrent write failed or waited. `PATCH /sessions/{id}/end` recomputed wall-clock duration on every call and billed it again, so retries/two tabs inflated `progress_daily.minutes_spoken`, and an idle tab counted as practice. The partial unique index allowing one in-progress assessment per user had no escape hatch: abandoning an attempt, a broken microphone or a corrupted phase locked the account out of ever starting a new assessment.
+- **Decision**:
+  - Turns are serialized per session (`app/concurrency.py`), read history, call the LLM **without** an open write transaction, then persist the whole turn (user message, reply, corrections, vocabulary) in one short transaction and commit. TTS runs afterwards and only updates `audio_url`; a TTS failure logs and returns `audio_url=null` instead of failing the turn. Session creation commits the greeting before synthesis.
+  - `services/session_metrics.py` owns finalisation: idempotent (already-ended sessions are not billed again), duration ends at the last message + `SESSION_END_GRACE_MINUTES`, and the result is capped at `MAX_SESSION_MINUTES`. REST and WebSocket paths share it.
+  - `DELETE /api/assessment/{id}` sets `abandoned_at` (soft delete, 409 if already completed); `/current`, `/message`, `/complete`, `/reanalyze`, recordings and audio ignore abandoned rows. `POST /start` reclaims attempts with no activity for `ASSESSMENT_INACTIVE_DAYS` before checking the in-progress slot. The partial index predicate gains `AND abandoned_at IS NULL`; startup compares stored index SQL with the expected definition and replaces outdated indexes idempotently.
+- **Consequences**:
+  - Pros: No long-held write locks; concurrent sessions stay responsive. Session minutes are billed once and reflect practice rather than idle time. An assessment can always be restarted, with the old conversation kept for export/diagnostics.
+  - Cons: The per-session lock and limiter are process-local (single-worker assumption); a TTS outage now yields silent text-only replies (the client already falls back to browser speech) — surfacing it in the UI is part of the next iteration.
+
+
+## ADR-022: HttpOnly Cookie Sessions with Rotating Refresh Tokens
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found the 24-hour JWT stored in `localStorage` and sent as a bearer header: readable by any XSS, impossible to revoke, and expiring with a hard redirect that discarded the user's unsent text. Password changes did not invalidate existing tokens and there was no way to sign out other devices.
+- **Decision**:
+  - Browser sessions move to cookies: `ef_access` (HttpOnly, 15 min, path `/`) and `ef_refresh` (HttpOnly, 30 days, path `/api/auth`). A readable `ef_csrf` cookie is echoed in `X-CSRF-Token` for unsafe methods (double-submit); Bearer auth remains for scripts and is exempt from CSRF.
+  - Refresh tokens are random 48-byte values stored only as SHA-256 in `refresh_tokens`, capped per user, pruned on issue, and rotated on every refresh. Presenting a revoked token is treated as theft: every session for the user is revoked and `users.token_version` is bumped, which invalidates outstanding access tokens without a denylist.
+  - `PATCH /auth/me` with a new password bumps `token_version`, revokes other devices, and re-issues cookies to the current one. `POST /auth/logout` revokes the presented refresh token and clears the cookies.
+  - The API client performs a single-flight silent refresh on 401 and retries the request once; if refresh fails it preserves a `?next=` return path instead of dumping the user on a blank login. The frontend keeps only a non-sensitive `ef_auth` flag so the shell can redirect before the first request.
+  - Unsent conversation text is stored per session in `sessionStorage` and restored on reload/session switch; signing out in one tab syncs to the others via the `storage` event.
+- **Consequences**:
+  - Pros: XSS can no longer exfiltrate a long-lived token; sessions are revocable; expiry is transparent; a stolen refresh token is usable at most once and its reuse kills all sessions; user work survives expiry/refresh.
+  - Cons: `COOKIE_SECURE` must be enabled on HTTPS deployments; cookie auth needs the CSRF header (clients bypassing the official API client must send it, or use Bearer); rotation requires the client's single-flight refresh to avoid tripping reuse detection with parallel 401s; refresh tokens add a table and a pruning step.
+
+
+## ADR-023: Data Durability — Alembic Baseline, Integrity Constraints, File-Backed Audio and Difficulty-Weighted Bands
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: The audit found an unversioned schema (Alembic configured with no revisions, column changes applied by a hand-maintained `_COLUMNS_TO_ADD`), no database-level validation, JSON columns whose corruption could 500 a whole listing, TTS audio stored as base64 inside the database and serialized into every message list, a `new_words` counter nobody wrote, and assessment levels derived from raw accuracy regardless of item difficulty (answering one A2 item correctly implied C2).
+- **Decision**:
+  - Startup still creates tables (`create_all`) and applies the legacy column/index sync, then stamps `0001_baseline` into `alembic_version` when absent. `alembic/env.py` now uses a synchronous engine, so future revisions can be authored and applied normally on both fresh and existing databases.
+  - Fresh databases get CHECK constraints (roles, phases, CEFR levels, non-negative counters) and expression/partial unique indexes: one vocabulary row per user and word (case-insensitive) and one global scenario per name. The indexes are also created at startup on existing databases; duplicates there are reported loudly instead of silently persisting.
+  - All JSON readers go through `app.json_utils.load_json`, which logs corruption with context and returns a safe default (`/lessons/generated` no longer 500s on a corrupt row).
+  - `progress_daily.new_words` is incremented when vocabulary is created (LLM turns and manual additions); duplicate words are rejected with 409 and never double-count.
+  - New TTS audio is written to `MEDIA_DIR` and referenced as `media:<uuid>.mp3`; `MessageResponse` exposes `has_audio` and never serializes the reference or a base64 data URI. A cookie-authenticated `GET /api/sessions/{id}/messages/{id}/audio` serves it; legacy data URIs are still decoded and served.
+  - Assessment levels now aggregate **bands** (`dimension_bands`) instead of raw scores: listening uses the hardest item answered correctly, demoted for poor accuracy; pronunciation uses the item's band demoted by the composite. The 0-100 scores remain for display and confidence.
+- **Consequences**:
+  - Pros: Schema changes have a versioned path; invalid rows are rejected at the DB boundary; one corrupt row cannot break a listing; the database no longer grows by megabytes per conversation; weekly charts report real new words; placement levels stop being inflated by easy items.
+  - Cons: Existing databases keep their old CHECK constraints until rebuilt (application-level validation still applies); the unique indexes require cleaning pre-existing duplicates (startup logs them); audio backups must include `MEDIA_DIR`; `dimension_bands` is an additional column and response field.
+
+
+## ADR-024: Incremental Tutor Replies over SSE, with a Shared Turn Service
+- **Date**: 2026-10-28
+- **Status**: Accepted
+- **Context**: Conversation turns waited for the complete JSON response (reply + corrections + vocabulary) and then for TTS, so the first visible feedback could be 10-40s away. A WebSocket transport existed but the web app never used it, and Next.js rewrites cannot proxy WebSocket upgrades ("WebSockets won't work" in the Next docs), so the browser could not reach the backend socket through the same origin that holds the session cookies.
+- **Decision**:
+  - The reply is streamed over **Server-Sent Events** (`POST /api/sessions/{id}/messages/stream`): normal HTTP through the existing proxy, cookie-authenticated, CSRF-protected, with keepalive comment frames while a reasoning model is thinking.
+  - The streamed call asks for **plain text** (`build_streaming_system_prompt`); streaming the structured JSON would show braces and field names to the student. A second non-streamed call (`build_correction_analysis_prompt`) extracts corrections and 1-3 vocabulary items, and runs even if the first call succeeded.
+  - All persistence, review and TTS live in `services/conversation_stream.py:stream_turn()`. The SSE endpoint and the WebSocket handler both call it, so the two transports cannot drift; the WebSocket now also emits `assistant_started`/`assistant_delta` for direct clients.
+  - If streaming fails before any token, the client retries transparently through the REST endpoint; if it fails after tokens were shown, it reloads the persisted history instead of trusting partial text.
+  - Settings gains provider editing and a connectivity probe (one tiny completion, 20s timeout, 8/min per user) so a bad key/URL/model is diagnosed before a conversation.
+  - Vocabulary and generated-lesson listings are paginated (`limit`/`offset`) with "Load more" in the UI; direct handler calls keep numeric defaults via `Annotated`.
+- **Consequences**:
+  - Pros: First token arrives as soon as the provider emits it; the web works through the existing same-origin cookie session without exposing tokens; one turn implementation serves SSE, WS and REST fallback; provider failures are testable; long lists stop loading everything at once.
+  - Cons: Each streamed turn uses two LLM calls (reply + review), so cost rises; the review/corrections arrive with the final event, after the text; SSE is one-way (no client-to-server mid-turn messages) — the WebSocket remains the path for that, currently for non-browser clients; transports must keep the event contract in sync (covered by tests).

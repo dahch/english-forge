@@ -12,6 +12,7 @@ import type {
   Message,
   PathLessonDetail,
   ProviderConfig,
+  ProviderTestResult,
   QuizQuestion,
   QuizResult,
   RecordingResult,
@@ -30,6 +31,12 @@ export type { LessonExercise, ExerciseCheckResult, LibraryLesson, LessonGenerate
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || ""
 
 export const SESSION_ID_KEY = "ef_active_session_id"
+// Non-sensitive UI flag only: the session itself is an HttpOnly cookie the
+// browser attaches automatically. Without this flag the shell would render for
+// a moment before the first 401 redirect.
+export const AUTH_FLAG_KEY = "ef_auth"
+const CSRF_COOKIE = "ef_csrf"
+const CSRF_HEADER = "X-CSRF-Token"
 
 export function getActiveSessionId(): string | null {
   if (typeof window === "undefined") return null
@@ -42,21 +49,28 @@ export function setActiveSessionId(sessionId: string | null) {
   else localStorage.removeItem(SESSION_ID_KEY)
 }
 
-function getToken(): string | null {
-  if (typeof window === "undefined") return null
-  return localStorage.getItem("ef_token")
-}
-
-export function setToken(token: string) {
-  localStorage.setItem("ef_token", token)
-}
-
-export function clearToken() {
-  localStorage.removeItem("ef_token")
-}
-
 export function isAuthenticated(): boolean {
-  return !!getToken()
+  if (typeof window === "undefined") return false
+  return localStorage.getItem(AUTH_FLAG_KEY) === "1"
+}
+
+export function setAuthenticated(authenticated: boolean) {
+  if (typeof window === "undefined") return
+  if (authenticated) localStorage.setItem(AUTH_FLAG_KEY, "1")
+  else localStorage.removeItem(AUTH_FLAG_KEY)
+}
+
+export function clearSessionState() {
+  setAuthenticated(false)
+  setActiveSessionId(null)
+}
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null
+  const match = document.cookie
+    .split("; ")
+    .find((entry) => entry.startsWith(`${name}=`))
+  return match ? match.slice(name.length + 1) : null
 }
 
 let redirecting = false
@@ -72,36 +86,79 @@ export class ApiError extends Error {
   }
 }
 
+function loginUrlWithReturn(): string {
+  const here = `${window.location.pathname}${window.location.search}`
+  if (here.startsWith("/login")) return "/login"
+  return `/login?next=${encodeURIComponent(here)}`
+}
+
 function handleUnauthorized(): never {
-  clearToken()
-  setActiveSessionId(null)
+  clearSessionState()
   if (typeof window !== "undefined" && !redirecting) {
     redirecting = true
-    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-    window.location.href = "/login"
+    window.location.assign(loginUrlWithReturn())
   }
   throw new Error("Unauthorized")
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = getToken()
-  // FormData bodies must not carry a JSON Content-Type — the browser sets
-  // its own multipart boundary header.
+// Single-flight refresh: several requests failing with 401 at once must rotate
+// the refresh token exactly once (rotation revokes the presented token, so a
+// second parallel refresh would look like token theft and kill the session).
+let refreshInFlight: Promise<boolean> | null = null
+
+async function refreshSession(): Promise<boolean> {
+  if (!refreshInFlight) {
+    refreshInFlight = fetch(`${API_BASE}/api/auth/refresh`, {
+      method: "POST",
+      credentials: "include",
+      headers: { [CSRF_HEADER]: readCookie(CSRF_COOKIE) ?? "" },
+    })
+      .then((response) => response.ok)
+      .catch(() => false)
+  }
+  try {
+    return await refreshInFlight
+  } finally {
+    refreshInFlight = null
+  }
+}
+
+function isCredentialCheck(path: string): boolean {
+  return path === "/api/auth/login" || path === "/api/auth/register"
+}
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+  allowRefresh = true,
+): Promise<T> {
+  // FormData bodies must not carry a JSON Content-Type — the browser sets its
+  // own multipart boundary header.
   const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData
+  const method = (options.method || "GET").toUpperCase()
   const headers: Record<string, string> = {
     ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...((options.headers as Record<string, string>) || {}),
   }
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`
+  const csrf = readCookie(CSRF_COOKIE)
+  if (csrf && method !== "GET" && method !== "HEAD") {
+    headers[CSRF_HEADER] = csrf
   }
 
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers,
+    credentials: "include",
   })
 
   if (res.status === 401) {
+    if (isCredentialCheck(path)) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new ApiError(err.detail || "Invalid email or password", 401)
+    }
+    if (allowRefresh && (await refreshSession())) {
+      return request<T>(path, options, false)
+    }
     return handleUnauthorized()
   }
 
@@ -114,17 +171,97 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json()
 }
 
-// Fetch a non-JSON resource (e.g. an audio blob) with the same auth header,
-// API base prefix and 401 handling as `request`. Used by the assessment audio
-// player, which needs the raw bytes rather than a parsed JSON body.
-export async function fetchBlob(path: string): Promise<Blob> {
-  const token = getToken()
-  const headers: Record<string, string> = {}
-  if (token) headers["Authorization"] = `Bearer ${token}`
+export type StreamEventHandler = (event: string, data: unknown) => void
 
-  const res = await fetch(`${API_BASE}${path}`, { headers })
+function parseSseFrame(frame: string): { event: string; data: string } | null {
+  let event = "message"
+  const dataLines: string[] = []
+  for (const line of frame.split("\n")) {
+    if (line.startsWith(":")) continue
+    if (line.startsWith("event:")) event = line.slice(6).trim()
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart())
+  }
+  if (dataLines.length === 0) return null
+  return { event, data: dataLines.join("\n") }
+}
+
+// Server-Sent Events over fetch: cookies, CSRF and silent refresh behave
+// exactly like the JSON request helper, but the body is consumed incrementally.
+async function streamRequest(
+  path: string,
+  body: unknown,
+  onEvent: StreamEventHandler,
+  allowRefresh = true,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  }
+  const csrf = readCookie(CSRF_COOKIE)
+  if (csrf) headers[CSRF_HEADER] = csrf
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    credentials: "include",
+  })
 
   if (res.status === 401) {
+    if (allowRefresh && (await refreshSession())) {
+      return streamRequest(path, body, onEvent, false)
+    }
+    return handleUnauthorized()
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new ApiError(err.detail || "Request failed", res.status)
+  }
+  if (!res.body) {
+    throw new ApiError("This browser cannot stream responses.", 0)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+      let boundary = buffer.indexOf("\n\n")
+      while (boundary !== -1) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const parsed = parseSseFrame(frame)
+        if (parsed) {
+          let payload: unknown = parsed.data
+          try {
+            payload = JSON.parse(parsed.data)
+          } catch {
+            // Non-JSON payloads are passed through as text.
+          }
+          onEvent(parsed.event, payload)
+        }
+        boundary = buffer.indexOf("\n\n")
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined)
+  }
+}
+
+// Fetch a non-JSON resource (e.g. an audio blob) with the same cookie auth,
+// API base prefix and silent refresh as `request`.
+export async function fetchBlob(path: string, allowRefresh = true): Promise<Blob> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
+  })
+
+  if (res.status === 401) {
+    if (allowRefresh && (await refreshSession())) {
+      return fetchBlob(path, false)
+    }
     return handleUnauthorized()
   }
   if (!res.ok) {
@@ -145,6 +282,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ email, password }),
       }),
+    logout: () => request<void>("/api/auth/logout", { method: "POST" }),
     me: () => request<User>("/api/auth/me"),
   },
 
@@ -196,10 +334,15 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ text }),
       }),
+    // Incremental turn over SSE: assistant_started, assistant_delta,
+    // assistant_response and error events.
+    stream: (sessionId: string, text: string, onEvent: StreamEventHandler) =>
+      streamRequest(`/api/sessions/${sessionId}/messages/stream`, { text }, onEvent),
   },
 
   vocab: {
-    list: (filter: string = "all") => request<VocabItem[]>(`/api/vocab?filter=${filter}`),
+    list: (filter: string = "all", limit: number = 100, offset: number = 0) =>
+      request<VocabItem[]>(`/api/vocab?filter=${filter}&limit=${limit}&offset=${offset}`),
     create: (data: { word: string; definition: string; example: string; ipa?: string | null }) =>
       request<VocabItem>("/api/vocab", {
         method: "POST",
@@ -241,7 +384,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
       }),
-    generated: () => request<GeneratedLesson[]>("/api/lessons/generated"),
+    generated: (limit: number = 50, offset: number = 0) =>
+      request<GeneratedLesson[]>(`/api/lessons/generated?limit=${limit}&offset=${offset}`),
     checkGeneratedExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
       request<ExerciseCheckResult>(`/api/lessons/generated/${lessonId}/exercise`, {
         method: "POST",
@@ -284,6 +428,11 @@ export const api = {
       request<Assessment>(`/api/assessment/${id}/complete`, { method: "POST" }),
     reanalyze: (id: string) =>
       request<Assessment>(`/api/assessment/${id}/reanalyze`, { method: "POST" }),
+    // Soft-delete the in-progress attempt so a fresh one can be started. The
+    // backend frees the "one in-progress assessment" invariant here; without
+    // it a stuck attempt could never be retaken.
+    abandon: (id: string) =>
+      request<void>(`/api/assessment/${id}`, { method: "DELETE" }),
   },
 
   learningPath: {
@@ -364,6 +513,21 @@ export const api = {
         body: JSON.stringify(data),
       }),
     deleteProvider: (id: string) => request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
+    // One tiny completion against a stored provider (key decrypted server-side).
+    testProvider: (id: string) =>
+      request<ProviderTestResult>(`/api/settings/providers/${id}/test`, { method: "POST" }),
+    // Probe the values currently typed in the form, before saving them.
+    testProviderDraft: (data: {
+      provider_name?: string
+      protocol: string
+      base_url: string
+      model: string
+      api_key: string
+    }) =>
+      request<ProviderTestResult>("/api/settings/providers/test", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
     get: () => request<{ key: string; value: string }[]>("/api/settings"),
     update: (data: {
       stt_mode?: string

@@ -13,15 +13,20 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import get_settings
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.models import Assessment, AssessmentMessage, User
+from app.services.assessment_bank import LISTENING_ITEMS, SPEAKING_ITEMS
 from app.services.assessment_flow import (
+    KIND_CHAT,
+    MAX_ASSESSMENT_EXCHANGES,
+    PHASE_CONVERSATION,
     PHASE_MIC_CHECK,
     analyze_assessment,
     ensure_message_audio,
@@ -43,6 +48,48 @@ _reanalyze_last: dict[str, datetime] = {}
 
 # Maximum accepted recording upload (30s of opus/webm is well under this).
 _MAX_RECORDING_BYTES = 10 * 1024 * 1024
+
+
+def _utcnow_naive() -> datetime:
+    """Naive UTC now — matches how SQLite stores DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def _abandon_stale_assessments(db: AsyncSession, user_id: str) -> int:
+    """Free the in-progress slot for assessments with no activity.
+
+    The partial unique index allows one in-progress assessment per user. Without
+    this reclaim, a user who closes the tab mid-assessment (or whose assessment
+    got into an unplayable phase) can never start a new one. "Activity" is the
+    last message, falling back to started_at, so a genuinely active assessment
+    is never reclaimed under the user's feet.
+    """
+    settings = get_settings()
+    cutoff = _utcnow_naive() - timedelta(days=settings.ASSESSMENT_INACTIVE_DAYS)
+    last_message = (
+        select(func.max(AssessmentMessage.created_at))
+        .where(AssessmentMessage.assessment_id == Assessment.id)
+        .scalar_subquery()
+    )
+    result = await db.execute(
+        update(Assessment)
+        .where(
+            Assessment.user_id == user_id,
+            Assessment.completed_at.is_(None),
+            Assessment.abandoned_at.is_(None),
+            Assessment.started_at < cutoff,
+            func.coalesce(last_message, Assessment.started_at) < cutoff,
+        )
+        .values(abandoned_at=_utcnow_naive())
+    )
+    if result.rowcount:
+        logger.info(
+            "Abandoned %s stale assessment(s) older than %s days for user %s",
+            result.rowcount,
+            settings.ASSESSMENT_INACTIVE_DAYS,
+            user_id,
+        )
+    return result.rowcount or 0
 
 
 class AssessmentMessageCreate(BaseModel):
@@ -91,10 +138,17 @@ class AssessmentResponse(BaseModel):
     summary: str | None
     phase: str | None
     dimension_scores: dict | None
+    dimension_bands: dict | None
     messages: list[AssessmentMessageResponse]
     # Transient signal: every section is done and the client should call
     # /complete. Defaults to False for endpoints that don't compute it.
     is_complete: bool = False
+    # Server-computed progress for the section stepper. The client must not
+    # infer it from the message list: phases can end early (listening) or be
+    # skipped via a short "I'm done", and question counting differs per kind.
+    section_step: int = 0
+    section_total: int = 0
+    questions_asked: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -108,7 +162,7 @@ class AssessmentResponse(BaseModel):
                 return []
         return v
 
-    @field_validator("dimension_scores", mode="before")
+    @field_validator("dimension_scores", "dimension_bands", mode="before")
     @classmethod
     def parse_dimension_scores(cls, v):
         if isinstance(v, str):
@@ -145,7 +199,7 @@ async def get_current_assessment(
     # completed one so the client can display results / allow a new attempt.
     result = await db.execute(
         select(Assessment)
-        .where(Assessment.user_id == current_user.id)
+        .where(Assessment.user_id == current_user.id, Assessment.abandoned_at.is_(None))
         .order_by(Assessment.completed_at.is_(None).desc(), Assessment.started_at.desc())
         .options(selectinload(Assessment.messages))
         .limit(1)
@@ -153,7 +207,7 @@ async def get_current_assessment(
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise HTTPException(status_code=404, detail="No assessment found")
-    return assessment
+    return _serialize_assessment(assessment)
 
 
 @router.post("/start", response_model=AssessmentResponse, status_code=201)
@@ -162,12 +216,20 @@ async def start_assessment(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Reclaim assessments abandoned by closing the tab / going stale, so the
+    # in-progress unique index never locks a user out of a fresh attempt.
+    await _abandon_stale_assessments(db, current_user.id)
+
     # Return the in-progress assessment instead of creating a duplicate
     # (double-click on "Start Assessment" would otherwise fork the chat).
     # An idempotent hit is 200, not 201 — nothing was created.
     existing_result = await db.execute(
         select(Assessment)
-        .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
+        .where(
+            Assessment.user_id == current_user.id,
+            Assessment.completed_at.is_(None),
+            Assessment.abandoned_at.is_(None),
+        )
         .order_by(Assessment.started_at.desc())
         .options(selectinload(Assessment.messages))
         .limit(1)
@@ -175,7 +237,7 @@ async def start_assessment(
     existing = existing_result.scalar_one_or_none()
     if existing:
         response.status_code = 200
-        return existing
+        return _serialize_assessment(existing)
 
     # The partial unique index (uq_assessments_user_in_progress, created at
     # startup) makes this insert atomic: a double-click that passes the
@@ -188,7 +250,11 @@ async def start_assessment(
     except IntegrityError:
         existing_result = await db.execute(
             select(Assessment)
-            .where(Assessment.user_id == current_user.id, Assessment.completed_at.is_(None))
+            .where(
+                Assessment.user_id == current_user.id,
+                Assessment.completed_at.is_(None),
+                Assessment.abandoned_at.is_(None),
+            )
             .order_by(Assessment.started_at.desc())
             .options(selectinload(Assessment.messages))
             .limit(1)
@@ -196,13 +262,13 @@ async def start_assessment(
         existing = existing_result.scalar_one_or_none()
         if existing:
             response.status_code = 200
-            return existing
+            return _serialize_assessment(existing)
         raise
     await db.flush()
 
     # The first message is a deterministic mic check — no LLM round-trip. It
     # validates permissions/volume/STT before the interview starts.
-    return await handle_start(db, assessment)
+    return _serialize_assessment(await handle_start(db, assessment))
 
 
 @router.get("/{assessment_id}/messages/{message_id}/audio")
@@ -218,7 +284,7 @@ async def get_message_audio(
         )
     )
     assessment = result.scalar_one_or_none()
-    if not assessment:
+    if not assessment or assessment.abandoned_at is not None:
         raise HTTPException(status_code=404, detail="Assessment not found")
 
     msg_result = await db.execute(
@@ -235,6 +301,37 @@ async def get_message_audio(
     if not audio:
         raise HTTPException(status_code=503, detail="Audio generation is unavailable right now")
     return Response(content=audio, media_type="audio/mpeg")
+
+
+# Items per phase: the denominator of "item X of Y" in the UI.
+_PHASE_TOTALS = {
+    PHASE_MIC_CHECK: 1,
+    PHASE_CONVERSATION: MAX_ASSESSMENT_EXCHANGES,
+    "listening": len(LISTENING_ITEMS),
+    "speaking": len(SPEAKING_ITEMS),
+}
+
+
+def _serialize_assessment(
+    assessment: Assessment, *, is_complete: bool = False
+) -> AssessmentResponse:
+    """ORM → response plus the progress the client renders.
+
+    Every endpoint returning an assessment goes through this, so the stepper
+    and the "Finish" availability are driven by server state instead of the
+    client guessing from messages.
+    """
+    response = AssessmentResponse.model_validate(assessment)
+    response.is_complete = is_complete
+    phase = assessment.phase or PHASE_CONVERSATION
+    response.section_step = assessment.section_step or 0
+    response.section_total = _PHASE_TOTALS.get(phase, 0)
+    response.questions_asked = sum(
+        1
+        for message in assessment.messages
+        if message.role == "assistant" and message.kind == KIND_CHAT
+    )
+    return response
 
 
 async def _read_limited(file: UploadFile, max_bytes: int) -> tuple[bytes, bool]:
@@ -272,6 +369,7 @@ async def upload_recording(
             Assessment.id == assessment_id,
             Assessment.user_id == current_user.id,
             Assessment.completed_at.is_(None),
+            Assessment.abandoned_at.is_(None),
         )
     )
     assessment = result.scalar_one_or_none()
@@ -309,6 +407,11 @@ async def assessment_message(
         raise HTTPException(status_code=404, detail="Assessment not found")
     if assessment.completed_at:
         raise HTTPException(status_code=400, detail="Assessment already completed")
+    if assessment.abandoned_at:
+        raise HTTPException(
+            status_code=400,
+            detail="This assessment was abandoned. Start a new one to continue.",
+        )
 
     try:
         assessment, is_complete = await handle_message(
@@ -323,9 +426,7 @@ async def assessment_message(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    resp = AssessmentResponse.model_validate(assessment)
-    resp.is_complete = is_complete
-    return resp
+    return _serialize_assessment(assessment, is_complete=is_complete)
 
 
 @router.post("/{assessment_id}/complete", response_model=AssessmentResponse)
@@ -340,11 +441,16 @@ async def complete_assessment(
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
+    if assessment.abandoned_at:
+        raise HTTPException(
+            status_code=400,
+            detail="This assessment was abandoned. Start a new one to continue.",
+        )
     if assessment.completed_at:
         # Idempotent re-complete: return the stored result. Must re-select with
         # eager loading — serializing the bare ORM object would lazy-load
         # `messages` outside the greenlet (MissingGreenlet → 500).
-        return await reload_assessment(db, assessment.id)
+        return _serialize_assessment(await reload_assessment(db, assessment.id))
 
     # Evidence integrity: an assessment that never left the mic check has no
     # measured evidence at all. Reject /complete so a bare start→complete can't
@@ -365,7 +471,7 @@ async def complete_assessment(
     assessment.completed_at = datetime.now(timezone.utc)
     await db.commit()
 
-    return await reload_assessment(db, assessment.id)
+    return _serialize_assessment(await reload_assessment(db, assessment.id))
 
 
 @router.post("/{assessment_id}/reanalyze", response_model=AssessmentResponse)
@@ -393,6 +499,11 @@ async def reanalyze_assessment(
     assessment = result.scalar_one_or_none()
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
+    if assessment.abandoned_at:
+        raise HTTPException(
+            status_code=400,
+            detail="This assessment was abandoned. Start a new one to continue.",
+        )
     if not assessment.completed_at:
         raise HTTPException(status_code=400, detail="Assessment is not complete yet")
 
@@ -406,4 +517,43 @@ async def reanalyze_assessment(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    return await reload_assessment(db, assessment.id)
+    return _serialize_assessment(await reload_assessment(db, assessment.id))
+
+
+@router.delete("/{assessment_id}", status_code=204)
+async def abandon_assessment(
+    assessment_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Abandon an in-progress assessment so the user can start a fresh one.
+
+    Soft delete: the stored conversation is kept (diagnostics/export), but
+    `abandoned_at` hides it from /current and frees the partial unique index
+    that guarantees one in-progress assessment per user. This is the escape
+    hatch for a mic that never works, a corrupted phase, or simply changing
+    your mind — previously the only way out was wiping the whole account data.
+    """
+    result = await db.execute(
+        select(Assessment).where(
+            Assessment.id == assessment_id, Assessment.user_id == current_user.id
+        )
+    )
+    assessment = result.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    if assessment.abandoned_at is not None:
+        # Idempotent: abandoning twice is a no-op.
+        return Response(status_code=204)
+    if assessment.completed_at is not None:
+        # Completed assessments are results, not scratch work. Retaking is a
+        # new attempt (POST /start), never a mutation of the old one.
+        raise HTTPException(
+            status_code=409,
+            detail="Assessment already completed. Retake it to start a new attempt.",
+        )
+
+    assessment.abandoned_at = datetime.now(timezone.utc)
+    await db.flush()
+    logger.info("Assessment %s abandoned by user %s", assessment.id, current_user.id)
+    return Response(status_code=204)

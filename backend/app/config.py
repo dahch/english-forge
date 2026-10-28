@@ -17,13 +17,62 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./data/englishforge.db"
 
-    JWT_SECRET_KEY: str = "change-me-in-production-use-openssl-rand-hex-32"
+    # No default on purpose: a missing/weak secret must stop the process at
+    # startup (see app.security.validate_security_settings) instead of letting
+    # the app run with a publicly known signing key.
+    JWT_SECRET_KEY: str = ""
     JWT_ALGORITHM: str = "HS256"
-    TOKEN_EXPIRE_MINUTES: int = 1440
+    # Access tokens are short-lived and renewed transparently by the refresh
+    # token cookie (see ADR-022). A long-lived access token in localStorage was
+    # the previous design.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    # Cap concurrent devices; the oldest refresh tokens are revoked beyond this.
+    MAX_REFRESH_TOKENS_PER_USER: int = 10
 
+    # --- Session cookies ----------------------------------------------------
+    # Set COOKIE_SECURE=true on any HTTPS deployment. It defaults to false so
+    # plain-HTTP local development still receives the cookie.
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: str = "lax"
+    COOKIE_DOMAIN: str = ""
+
+    # Escape hatch for CI/local experiments only. Never set this in production:
+    # it downgrades the startup validation to a warning.
+    ALLOW_INSECURE_DEFAULTS: bool = False
+
+    # Dedicated Fernet key for provider API keys. Empty = derived from
+    # JWT_SECRET_KEY (legacy behaviour, logs a warning). A dedicated key keeps
+    # encrypted secrets decryptable when the JWT secret is rotated.
     SETTINGS_ENCRYPTION_KEY: str = ""
 
     APP_PIN: Optional[str] = None
+
+    # --- Auth hardening -----------------------------------------------------
+    # Failed logins are counted per email and per client IP; 429 + Retry-After
+    # once the window budget is exhausted.
+    AUTH_RATE_LIMIT_ATTEMPTS: int = 5
+    AUTH_RATE_LIMIT_WINDOW_SECONDS: int = 900
+    # Registrations are counted per client IP (successes included).
+    REGISTER_RATE_LIMIT_ATTEMPTS: int = 5
+    REGISTER_RATE_LIMIT_WINDOW_SECONDS: int = 3600
+    # The backend usually sits behind the Next.js rewrite proxy, so the client
+    # IP arrives in X-Forwarded-For. Disable when exposed directly.
+    TRUST_PROXY_HEADERS: bool = True
+
+    # --- Data lifecycle -----------------------------------------------------
+    # An in-progress assessment with no activity for this long is abandoned
+    # automatically so the user is never locked out of starting a new one.
+    ASSESSMENT_INACTIVE_DAYS: int = 7
+    # TTS audio is stored as files under this directory (inside the data volume
+    # in Docker) instead of base64 blobs in the database.
+    MEDIA_DIR: str = "data/media"
+    # Wall-clock cap for a session's billable minutes (an idle tab left open
+    # overnight must not inflate ProgressDaily).
+    MAX_SESSION_MINUTES: int = 180
+    # Grace period after the last message before the session is considered
+    # finished, for the duration calculation.
+    SESSION_END_GRACE_MINUTES: int = 2
 
     PERSONAL_API_URL: str = "http://personal-api:8000"
     TTS_DEFAULT_VOICE: str = "alba"

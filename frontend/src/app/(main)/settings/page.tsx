@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -8,8 +8,56 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import type { ProviderConfig, TutorProfile, User } from "@/lib/types"
-import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
+import { useToast } from "@/components/feedback/toast"
+import type { ProviderConfig, ProviderTestResult, TutorProfile, User } from "@/lib/types"
+import {
+  Settings,
+  Plus,
+  Trash2,
+  Key,
+  Server,
+  Save,
+  AlertCircle,
+  UserCircle,
+  Database,
+  CheckCircle2,
+  Pencil,
+  PlugZap,
+  Loader2,
+} from "lucide-react"
+
+const EMPTY_PROVIDER = {
+  provider_name: "",
+  api_key: "",
+  base_url: "",
+  model: "",
+  protocol: "openai",
+  priority: 0,
+  task_routing: "conversation,correction,lesson",
+}
+
+// Inline result of a connectivity probe (card or unsaved form).
+function TestResultLine({ result }: { result: ProviderTestResult }) {
+  if (result.ok) {
+    return (
+      <p
+        role="status"
+        className="flex flex-wrap items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400"
+      >
+        <CheckCircle2 className="h-3.5 w-3.5" />
+        Connected · {result.provider ?? "provider"}
+        {typeof result.latency_ms === "number" ? ` · ${result.latency_ms} ms` : ""}
+        {result.reply ? ` · “${result.reply}”` : ""}
+      </p>
+    )
+  }
+  return (
+    <p role="alert" className="flex items-start gap-1 text-xs text-destructive">
+      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <span>{result.error ?? "Connection failed"}</span>
+    </p>
+  )
+}
 
 const PERSONALITY_PRESETS = [
   "friendly",
@@ -25,6 +73,7 @@ const PERSONALITY_PRESETS = [
 ]
 
 export default function SettingsPage() {
+  const { toast } = useToast()
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [settings, setSettings] = useState<Record<string, string>>({})
   const [currentUser, setCurrentUser] = useState<User | null>(null)
@@ -49,71 +98,250 @@ export default function SettingsPage() {
   const [showAddProvider, setShowAddProvider] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [clearing, setClearing] = useState(false)
-  const [newProvider, setNewProvider] = useState({
-    provider_name: "",
-    api_key: "",
-    base_url: "",
-    model: "",
-    protocol: "openai",
-    priority: 0,
-    task_routing: "conversation,correction,lesson",
-  })
+  // Load failures used to be console.error only: the form silently rendered
+  // defaults and users could save over settings they never saw.
+  const [loadError, setLoadError] = useState("")
+  const [loadingSettings, setLoadingSettings] = useState(true)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  const [newProvider, setNewProvider] = useState({ ...EMPTY_PROVIDER })
+  // Editing reuses the add form; the API key is never sent back to the client,
+  // so a blank field means "keep the stored key".
+  const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
+  const [providerSaving, setProviderSaving] = useState(false)
+  const [testingId, setTestingId] = useState<string | null>(null)
+  const [testingDraft, setTestingDraft] = useState(false)
+  const [draftTest, setDraftTest] = useState<ProviderTestResult | null>(null)
+  const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResult>>({})
 
-  useEffect(() => {
-    api.settings.getProviders().then(setProviders).catch(console.error)
-    api.settings.get().then((data) => {
+  const loadSettings = useCallback(async () => {
+    // Deliberately no setState before the first await: the effect runs this on
+    // mount and must not cascade renders synchronously (react-hooks lint), and
+    // `loadingSettings` already starts true.
+    const [providersRes, settingsRes, meRes, pathRes, tutorRes] = await Promise.allSettled([
+      api.settings.getProviders(),
+      api.settings.get(),
+      api.auth.me(),
+      api.learningPath.current(),
+      api.tutorProfile.get(),
+    ])
+
+    if (providersRes.status === "fulfilled") setProviders(providersRes.value)
+    if (settingsRes.status === "fulfilled") {
       const map: Record<string, string> = {}
-      data.forEach((s) => { map[s.key] = s.value })
+      settingsRes.value.forEach((s) => {
+        map[s.key] = s.value
+      })
       setSettings(map)
-      if (map.default_cefr) {
-        setSavedCefr(map.default_cefr)
-      }
-    }).catch(console.error)
-    api.auth.me().then((u) => {
-      setCurrentUser(u)
-      setSavedCefr((prev) => (prev && prev !== "A1" ? prev : u.current_level || "A1"))
-    }).catch(console.error)
-    api.learningPath.current().then((p) => {
-      if (p && p.id && p.is_active) {
-        setHasActivePath(true)
-      }
-    }).catch(() => {
-      setHasActivePath(false)
-    })
-    api.tutorProfile.get().then((p) => {
-      setTutorProfile(p)
+      if (map.default_cefr) setSavedCefr(map.default_cefr)
+    }
+    if (meRes.status === "fulfilled") {
+      const loadedUser = meRes.value
+      setCurrentUser(loadedUser)
+      setSavedCefr((prev) => (prev && prev !== "A1" ? prev : loadedUser.current_level || "A1"))
+    }
+    setHasActivePath(pathRes.status === "fulfilled" && Boolean(pathRes.value?.is_active))
+    if (tutorRes.status === "fulfilled") {
+      const profile = tutorRes.value
+      setTutorProfile(profile)
       setTutorForm({
-        name: p.name || "",
-        age: p.age,
-        gender: p.gender || "",
-        personality: p.personality || "",
-        voice: p.voice || "",
+        name: profile.name || "",
+        age: profile.age,
+        gender: profile.gender || "",
+        personality: profile.personality || "",
+        voice: profile.voice || "",
       })
       setCustomPersonality(
-        !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
+        !!profile.personality && !PERSONALITY_PRESETS.includes(profile.personality.toLowerCase()),
       )
-    }).catch(console.error)
+    }
+
+    const failed = [providersRes, settingsRes, meRes, tutorRes].find(
+      (result) => result.status === "rejected",
+    )
+    if (failed && failed.status === "rejected") {
+      setLoadError(
+        failed.reason instanceof Error
+          ? failed.reason.message
+          : "Some settings could not be loaded. Retry before changing anything.",
+      )
+    }
+    setLoadingSettings(false)
   }, [])
 
-  const addProvider = async () => {
-    if (!newProvider.provider_name || !newProvider.api_key || !newProvider.base_url || !newProvider.model) return
+  useEffect(() => {
+    // Initial fetch on mount. The lint rule matches setState anywhere in the
+    // callee, but every state update here happens after the awaited
+    // Promise.allSettled — nothing is set synchronously during the effect.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadSettings()
+  }, [loadSettings])
+
+  const announceTest = (result: ProviderTestResult) => {
+    if (result.ok) {
+      toast({
+        title: "Connection OK",
+        description: `${result.provider ?? "Provider"}${
+          typeof result.latency_ms === "number" ? ` · ${result.latency_ms} ms` : ""
+        }`,
+        variant: "success",
+      })
+    } else {
+      toast({
+        title: "Connection failed",
+        description: result.error ?? "Unknown provider error",
+        variant: "error",
+      })
+    }
+  }
+
+  const closeProviderForm = () => {
+    setShowAddProvider(false)
+    setEditingProviderId(null)
+    setDraftTest(null)
+    setNewProvider({ ...EMPTY_PROVIDER })
+  }
+
+  const openAddProvider = () => {
+    setConfirmDeleteId(null)
+    setEditingProviderId(null)
+    setDraftTest(null)
+    setNewProvider({ ...EMPTY_PROVIDER })
+    setShowAddProvider(true)
+  }
+
+  const openEditProvider = (provider: ProviderConfig) => {
+    setConfirmDeleteId(null)
+    setEditingProviderId(provider.id)
+    setDraftTest(null)
+    // The API key is never sent to the browser; blank means "keep it".
+    setNewProvider({
+      provider_name: provider.provider_name,
+      api_key: "",
+      base_url: provider.base_url,
+      model: provider.model,
+      protocol: provider.protocol,
+      priority: provider.priority,
+      task_routing: provider.task_routing,
+    })
+    setShowAddProvider(true)
+  }
+
+  const saveProvider = async () => {
+    const isEdit = Boolean(editingProviderId)
+    const missing =
+      !newProvider.provider_name.trim() ||
+      !newProvider.base_url.trim() ||
+      !newProvider.model.trim() ||
+      (!isEdit && !newProvider.api_key.trim())
+    if (missing) {
+      const message = isEdit
+        ? "Provider name, base URL and model are required."
+        : "Provider name, API key, base URL and model are all required."
+      setError(message)
+      toast({ title: "Provider not saved", description: message, variant: "error" })
+      return
+    }
+
+    setProviderSaving(true)
     try {
-      await api.settings.createProvider(newProvider)
-      const updated = await api.settings.getProviders()
-      setProviders(updated)
-      setShowAddProvider(false)
-      setNewProvider({ provider_name: "", api_key: "", base_url: "", model: "", protocol: "openai", priority: 0, task_routing: "conversation,correction,lesson" })
+      if (editingProviderId) {
+        const payload: Record<string, unknown> = {
+          provider_name: newProvider.provider_name.trim(),
+          base_url: newProvider.base_url.trim(),
+          model: newProvider.model.trim(),
+          protocol: newProvider.protocol,
+          priority: newProvider.priority,
+          task_routing: newProvider.task_routing,
+        }
+        if (newProvider.api_key.trim()) payload.api_key = newProvider.api_key
+        await api.settings.updateProvider(editingProviderId, payload)
+      } else {
+        await api.settings.createProvider(newProvider)
+      }
+      setProviders(await api.settings.getProviders())
+      toast({
+        title: isEdit ? "Provider updated" : "Provider saved",
+        description: newProvider.provider_name.trim(),
+        variant: "success",
+      })
+      closeProviderForm()
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save provider")
+      const message = err instanceof Error ? err.message : "Failed to save provider"
+      setError(message)
+      toast({ title: "Could not save the provider", description: message, variant: "error" })
+    } finally {
+      setProviderSaving(false)
+    }
+  }
+
+  const testDraftProvider = async () => {
+    if (!newProvider.base_url.trim() || !newProvider.model.trim()) {
+      toast({
+        title: "Nothing to test yet",
+        description: "Enter the base URL and model first.",
+        variant: "error",
+      })
+      return
+    }
+    if (!editingProviderId && !newProvider.api_key.trim()) {
+      toast({ title: "API key required", description: "Enter a key to test.", variant: "error" })
+      return
+    }
+
+    setTestingDraft(true)
+    setDraftTest(null)
+    try {
+      const result =
+        editingProviderId && !newProvider.api_key.trim()
+          ? await api.settings.testProvider(editingProviderId)
+          : await api.settings.testProviderDraft({
+              provider_name: newProvider.provider_name.trim() || "test",
+              protocol: newProvider.protocol,
+              base_url: newProvider.base_url.trim(),
+              model: newProvider.model.trim(),
+              api_key: newProvider.api_key,
+            })
+      setDraftTest(result)
+      announceTest(result)
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Connection test failed"
+      setDraftTest({ ok: false, error: message })
+      toast({ title: "Connection failed", description: message, variant: "error" })
+    } finally {
+      setTestingDraft(false)
+    }
+  }
+
+  const testSavedProvider = async (provider: ProviderConfig) => {
+    setTestingId(provider.id)
+    try {
+      const result = await api.settings.testProvider(provider.id)
+      setProviderTests((prev) => ({ ...prev, [provider.id]: result }))
+      announceTest(result)
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Connection test failed"
+      setProviderTests((prev) => ({ ...prev, [provider.id]: { ok: false, error: message } }))
+      toast({ title: "Connection failed", description: message, variant: "error" })
+    } finally {
+      setTestingId(null)
     }
   }
 
   const deleteProvider = async (id: string) => {
+    const removed = providers.find((provider) => provider.id === id)
     try {
       await api.settings.deleteProvider(id)
-      setProviders(providers.filter((p) => p.id !== id))
+      setProviders((current) => current.filter((provider) => provider.id !== id))
+      setConfirmDeleteId(null)
+      toast({
+        title: "Provider removed",
+        description: removed ? `${removed.provider_name} and its stored API key were deleted.` : undefined,
+        variant: "success",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to delete provider")
+      const message = err instanceof Error ? err.message : "Failed to delete provider"
+      setError(message)
+      toast({ title: "Could not remove the provider", description: message, variant: "error" })
     }
   }
 
@@ -143,8 +371,15 @@ export default function SettingsPage() {
       setPendingCefr(null)
       setPreferencesSaved(true)
       setTimeout(() => setPreferencesSaved(false), 2000)
+      toast({
+        title: "Preferences saved",
+        description: `Default level is now ${pendingCefr}; your learning path was regenerated.`,
+        variant: "success",
+      })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to update preferences and regenerate path")
+      const message = err instanceof Error ? err.message : "Failed to update preferences and regenerate path"
+      setError(message)
+      toast({ title: "Could not save preferences", description: message, variant: "error" })
     } finally {
       setSavingPreferences(false)
     }
@@ -169,8 +404,11 @@ export default function SettingsPage() {
       }
       setPreferencesSaved(true)
       setTimeout(() => setPreferencesSaved(false), 2000)
+      toast({ title: "Preferences saved", variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save preferences")
+      const message = err instanceof Error ? err.message : "Failed to save preferences"
+      setError(message)
+      toast({ title: "Could not save preferences", description: message, variant: "error" })
     } finally {
       setSavingPreferences(false)
     }
@@ -186,8 +424,11 @@ export default function SettingsPage() {
       setTutorProfile(updated)
       setTutorSaved(true)
       setTimeout(() => setTutorSaved(false), 2000)
+      toast({ title: "Tutor profile saved", variant: "success" })
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save tutor profile")
+      const message = err instanceof Error ? err.message : "Failed to save tutor profile"
+      setError(message)
+      toast({ title: "Could not save the tutor profile", description: message, variant: "error" })
     }
   }
 
@@ -197,11 +438,18 @@ export default function SettingsPage() {
     try {
       await api.settings.clearData()
       setSuccess("All data cleared successfully. Refreshing...")
+      toast({
+        title: "All learning data cleared",
+        description: "Your account and provider keys were kept.",
+        variant: "success",
+      })
       setTimeout(() => {
         window.location.reload()
       }, 1500)
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to clear data")
+      const message = err instanceof Error ? err.message : "Failed to clear data"
+      setError(message)
+      toast({ title: "Could not clear your data", description: message, variant: "error" })
     } finally {
       setClearing(false)
       setShowClearConfirm(false)
@@ -221,6 +469,30 @@ export default function SettingsPage() {
           {error}
           <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setError("")}>Dismiss</Button>
         </div>
+      )}
+
+      {loadError && (
+        <div role="alert" className="flex items-center gap-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{loadError}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setLoadError("")
+              setLoadingSettings(true)
+              void loadSettings()
+            }}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {loadingSettings && (
+        <p role="status" aria-live="polite" className="text-sm text-muted-foreground">
+          Loading your settings…
+        </p>
       )}
 
       {success && (
@@ -243,30 +515,85 @@ export default function SettingsPage() {
             <p className="text-sm text-muted-foreground">No providers configured. Add one to get started.</p>
           )}
           {providers.map((p) => (
-            <div key={p.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 rounded-lg bg-secondary">
-              <div className="space-y-1 min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{p.provider_name}</span>
-                  <Badge variant="secondary">{p.protocol}</Badge>
-                  <Badge className="max-w-full break-all whitespace-normal">{p.model}</Badge>
-                  {p.is_active ? (
-                    <Badge className="bg-green-600">Active</Badge>
-                  ) : (
-                    <Badge variant="outline">Inactive</Badge>
-                  )}
+            <div key={p.id} className="rounded-lg bg-secondary p-3 space-y-2">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{p.provider_name}</span>
+                    <Badge variant="secondary">{p.protocol}</Badge>
+                    <Badge className="max-w-full break-all whitespace-normal">{p.model}</Badge>
+                    {p.is_active ? (
+                      <Badge className="bg-green-600">Active</Badge>
+                    ) : (
+                      <Badge variant="outline">Inactive</Badge>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground break-all">{p.base_url}</p>
+                  <p className="text-xs text-muted-foreground">Tasks: {p.task_routing}</p>
                 </div>
-                <p className="text-xs text-muted-foreground break-all">{p.base_url}</p>
-                <p className="text-xs text-muted-foreground">Tasks: {p.task_routing}</p>
+                {confirmDeleteId === p.id ? (
+                  <div className="flex items-center gap-1 self-end sm:self-center shrink-0">
+                    <Button size="sm" variant="destructive" onClick={() => deleteProvider(p.id)}>
+                      Delete
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => setConfirmDeleteId(null)}>
+                      Cancel
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1 self-end sm:self-center shrink-0">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => void testSavedProvider(p)}
+                      disabled={testingId === p.id}
+                      title="Send a tiny completion to verify the key, URL and model"
+                    >
+                      {testingId === p.id ? (
+                        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <PlugZap className="mr-1 h-3.5 w-3.5" />
+                      )}
+                      Test
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => openEditProvider(p)}
+                      aria-label={`Edit ${p.provider_name}`}
+                      title="Edit provider"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setConfirmDeleteId(p.id)}
+                      aria-label={`Delete ${p.provider_name}`}
+                      title="Delete this provider and its stored API key"
+                    >
+                      <Trash2 className="h-4 w-4 text-destructive" />
+                    </Button>
+                  </div>
+                )}
               </div>
-              <Button variant="ghost" size="icon" onClick={() => deleteProvider(p.id)} className="self-end sm:self-center shrink-0">
-                <Trash2 className="h-4 w-4 text-destructive" />
-              </Button>
+              {providerTests[p.id] && <TestResultLine result={providerTests[p.id]} />}
             </div>
           ))}
 
           {showAddProvider ? (
             <Card>
-              <CardContent className="p-4 space-y-3">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">
+                  {editingProviderId ? "Edit provider" : "Add provider"}
+                </CardTitle>
+                <CardDescription>
+                  {editingProviderId
+                    ? "Leave the API key blank to keep the stored one."
+                    : "Keys are encrypted at rest and never sent back to the browser."}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <Label>Provider Name</Label>
@@ -291,7 +618,7 @@ export default function SettingsPage() {
                   <Label>API Key</Label>
                   <Input
                     type="password"
-                    placeholder="sk-..."
+                    placeholder={editingProviderId ? "Leave blank to keep the stored key" : "sk-..."}
                     value={newProvider.api_key}
                     onChange={(e) => setNewProvider({ ...newProvider, api_key: e.target.value })}
                   />
@@ -322,14 +649,42 @@ export default function SettingsPage() {
                     />
                   </div>
                 </div>
-                <div className="flex gap-2">
-                  <Button onClick={addProvider} size="sm">Save Provider</Button>
-                  <Button variant="outline" size="sm" onClick={() => setShowAddProvider(false)}>Cancel</Button>
+                {draftTest && <TestResultLine result={draftTest} />}
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={() => void saveProvider()} size="sm" disabled={providerSaving || testingDraft}>
+                    {providerSaving ? (
+                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Save className="mr-1 h-4 w-4" />
+                    )}
+                    {editingProviderId ? "Save changes" : "Save Provider"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void testDraftProvider()}
+                    disabled={testingDraft || providerSaving}
+                  >
+                    {testingDraft ? (
+                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                    ) : (
+                      <PlugZap className="mr-1 h-4 w-4" />
+                    )}
+                    Test connection
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={closeProviderForm}
+                    disabled={providerSaving || testingDraft}
+                  >
+                    Cancel
+                  </Button>
                 </div>
               </CardContent>
             </Card>
           ) : (
-            <Button variant="outline" onClick={() => setShowAddProvider(true)}>
+            <Button variant="outline" onClick={openAddProvider}>
               <Plus className="h-4 w-4 mr-1" />
               Add Provider
             </Button>

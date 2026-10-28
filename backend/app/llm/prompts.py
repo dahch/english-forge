@@ -584,11 +584,11 @@ def get_specialized_lesson_prompt(
     )
 
 
-def build_system_prompt(
-    scenario_key: str | None = None,
-    scenario_custom_prompt: str | None = None,
-    cefr_level: str = "B1",
-    tutor_profile: dict | None = None,
+def _build_role_context(
+    scenario_key: str | None,
+    scenario_custom_prompt: str | None,
+    cefr_level: str,
+    tutor_profile: dict | None,
 ) -> str:
     level_info = CEFR_LEVELS.get(cefr_level, CEFR_LEVELS["B1"])
 
@@ -609,7 +609,20 @@ def build_system_prompt(
 ## Student Level: {cefr_level}
 {level_info['description']}
 - {level_info['vocab_constraint']}
-- {level_info['correction_tolerance']}
+- {level_info['correction_tolerance']}"""
+
+
+def build_system_prompt(
+    scenario_key: str | None = None,
+    scenario_custom_prompt: str | None = None,
+    cefr_level: str = "B1",
+    tutor_profile: dict | None = None,
+) -> str:
+    """Non-streaming conversation prompt: one JSON call returns reply + review."""
+    context = _build_role_context(
+        scenario_key, scenario_custom_prompt, cefr_level, tutor_profile
+    )
+    return f"""{context}
 
 ## Response Format
 You MUST respond in valid JSON with this exact structure:
@@ -640,3 +653,61 @@ You MUST respond in valid JSON with this exact structure:
 5. Keep "reply" concise (1-3 sentences) to maintain conversation flow.
 6. Adapt your vocabulary and complexity to the {cefr_level} level.
 7. Stay in character for the scenario at all times in the "reply" field."""
+
+
+def build_streaming_system_prompt(
+    scenario_key: str | None = None,
+    scenario_custom_prompt: str | None = None,
+    cefr_level: str = "B1",
+    tutor_profile: dict | None = None,
+) -> str:
+    """Streaming conversation prompt: plain text only.
+
+    Streaming the structured JSON would show braces and field names to the
+    student, so the streamed call returns just the spoken reply and a separate
+    (non-streamed) call extracts corrections and vocabulary.
+    """
+    context = _build_role_context(
+        scenario_key, scenario_custom_prompt, cefr_level, tutor_profile
+    )
+    return f"""{context}
+
+## Response Format
+Reply with ONLY your in-character spoken response as plain text.
+Do not return JSON, markdown, labels, quotes around the whole reply, or corrections.
+
+## Rules
+1. Stay in character at all times.
+2. Keep the reply concise (1-3 sentences) and natural.
+3. Adapt vocabulary and complexity to the {cefr_level} level.
+4. Corrections are handled separately — never mention or format them."""
+
+
+def build_correction_analysis_prompt(student_text: str, cefr_level: str = "B1") -> str:
+    """Second-pass review for streamed turns (corrections + new vocabulary)."""
+    return f"""Analyze one message written by an English learner at {cefr_level} level.
+
+STUDENT MESSAGE:
+{student_text}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "corrections": [
+    {{
+      "error_type": "grammar|vocabulary|pronunciation|naturalness|word_order",
+      "original": "The exact phrase containing the error",
+      "correction": "The corrected version",
+      "explanation": "Brief explanation in Spanish"
+    }}
+  ],
+  "new_vocab": [
+    {{
+      "word": "A useful new word or expression",
+      "definition": "Definition in Spanish",
+      "example": "Example sentence using it"
+    }}
+  ]
+}}
+
+Corrections only for real errors (empty array if none). At most 3 vocabulary
+items, only when genuinely useful. Do not invent errors in correct sentences."""

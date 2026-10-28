@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 
 from sqlalchemy import select
@@ -22,6 +23,10 @@ class LLMRouter:
         self._db = db
         self._user_id = user_id
         self._providers: list[ChatProvider] | None = None
+        # Set once a streaming call starts producing: lets the caller label the
+        # partial reply without a second round-trip.
+        self.last_provider: str | None = None
+        self.last_model: str | None = None
 
     async def _load_providers(self) -> list[ChatProvider]:
         providers: list[ChatProvider] = []
@@ -188,6 +193,59 @@ class LLMRouter:
                 )
                 logger.warning(f"Provider {provider.provider_name} failed: {last_error}")
                 break
+
+        raise RuntimeError(f"All providers failed. Last error: {last_error}")
+
+    async def stream_with_fallback(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str,
+        *,
+        task: str = "conversation",
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> AsyncIterator[str]:
+        """Stream text chunks, falling back only before the first token.
+
+        Once a provider has produced output we cannot transparently switch:
+        the user would see two different replies concatenated. A mid-stream
+        failure is therefore raised to the caller, which decides whether to
+        keep the partial text or ask for a retry.
+        """
+        if self._providers is None:
+            self._providers = await self._load_providers()
+        if not self._providers:
+            raise RuntimeError("No LLM providers configured. Add at least one in Settings.")
+
+        last_error: Exception | None = None
+        for provider in self._providers:
+            produced = False
+            try:
+                async for chunk in provider.stream(
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ):
+                    if not chunk:
+                        continue
+                    if not produced:
+                        produced = True
+                        self.last_provider = provider.provider_name
+                        self.last_model = provider.model_name
+                    yield chunk
+                if produced:
+                    return
+                last_error = ValueError(
+                    f"Provider {provider.provider_name} returned an empty stream"
+                )
+                logger.warning("%s", last_error)
+            except Exception as e:  # noqa: BLE001 - fail over before first token
+                last_error = e
+                logger.warning(f"Provider {provider.provider_name} stream failed: {e}")
+                if produced:
+                    raise
+                continue
 
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 

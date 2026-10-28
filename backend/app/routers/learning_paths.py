@@ -23,6 +23,7 @@ from app.llm.prompts import (
     get_curriculum_seed,
     get_specialized_lesson_prompt,
 )
+from app.json_utils import load_json
 from app.llm.router import LLMRouter, parse_llm_json, parse_lesson_json
 from app.models.models import (
     Assessment,
@@ -82,6 +83,10 @@ class LearningPathResponse(BaseModel):
     created_at: datetime
     completed_at: datetime | None
     is_active: bool
+    # Transient: "llm" when the model produced the curriculum, "curriculum" when
+    # the deterministic seed was used because the model failed/timed out,
+    # "unknown" for paths read back from the database. Lets the UI be honest.
+    generation_source: str = "unknown"
 
     model_config = {"from_attributes": True}
 
@@ -519,9 +524,24 @@ async def _generate_path_for_user(
 
     assessment_info = ""
     if assessment:
-        strengths = json.loads(assessment.strengths) if assessment.strengths else []
-        weaknesses = json.loads(assessment.weaknesses) if assessment.weaknesses else []
-        recommendations = json.loads(assessment.recommendations) if assessment.recommendations else []
+        strengths = load_json(
+            assessment.strengths,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} strengths",
+        )
+        weaknesses = load_json(
+            assessment.weaknesses,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} weaknesses",
+        )
+        recommendations = load_json(
+            assessment.recommendations,
+            default=[],
+            expected_type=list,
+            context=f"assessment {assessment.id} recommendations",
+        )
         assessment_info = (
             f"Estimated level: {assessment.estimated_level}\n"
             f"Strengths: {', '.join(strengths)}\n"
@@ -605,6 +625,7 @@ async def _generate_path_for_user(
         )
 
     # Graceful fallback to curriculum template seed:
+    used_curriculum = not lessons_data
     if not lessons_data:
         logger.warning(
             f"Generated learning path had no usable lessons or timed out for user {current_user.id}. "
@@ -656,10 +677,13 @@ async def _generate_path_for_user(
 
     logger.info(
         f"Generated learning path {path.id} for user {current_user.id}: "
-        f"{path.current_level}->{path.target_level}, {len(lessons_data)} lessons"
+        f"{path.current_level}->{path.target_level}, {len(lessons_data)} lessons "
+        f"(source={'curriculum' if used_curriculum else 'llm'})"
     )
 
-    return await _get_path_with_lessons(db, path.id)
+    generated_path = await _get_path_with_lessons(db, path.id)
+    generated_path.generation_source = "curriculum" if used_curriculum else "llm"
+    return generated_path
 
 
 @router.get("/current", response_model=FullLearningPathResponse)
@@ -764,8 +788,18 @@ async def _generate_lesson_content(
         )
         assessment = a_result.scalar_one_or_none()
         if assessment:
-            strengths = json.loads(assessment.strengths) if assessment.strengths else []
-            weaknesses = json.loads(assessment.weaknesses) if assessment.weaknesses else []
+            strengths = load_json(
+                assessment.strengths,
+                default=[],
+                expected_type=list,
+                context=f"assessment {assessment.id} strengths",
+            )
+            weaknesses = load_json(
+                assessment.weaknesses,
+                default=[],
+                expected_type=list,
+                context=f"assessment {assessment.id} weaknesses",
+            )
             assessment_info = (
                 f"\nLearner assessment context (personalize toward weaknesses):\n"
                 f"Estimated level: {assessment.estimated_level or path.current_level}\n"

@@ -5,15 +5,18 @@ from datetime import datetime, date, timezone
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -28,6 +31,12 @@ def _uuid() -> str:
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "current_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_users_current_level",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
@@ -35,6 +44,10 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
     current_level: Mapped[str] = mapped_column(String(2), nullable=False, default="A1")
     assessment_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Bumped on password change / "sign out everywhere". Access tokens carry the
+    # value they were issued with, so a stale one stops matching immediately
+    # without a per-token denylist.
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -43,11 +56,36 @@ class User(Base):
     progress_entries: Mapped[list["ProgressDaily"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     settings: Mapped[list["Setting"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     provider_configs: Mapped[list["ProviderConfig"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     tutor_profile: Mapped["TutorProfile | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
     assessments: Mapped[list["Assessment"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     generated_lessons: Mapped[list["GeneratedLesson"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     library_completions: Mapped[list["LibraryLessonCompletion"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     learning_paths: Mapped[list["LearningPath"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class RefreshToken(Base):
+    """Rotating refresh token, stored hashed.
+
+    Only the SHA-256 of the raw token is persisted, so a database leak does not
+    hand out usable sessions. Rotation revokes the presented token and issues a
+    replacement; presenting an already-revoked token is treated as theft and
+    revokes every token for that user (ADR-022).
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    replaced_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="refresh_tokens")
 
 
 class TutorProfile(Base):
@@ -68,6 +106,19 @@ class TutorProfile(Base):
 
 class Scenario(Base):
     __tablename__ = "scenarios"
+    __table_args__ = (
+        CheckConstraint(
+            "cefr_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_scenarios_cefr_level",
+        ),
+        # Global scenarios are seeded once, even under concurrent first use.
+        Index(
+            "uq_scenarios_global_name",
+            text("lower(name)"),
+            unique=True,
+            sqlite_where=text("user_id IS NULL AND is_custom = 0"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
@@ -83,6 +134,12 @@ class Scenario(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "cefr_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_sessions_cefr_level",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -99,13 +156,24 @@ class Session(Base):
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        CheckConstraint("role IN ('user','assistant')", name="ck_messages_role"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     session_id: Mapped[str] = mapped_column(String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False)
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     audio_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # Python-side default with microsecond precision: SQLite's func.now() only
+    # has second precision, so two messages inserted in the same second would
+    # order randomly by UUID and scramble the conversation on reload.
+    # server_default keeps rows inserted outside the ORM valid.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
 
     session: Mapped["Session"] = relationship(back_populates="messages")
     corrections: Mapped[list["Correction"]] = relationship(back_populates="message", cascade="all, delete-orphan")
@@ -126,6 +194,13 @@ class Correction(Base):
 
 class VocabItem(Base):
     __tablename__ = "vocab_items"
+    __table_args__ = (
+        CheckConstraint("interval_days >= 0", name="ck_vocab_interval"),
+        CheckConstraint("ease_factor >= 1.3", name="ck_vocab_ease"),
+        # Case-insensitive uniqueness per user: the LLM and the manual form used
+        # to race on SELECT-then-INSERT and create duplicates.
+        Index("uq_vocab_items_user_word", "user_id", text("lower(word)"), unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -145,6 +220,16 @@ class VocabItem(Base):
 
 class Assessment(Base):
     __tablename__ = "assessments"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('mic_check','conversation','listening','speaking')",
+            name="ck_assessments_phase",
+        ),
+        CheckConstraint(
+            "estimated_level IS NULL OR estimated_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_assessments_level",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -170,6 +255,14 @@ class Assessment(Base):
     # LLM-rubric conversation dims. JSON: {grammar, vocabulary, fluency,
     # listening, pronunciation} — missing keys mean "not assessed".
     dimension_scores: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Difficulty-weighted CEFR band per dimension (independent of the raw
+    # accuracy in dimension_scores). The final level is the median of these.
+    dimension_bands: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set when the user explicitly abandons an in-progress assessment or it is
+    # reclaimed after inactivity. The partial unique index only covers
+    # `completed_at IS NULL AND abandoned_at IS NULL`, so abandoning frees the
+    # user to start a fresh attempt without fabricating a completed result.
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="assessments")
     # (created_at, id) — created_at uses func.now() (the transaction
@@ -184,6 +277,13 @@ class Assessment(Base):
 
 class AssessmentMessage(Base):
     __tablename__ = "assessment_messages"
+    __table_args__ = (
+        CheckConstraint("role IN ('user','assistant')", name="ck_assessment_messages_role"),
+        CheckConstraint(
+            "kind IN ('chat','mic_check','listening','speaking')",
+            name="ck_assessment_messages_kind",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     assessment_id: Mapped[str] = mapped_column(String(36), ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False)
@@ -253,6 +353,18 @@ class LibraryLessonCompletion(Base):
 
 class LearningPath(Base):
     __tablename__ = "learning_paths"
+    __table_args__ = (
+        CheckConstraint(
+            "current_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_learning_paths_current_level",
+        ),
+        CheckConstraint(
+            "target_level IN ('A1','A2','B1','B2','C1','C2')",
+            name="ck_learning_paths_target_level",
+        ),
+        CheckConstraint("lessons_required >= 0", name="ck_learning_paths_required"),
+        CheckConstraint("lessons_completed >= 0", name="ck_learning_paths_completed"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -288,7 +400,12 @@ class PathLesson(Base):
 
 class ProgressDaily(Base):
     __tablename__ = "progress_daily"
-    __table_args__ = (UniqueConstraint("date", "user_id", name="uq_progress_daily_date_user"),)
+    __table_args__ = (
+        UniqueConstraint("date", "user_id", name="uq_progress_daily_date_user"),
+        CheckConstraint("minutes_spoken >= 0", name="ck_progress_minutes"),
+        CheckConstraint("reviews_done >= 0", name="ck_progress_reviews"),
+        CheckConstraint("lessons_completed >= 0", name="ck_progress_lessons"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
@@ -316,7 +433,10 @@ class Setting(Base):
 
 class ProviderConfig(Base):
     __tablename__ = "provider_configs"
-    __table_args__ = (UniqueConstraint("provider_name", "user_id", name="uq_provider_config_name_user"),)
+    __table_args__ = (
+        UniqueConstraint("provider_name", "user_id", name="uq_provider_config_name_user"),
+        CheckConstraint("protocol IN ('openai','anthropic')", name="ck_provider_protocol"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)

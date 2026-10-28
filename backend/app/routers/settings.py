@@ -28,17 +28,32 @@ from app.models.models import (
     User,
     VocabItem,
 )
+from app.rate_limit import check_rate_limit, record_rate_limit
 from app.schemas.settings import (
     ProviderConfigCreate,
     ProviderConfigResponse,
     ProviderConfigUpdate,
+    ProviderTestRequest,
+    ProviderTestResponse,
     SettingResponse,
     UserSettingsUpdate,
 )
+from app.services.provider_test import probe_provider
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+# Probe budget per user: a stuck form must not hammer paid endpoints.
+_PROVIDER_TEST_LIMIT = 8
+_PROVIDER_TEST_WINDOW_SECONDS = 60
+
+
+def _enforce_provider_test_limit(user_id: str) -> None:
+    check_rate_limit(
+        "provider-test", user_id, _PROVIDER_TEST_LIMIT, _PROVIDER_TEST_WINDOW_SECONDS
+    )
+    record_rate_limit("provider-test", user_id, _PROVIDER_TEST_WINDOW_SECONDS)
 
 
 @router.get("/providers", response_model=list[ProviderConfigResponse])
@@ -85,7 +100,7 @@ async def create_provider(
 
     config = ProviderConfig(
         user_id=current_user.id,
-        provider_name=body.provider_name,
+        provider_name=body.provider_name.strip(),
         api_key_enc=encrypt_value(body.api_key),
         base_url=body.base_url,
         model=body.model,
@@ -128,8 +143,27 @@ async def update_provider(
     if not config:
         raise HTTPException(status_code=404, detail="Provider not found")
 
+    if body.provider_name is not None:
+        new_name = body.provider_name.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Provider name cannot be empty")
+        if new_name != config.provider_name:
+            duplicate = await db.execute(
+                select(ProviderConfig.id).where(
+                    ProviderConfig.user_id == current_user.id,
+                    ProviderConfig.provider_name == new_name,
+                    ProviderConfig.id != config.id,
+                )
+            )
+            if duplicate.first():
+                raise HTTPException(
+                    status_code=400, detail="A provider with that name already exists"
+                )
+            config.provider_name = new_name
     if body.api_key is not None:
-        config.api_key_enc = encrypt_value(body.api_key)
+        # An empty string from the edit form means "keep the stored key".
+        if body.api_key.strip():
+            config.api_key_enc = encrypt_value(body.api_key)
     if body.base_url is not None:
         config.base_url = body.base_url
     if body.model is not None:
@@ -157,6 +191,63 @@ async def update_provider(
         task_routing=config.task_routing,
         has_api_key=bool(config.api_key_enc),
     )
+
+
+@router.post("/providers/test", response_model=ProviderTestResponse)
+async def test_provider_draft(
+    body: ProviderTestRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Probe the values currently typed in the Settings form."""
+    _enforce_provider_test_limit(current_user.id)
+    result = await probe_provider(
+        protocol=body.protocol,
+        base_url=body.base_url.strip(),
+        api_key=body.api_key,
+        model=body.model.strip(),
+        label=body.provider_name.strip() or "test",
+    )
+    return ProviderTestResponse(**result)
+
+
+@router.post("/providers/{provider_id}/test", response_model=ProviderTestResponse)
+async def test_provider_saved(
+    provider_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Probe a stored provider using its decrypted key."""
+    result = await db.execute(
+        select(ProviderConfig).where(
+            ProviderConfig.id == provider_id,
+            ProviderConfig.user_id == current_user.id,
+        )
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if not config.api_key_enc:
+        raise HTTPException(status_code=400, detail="No API key stored for this provider")
+    try:
+        api_key = decrypt_value(config.api_key_enc)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The stored API key cannot be decrypted with the current key. "
+                "Re-add the provider."
+            ),
+        )
+
+    _enforce_provider_test_limit(current_user.id)
+    probe = await probe_provider(
+        protocol=config.protocol,
+        base_url=config.base_url,
+        api_key=api_key,
+        model=config.model,
+        label=config.provider_name,
+    )
+    return ProviderTestResponse(**probe)
 
 
 @router.delete("/providers/{provider_id}", status_code=204)

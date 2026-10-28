@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, date
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class CorrectionSchema(BaseModel):
@@ -47,7 +47,9 @@ class SessionCreate(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    text: str = Field(..., min_length=1)
+    # Same cap as assessment turns: an unbounded message is a cost/DoS vector
+    # for the LLM and bloats the history sent on every subsequent turn.
+    text: str = Field(..., min_length=1, max_length=2000)
 
 
 class CorrectionResponse(BaseModel):
@@ -65,11 +67,22 @@ class MessageResponse(BaseModel):
     session_id: str
     role: str
     text: str
+    # Kept for wire compatibility but always null: audio lives on disk and is
+    # fetched from the authenticated endpoint (never as a base64 blob).
     audio_url: Optional[str] = None
+    has_audio: bool = False
     created_at: datetime
     corrections: list[CorrectionResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _hide_audio_reference(self):
+        # Idempotent: FastAPI/Pydantic may validate the same instance again
+        # when it is nested in a response, and this must not reset the flag.
+        self.has_audio = bool(self.has_audio or self.audio_url)
+        self.audio_url = None
+        return self
 
 
 class SessionResponse(BaseModel):

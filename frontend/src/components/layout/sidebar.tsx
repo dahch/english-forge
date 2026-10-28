@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
-import { clearToken } from "@/lib/api"
+import { api, clearSessionState } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import {
@@ -32,8 +32,15 @@ export function Sidebar() {
   const pathname = usePathname()
   const router = useRouter()
 
-  const handleLogout = () => {
-    clearToken()
+  const handleLogout = async () => {
+    // Revoke the refresh token server-side and clear the HttpOnly cookies.
+    // A failed call must not trap the user: local state is cleared regardless.
+    try {
+      await api.auth.logout()
+    } catch {
+      // Session already gone / offline — still leave the app.
+    }
+    clearSessionState()
     router.push("/login")
   }
 
