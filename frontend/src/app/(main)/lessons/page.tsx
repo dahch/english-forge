@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -61,7 +61,11 @@ export default function LessonsPage() {
   const [generating, setGenerating] = useState(false)
   const [completing, setCompleting] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [generatedHasMore, setGeneratedHasMore] = useState(false)
+  const [loadingMoreGenerated, setLoadingMoreGenerated] = useState(false)
+  const generatedOffsetRef = useRef(0)
   const generatingSeconds = useElapsed(generating)
+  const GENERATED_PAGE_SIZE = 30
 
   useEffect(() => {
     loadAll()
@@ -83,13 +87,17 @@ export default function LessonsPage() {
     try {
       const [libRes, genRes, pathRes, meRes] = await Promise.allSettled([
         api.lessons.library(),
-        api.lessons.generated(),
+        api.lessons.generated(GENERATED_PAGE_SIZE, 0),
         api.learningPath.current(),
         api.auth.me(),
       ])
 
       if (libRes.status === "fulfilled") setLibraryLessons(libRes.value)
-      if (genRes.status === "fulfilled") setGeneratedLessons(genRes.value)
+      if (genRes.status === "fulfilled") {
+        setGeneratedLessons(genRes.value)
+        generatedOffsetRef.current = genRes.value.length
+        setGeneratedHasMore(genRes.value.length === GENERATED_PAGE_SIZE)
+      }
       if (pathRes.status === "fulfilled") setLearningPath(pathRes.value)
       if (meRes.status === "fulfilled") {
         const lvl = meRes.value.current_level || "B1"
@@ -100,6 +108,30 @@ export default function LessonsPage() {
       setLoadError(err instanceof Error ? err.message : "Failed to load lessons")
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadMoreGenerated = async () => {
+    setLoadingMoreGenerated(true)
+    try {
+      const page = await api.lessons.generated(
+        GENERATED_PAGE_SIZE,
+        generatedOffsetRef.current,
+      )
+      setGeneratedLessons((prev) => {
+        const seen = new Set(prev.map((lesson) => lesson.id))
+        return [...prev, ...page.filter((lesson) => !seen.has(lesson.id))]
+      })
+      generatedOffsetRef.current += page.length
+      setGeneratedHasMore(page.length === GENERATED_PAGE_SIZE)
+    } catch (err: unknown) {
+      toast({
+        title: "Could not load more lessons",
+        description: err instanceof Error ? err.message : "Try again.",
+        variant: "error",
+      })
+    } finally {
+      setLoadingMoreGenerated(false)
     }
   }
 
@@ -135,7 +167,9 @@ export default function LessonsPage() {
         topic: topic.trim() || undefined,
         level,
       })
-      setGeneratedLessons((prev) => [lesson, ...prev])
+      setGeneratedLessons((prev) => [lesson, ...prev.filter((item) => item.id !== lesson.id)])
+      // The new row shifts server-side pagination by one.
+      generatedOffsetRef.current += 1
       setActiveLesson(lesson)
       setExerciseAnswers({})
       setExerciseResults({})
@@ -636,7 +670,8 @@ export default function LessonsPage() {
               </CardContent>
             </Card>
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-4">
+              <div className="grid gap-4 md:grid-cols-2">
               {generatedLessons.map((lesson) => (
                 <Card
                   key={lesson.id}
@@ -685,6 +720,23 @@ export default function LessonsPage() {
                   </CardContent>
                 </Card>
               ))}
+              </div>
+
+              {generatedHasMore && (
+                <div className="text-center">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void loadMoreGenerated()}
+                    disabled={loadingMoreGenerated}
+                  >
+                    {loadingMoreGenerated && (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    )}
+                    {loadingMoreGenerated ? "Loading…" : "Load more lessons"}
+                  </Button>
+                </div>
+              )}
             </div>
           )}
         </TabsContent>

@@ -52,9 +52,14 @@ function VocabContent() {
   const [newExample, setNewExample] = useState("")
   const [newIpa, setNewIpa] = useState("")
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
   const [error, setError] = useState("")
   // Deleting a word also deletes its SRS history, so it asks first.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+  // Server-side pagination: the list grows over the user's lifetime, so it is
+  // fetched in pages instead of all at once.
+  const vocabOffsetRef = useRef(0)
 
   // View mode
   const [viewMode, setViewMode] = useState<ViewMode>("list")
@@ -106,22 +111,36 @@ function VocabContent() {
     }
   }
 
-  // Load vocabulary list
-  const loadVocab = useCallback(async () => {
-    setError("")
-    try {
-      const items = await api.vocab.list("all")
-      setAllVocab(items)
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to load vocabulary")
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const VOCAB_PAGE_SIZE = 100
+
+  // Load one page of the currently selected filter; `more` appends.
+  const loadVocab = useCallback(
+    async (more = false) => {
+      setError("")
+      if (more) setLoadingMore(true)
+      else setLoading(true)
+
+      const offset = more ? vocabOffsetRef.current : 0
+      try {
+        const items = await api.vocab.list(filter, VOCAB_PAGE_SIZE, offset)
+        setAllVocab((prev) => (more ? [...prev, ...items] : items))
+        vocabOffsetRef.current = offset + items.length
+        setHasMore(items.length === VOCAB_PAGE_SIZE)
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : "Failed to load vocabulary")
+      } finally {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    },
+    [filter],
+  )
 
   useEffect(() => {
+    // Filter switches refetch page 0 through the same callback.
+    vocabOffsetRef.current = 0
     Promise.resolve().then(() => {
-      void loadVocab()
+      void loadVocab(false)
     })
   }, [loadVocab])
 
@@ -1095,7 +1114,7 @@ function VocabContent() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={loadVocab}
+          onClick={() => void loadVocab()}
           disabled={loading}
           className="h-8 px-2 text-xs text-muted-foreground"
           title="Refresh vocabulary"
@@ -1226,6 +1245,23 @@ function VocabContent() {
               </CardContent>
             </Card>
           ))}
+
+          {hasMore && (
+            <div className="flex flex-col items-center gap-1 pt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void loadVocab(true)}
+                disabled={loadingMore}
+              >
+                {loadingMore && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}
+                {loadingMore ? "Loading…" : "Load more words"}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Showing {allVocab.length} loaded
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>

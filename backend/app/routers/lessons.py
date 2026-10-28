@@ -5,10 +5,11 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -268,11 +269,15 @@ async def check_exercise(
 async def list_generated_lessons(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     result = await db.execute(
         select(GeneratedLesson)
         .where(GeneratedLesson.user_id == current_user.id)
         .order_by(GeneratedLesson.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     )
     lessons = result.scalars().all()
     return [_serialize_generated_lesson(l) for l in lessons]

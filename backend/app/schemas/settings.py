@@ -17,13 +17,33 @@ class ProviderConfigCreate(BaseModel):
 
 
 class ProviderConfigUpdate(BaseModel):
+    provider_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
-    protocol: Optional[str] = None
+    protocol: Optional[str] = Field(default=None, pattern="^(openai|anthropic)$")
     is_active: Optional[bool] = None
     priority: Optional[int] = None
     task_routing: Optional[str] = None
+
+
+class ProviderTestRequest(BaseModel):
+    """Probe an unsaved provider configuration from the Settings form."""
+
+    provider_name: str = Field(default="test", max_length=100)
+    protocol: str = Field(default="openai", pattern="^(openai|anthropic)$")
+    base_url: str = Field(..., max_length=500)
+    model: str = Field(..., min_length=1, max_length=200)
+    api_key: str = Field(..., min_length=1, max_length=500)
+
+
+class ProviderTestResponse(BaseModel):
+    ok: bool
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    latency_ms: Optional[int] = None
+    reply: Optional[str] = None
+    error: Optional[str] = None
 
 
 class ProviderConfigResponse(BaseModel):

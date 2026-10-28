@@ -141,6 +141,15 @@ export interface ProviderConfig {
   has_api_key: boolean
 }
 
+export interface ProviderTestResult {
+  ok: boolean
+  provider?: string | null
+  model?: string | null
+  latency_ms?: number | null
+  reply?: string | null
+  error?: string | null
+}
+
 export interface DashboardStats {
   total_sessions: number
   total_minutes: number

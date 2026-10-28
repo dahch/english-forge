@@ -12,6 +12,7 @@ import type {
   Message,
   PathLessonDetail,
   ProviderConfig,
+  ProviderTestResult,
   QuizQuestion,
   QuizResult,
   RecordingResult,
@@ -256,7 +257,8 @@ export const api = {
   },
 
   vocab: {
-    list: (filter: string = "all") => request<VocabItem[]>(`/api/vocab?filter=${filter}`),
+    list: (filter: string = "all", limit: number = 100, offset: number = 0) =>
+      request<VocabItem[]>(`/api/vocab?filter=${filter}&limit=${limit}&offset=${offset}`),
     create: (data: { word: string; definition: string; example: string; ipa?: string | null }) =>
       request<VocabItem>("/api/vocab", {
         method: "POST",
@@ -298,7 +300,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ exercise_index: exerciseIndex, answer }),
       }),
-    generated: () => request<GeneratedLesson[]>("/api/lessons/generated"),
+    generated: (limit: number = 50, offset: number = 0) =>
+      request<GeneratedLesson[]>(`/api/lessons/generated?limit=${limit}&offset=${offset}`),
     checkGeneratedExercise: (lessonId: string, exerciseIndex: number, answer: string) =>
       request<ExerciseCheckResult>(`/api/lessons/generated/${lessonId}/exercise`, {
         method: "POST",
@@ -426,6 +429,21 @@ export const api = {
         body: JSON.stringify(data),
       }),
     deleteProvider: (id: string) => request<void>(`/api/settings/providers/${id}`, { method: "DELETE" }),
+    // One tiny completion against a stored provider (key decrypted server-side).
+    testProvider: (id: string) =>
+      request<ProviderTestResult>(`/api/settings/providers/${id}/test`, { method: "POST" }),
+    // Probe the values currently typed in the form, before saving them.
+    testProviderDraft: (data: {
+      provider_name?: string
+      protocol: string
+      base_url: string
+      model: string
+      api_key: string
+    }) =>
+      request<ProviderTestResult>("/api/settings/providers/test", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
     get: () => request<{ key: string; value: string }[]>("/api/settings"),
     update: (data: {
       stt_mode?: string

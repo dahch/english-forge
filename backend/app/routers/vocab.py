@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Annotated
 import random
 import re
 
@@ -33,6 +34,10 @@ async def list_vocab(
     filter: str = Query("all", pattern="^(all|due|new)$"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    # Annotated defaults are real ints, so direct handler calls in tests/scripts
+    # keep working (a Query(...) default would leak into them).
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     query = select(VocabItem).where(VocabItem.user_id == current_user.id)
     if filter == "due":
@@ -41,7 +46,7 @@ async def list_vocab(
         )
     elif filter == "new":
         query = query.where(VocabItem.interval_days == 0)
-    query = query.order_by(VocabItem.created_at.desc())
+    query = query.order_by(VocabItem.created_at.desc()).offset(offset).limit(limit)
 
     result = await db.execute(query)
     items = result.scalars().all()
