@@ -47,6 +47,8 @@ class ReviewCardResponse(BaseModel):
     ipa: Optional[str] = None
     ease_factor: float
     interval_days: int
+    next_review_at: Optional[date] = None
+    last_reviewed_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

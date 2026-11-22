@@ -174,9 +174,9 @@ async def clear_user_data(email: str, dry_run: bool = False):
         print("  - Deleted settings")
 
         # Reset user level and assessment status
-        user.current_level = "B1"
+        user.current_level = "A1"
         user.assessment_completed = False
-        print("  - Reset user level to B1 and assessment status")
+        print("  - Reset user level to A1 and assessment status")
 
         await db.commit()
         print("\nAll user data cleared successfully!")

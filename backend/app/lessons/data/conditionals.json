@@ -1,0 +1,44 @@
+{
+  "title": "Conditional Sentences",
+  "topic": "grammar",
+  "level": "B2",
+  "explanation": "Conditionals express hypothetical situations and their consequences. Zero: general truths (If + present, present). First: real future possibilities (If + present, will + verb). Second: unreal present/future (If + past simple, would + verb). Third: unreal past (If + past perfect, would have + past participle).",
+  "examples": [
+    "Zero: If you heat water to 100°C, it boils. (always true)",
+    "First: If it rains tomorrow, I will stay home. (real possibility)",
+    "Second: If I won the lottery, I would travel the world. (unreal/hypothetical)",
+    "Third: If I had studied harder, I would have passed the exam. (unreal past)"
+  ],
+  "exercises": [
+    {
+      "question": "If I ___ (be) you, I would accept the offer.",
+      "type": "fill_blank",
+      "answer": "were",
+      "explanation": "Second conditional: If + past simple. 'Were' is used for all persons in formal English."
+    },
+    {
+      "question": "If she ___ (study) more, she would have passed.",
+      "type": "fill_blank",
+      "answer": "had studied",
+      "explanation": "Third conditional: If + past perfect."
+    },
+    {
+      "question": "If it ___ (rain), we will cancel the picnic.",
+      "type": "fill_blank",
+      "answer": "rains",
+      "explanation": "First conditional: If + present simple."
+    },
+    {
+      "question": "If you mix red and blue, you ___ (get) purple.",
+      "type": "fill_blank",
+      "answer": "get",
+      "explanation": "Zero conditional: If + present, present. General truth."
+    },
+    {
+      "question": "I ___ (travel) the world if I had more money.",
+      "type": "fill_blank",
+      "answer": "would travel",
+      "explanation": "Second conditional: would + verb for hypothetical present/future."
+    }
+  ]
+}

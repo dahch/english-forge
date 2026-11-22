@@ -1,23 +1,58 @@
 "use client"
 
 import { useState, useEffect } from "react"
+import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Label } from "@/components/ui/label"
 import { api, type LibraryLesson } from "@/lib/api"
-import type { GeneratedLesson } from "@/lib/types"
-import { GraduationCap, CheckCircle2, XCircle, Sparkles, AlertCircle, Loader2, BookOpen, Check } from "lucide-react"
+import type { GeneratedLesson, LearningPath } from "@/lib/types"
+import {
+  GraduationCap,
+  CheckCircle2,
+  XCircle,
+  Sparkles,
+  AlertCircle,
+  Loader2,
+  BookOpen,
+  Check,
+  Route,
+  Lock,
+  ExternalLink,
+  ChevronRight,
+  Plus,
+  X,
+} from "lucide-react"
+
+const CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"] as const
+
+const TOPIC_SUGGESTIONS = [
+  "Job Interview Phrasal Verbs",
+  "Small Talk & Icebreakers",
+  "Past Continuous vs Past Simple",
+  "Conditionals (If & Would)",
+  "Business Email Writing",
+  "Ordering Food & Restaurants",
+]
 
 export default function LessonsPage() {
   const [libraryLessons, setLibraryLessons] = useState<LibraryLesson[]>([])
   const [generatedLessons, setGeneratedLessons] = useState<GeneratedLesson[]>([])
+  const [learningPath, setLearningPath] = useState<LearningPath | null>(null)
+  const [userLevel, setUserLevel] = useState<string>("B1")
+  const [showGenerateModal, setShowGenerateModal] = useState(false)
+  const [customTopic, setCustomTopic] = useState("")
+  const [customLevel, setCustomLevel] = useState("B1")
   const [loadError, setLoadError] = useState("")
   const [activeLesson, setActiveLesson] = useState<LibraryLesson | GeneratedLesson | null>(null)
   const [exerciseAnswers, setExerciseAnswers] = useState<Record<number, string>>({})
   const [exerciseResults, setExerciseResults] = useState<Record<number, { correct: boolean; correct_answer: string; explanation: string }>>({})
+  const [exerciseErrors, setExerciseErrors] = useState<Record<number, string>>({})
   const [checking, setChecking] = useState<Record<number, boolean>>({})
   const [generating, setGenerating] = useState(false)
   const [completing, setCompleting] = useState<string | null>(null)
@@ -27,12 +62,35 @@ export default function LessonsPage() {
     loadAll()
   }, [])
 
+  // Close modal on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && showGenerateModal && !generating) {
+        setShowGenerateModal(false)
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [showGenerateModal, generating])
+
   const loadAll = async () => {
     setLoading(true)
     try {
-      const [lib, gen] = await Promise.all([api.lessons.library(), api.lessons.generated()])
-      setLibraryLessons(lib)
-      setGeneratedLessons(gen)
+      const [libRes, genRes, pathRes, meRes] = await Promise.allSettled([
+        api.lessons.library(),
+        api.lessons.generated(),
+        api.learningPath.current(),
+        api.auth.me(),
+      ])
+
+      if (libRes.status === "fulfilled") setLibraryLessons(libRes.value)
+      if (genRes.status === "fulfilled") setGeneratedLessons(genRes.value)
+      if (pathRes.status === "fulfilled") setLearningPath(pathRes.value)
+      if (meRes.status === "fulfilled") {
+        const lvl = meRes.value.current_level || "B1"
+        setUserLevel(lvl)
+        setCustomLevel(lvl)
+      }
     } catch (err: unknown) {
       setLoadError(err instanceof Error ? err.message : "Failed to load lessons")
     } finally {
@@ -46,32 +104,41 @@ export default function LessonsPage() {
     if (!answer.trim()) return
 
     setChecking((prev) => ({ ...prev, [index]: true }))
+    setExerciseErrors((prev) => ({ ...prev, [index]: "" }))
     try {
       const result = isGeneratedLesson(activeLesson)
         ? await api.lessons.checkGeneratedExercise(activeLesson.id, index, answer)
         : await api.lessons.checkExercise(activeLesson.id, index, answer)
       setExerciseResults((prev) => ({ ...prev, [index]: result }))
     } catch (err: unknown) {
-      setExerciseResults((prev) => ({
+      setExerciseErrors((prev) => ({
         ...prev,
-        [index]: { correct: false, correct_answer: "", explanation: err instanceof Error ? err.message : "Check failed" },
+        [index]: err instanceof Error ? err.message : "Check failed. Please try again.",
       }))
     } finally {
       setChecking((prev) => ({ ...prev, [index]: false }))
     }
   }
 
-  const generateLesson = async () => {
+  const generateLessonOnDemand = async (topicOverride?: string, levelOverride?: string) => {
     setGenerating(true)
     setLoadError("")
     try {
-      const lesson = await api.lessons.generate()
+      const topic = topicOverride !== undefined ? topicOverride : customTopic
+      const level = levelOverride || customLevel || userLevel || "B1"
+      const lesson = await api.lessons.generate({
+        topic: topic.trim() || undefined,
+        level,
+      })
       setGeneratedLessons((prev) => [lesson, ...prev])
       setActiveLesson(lesson)
       setExerciseAnswers({})
       setExerciseResults({})
+      setExerciseErrors({})
+      setShowGenerateModal(false)
+      setCustomTopic("")
     } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : "Generation failed")
+      setLoadError(err instanceof Error ? err.message : "Lesson generation failed")
     } finally {
       setGenerating(false)
     }
@@ -85,6 +152,7 @@ export default function LessonsPage() {
       setGeneratedLessons((prev) =>
         prev.map((l) => (l.id === lesson.id ? { ...l, completed: true, completed_at: new Date().toISOString() } : l))
       )
+      setActiveLesson((prev) => (prev && prev.id === lesson.id ? { ...prev, completed: true } : prev))
     } catch (err: unknown) {
       setLoadError(err instanceof Error ? err.message : "Failed to mark complete")
     } finally {
@@ -92,41 +160,88 @@ export default function LessonsPage() {
     }
   }
 
-  const isGeneratedLesson = (lesson: LibraryLesson | GeneratedLesson): lesson is GeneratedLesson =>
-    "completed" in lesson
+  const toggleLibraryLessonComplete = async (lesson: LibraryLesson) => {
+    const nextStatus = !lesson.completed
+    setCompleting(lesson.id)
+    try {
+      await api.lessons.completeLibrary(lesson.id, nextStatus)
+      setLibraryLessons((prev) =>
+        prev.map((l) => (l.id === lesson.id ? { ...l, completed: nextStatus } : l))
+      )
+      setActiveLesson((prev) => (prev && prev.id === lesson.id ? { ...prev, completed: nextStatus } : prev))
+    } catch (err: unknown) {
+      setLoadError(err instanceof Error ? err.message : "Failed to update lesson completion")
+    } finally {
+      setCompleting(null)
+    }
+  }
 
-  // Library list items lack exercise data — fetch the full detail on open.
+  const isGeneratedLesson = (lesson: LibraryLesson | GeneratedLesson): lesson is GeneratedLesson =>
+    "completed" in lesson && "based_on_errors" in lesson
+
   const openLibraryLesson = async (lesson: LibraryLesson) => {
     setActiveLesson(lesson)
     setExerciseAnswers({})
     setExerciseResults({})
+    setExerciseErrors({})
     try {
       const detail = await api.lessons.get(lesson.id)
-      setActiveLesson((prev) => (prev && prev.id === lesson.id ? detail : prev))
+      setActiveLesson((prev) => (prev && prev.id === lesson.id ? { ...detail, completed: lesson.completed } : prev))
     } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : "Failed to load lesson")
+      setLoadError(err instanceof Error ? err.message : "Failed to load lesson detail")
       setActiveLesson(null)
     }
   }
 
   if (activeLesson) {
+    const isGen = isGeneratedLesson(activeLesson)
     return (
       <div className="max-w-2xl mx-auto p-4 sm:p-6 space-y-6">
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <Button variant="ghost" onClick={() => setActiveLesson(null)}>
             ← Back to Lessons
           </Button>
-          {isGeneratedLesson(activeLesson) && !activeLesson.completed && (
-            <Button size="sm" onClick={() => completeGeneratedLesson(activeLesson)} disabled={completing === activeLesson.id}>
-              {completing === activeLesson.id ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Check className="h-4 w-4 mr-1" />}
-              Mark Complete
+
+          {isGen ? (
+            <Button
+              size="sm"
+              variant={activeLesson.completed ? "outline" : "default"}
+              onClick={() => completeGeneratedLesson(activeLesson)}
+              disabled={completing === activeLesson.id || activeLesson.completed}
+            >
+              {completing === activeLesson.id ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-1" />
+              ) : (
+                <Check className={`h-4 w-4 mr-1 ${activeLesson.completed ? "text-emerald-600 dark:text-emerald-400" : ""}`} />
+              )}
+              {activeLesson.completed ? "Completed" : "Mark Complete"}
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant={activeLesson.completed ? "outline" : "default"}
+              onClick={() => toggleLibraryLessonComplete(activeLesson as LibraryLesson)}
+              disabled={completing === activeLesson.id}
+            >
+              {completing === activeLesson.id ? (
+                <Loader2 className="h-4 w-4 animate-spin mr-1" />
+              ) : (
+                <Check className={`h-4 w-4 mr-1 ${activeLesson.completed ? "text-emerald-600 dark:text-emerald-400" : ""}`} />
+              )}
+              {activeLesson.completed ? "Completed (Click to unmark)" : "Mark Complete"}
             </Button>
           )}
         </div>
+
         <div>
           <div className="flex items-center gap-2 mb-2">
             <h1 className="text-2xl font-bold">{activeLesson.title}</h1>
             {"level" in activeLesson && activeLesson.level && <Badge>{activeLesson.level}</Badge>}
+            {activeLesson.completed && (
+              <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400 border-emerald-500/30 gap-1">
+                <Check className="h-3 w-3" /> Done
+              </Badge>
+            )}
           </div>
           <p className="text-muted-foreground">{activeLesson.explanation}</p>
         </div>
@@ -158,43 +273,56 @@ export default function LessonsPage() {
                   <CardContent className="p-4 space-y-3">
                     <p className="font-medium">{ex.question}</p>
                     {!result ? (
-                      isMultipleChoice ? (
-                        <div className="flex flex-wrap gap-2">
-                          {options!.map((opt) => (
-                            <Button
-                              key={opt}
-                              size="sm"
-                              variant={exerciseAnswers[i] === opt ? "default" : "outline"}
-                              disabled={checking[i]}
-                              onClick={() => {
-                                setExerciseAnswers((prev) => ({ ...prev, [i]: opt }))
-                                checkExercise(i, opt)
-                              }}
-                            >
-                              {opt}
+                      <div className="space-y-2">
+                        {isMultipleChoice ? (
+                          <div className="flex flex-wrap gap-2" role="group" aria-label={`Options for exercise ${i + 1}`}>
+                            {options!.map((opt) => (
+                              <Button
+                                key={opt}
+                                size="sm"
+                                variant={exerciseAnswers[i] === opt ? "default" : "outline"}
+                                disabled={checking[i]}
+                                onClick={() => {
+                                  setExerciseAnswers((prev) => ({ ...prev, [i]: opt }))
+                                  checkExercise(i, opt)
+                                }}
+                              >
+                                {opt}
+                              </Button>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="flex gap-2">
+                            <Input
+                              placeholder="Your answer"
+                              aria-label={`Your answer for exercise ${i + 1}: ${ex.question}`}
+                              value={exerciseAnswers[i] || ""}
+                              onChange={(e) => setExerciseAnswers((prev) => ({ ...prev, [i]: e.target.value }))}
+                              onKeyDown={(e) => e.key === "Enter" && checkExercise(i)}
+                            />
+                            <Button size="sm" onClick={() => checkExercise(i)} disabled={!exerciseAnswers[i] || checking[i]}>
+                              {checking[i] ? <Loader2 className="h-4 w-4 animate-spin" /> : "Check"}
                             </Button>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="flex gap-2">
-                          <Input
-                            placeholder="Your answer"
-                            value={exerciseAnswers[i] || ""}
-                            onChange={(e) => setExerciseAnswers((prev) => ({ ...prev, [i]: e.target.value }))}
-                            onKeyDown={(e) => e.key === "Enter" && checkExercise(i)}
-                          />
-                          <Button size="sm" onClick={() => checkExercise(i)} disabled={!exerciseAnswers[i] || checking[i]}>
-                            {checking[i] ? <Loader2 className="h-4 w-4 animate-spin" /> : "Check"}
-                          </Button>
-                        </div>
-                      )
+                          </div>
+                        )}
+                        {exerciseErrors[i] && (
+                          <p role="alert" className="text-xs text-destructive flex items-center gap-1 mt-1">
+                            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                            <span>{exerciseErrors[i]}</span>
+                          </p>
+                        )}
+                      </div>
                     ) : (
-                      <div className={`flex items-start gap-2 text-sm ${result.correct ? "text-green-400" : "text-destructive"}`}>
-                        {result.correct ? <CheckCircle2 className="h-4 w-4 mt-0.5" /> : <XCircle className="h-4 w-4 mt-0.5" />}
+                      <div
+                        role="status"
+                        aria-live="polite"
+                        className={`flex items-start gap-2 text-sm ${result.correct ? "text-emerald-600 dark:text-emerald-400 font-medium" : "text-destructive"}`}
+                      >
+                        {result.correct ? <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" /> : <XCircle className="h-4 w-4 mt-0.5 shrink-0" />}
                         <div>
                           <p>{result.explanation}</p>
                           {!result.correct && result.correct_answer && (
-                            <p className="text-muted-foreground">Correct answer: <strong>{result.correct_answer}</strong></p>
+                            <p className="text-muted-foreground font-normal mt-1">Correct answer: <strong>{result.correct_answer}</strong></p>
                           )}
                         </div>
                       </div>
@@ -240,13 +368,14 @@ export default function LessonsPage() {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <h1 className="text-2xl font-bold flex items-center gap-2">
           <GraduationCap className="h-6 w-6 text-primary" />
-          Lessons
+          Lessons Hub
         </h1>
-        <Button onClick={generateLesson} disabled={generating} className="w-full sm:w-auto shrink-0">
-          <Sparkles className="h-4 w-4 mr-1" />
-          {generating ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
-          {generating ? "Generating..." : "Generate Lesson"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button onClick={() => setShowGenerateModal(true)} className="gap-1 shadow-sm">
+            <Sparkles className="h-4 w-4" />
+            Generate Lesson
+          </Button>
+        </div>
       </div>
 
       {loadError && (
@@ -259,59 +388,378 @@ export default function LessonsPage() {
         </div>
       )}
 
+      {/* Generate Custom Lesson Dialog */}
+      {showGenerateModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="generate-lesson-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-150"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !generating) {
+              setShowGenerateModal(false)
+            }
+          }}
+        >
+          <Card className="w-full max-w-lg shadow-2xl border-primary/20" onClick={(e) => e.stopPropagation()}>
+            <CardHeader className="flex flex-row items-start justify-between pb-4">
+              <div>
+                <CardTitle id="generate-lesson-modal-title" className="text-xl flex items-center gap-2">
+                  <Sparkles className="h-5 w-5 text-primary" />
+                  Generate Lesson on Any Topic
+                </CardTitle>
+                <CardDescription>
+                  Choose a topic and CEFR level to generate an interactive AI lesson with explanations and exercises.
+                </CardDescription>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                aria-label="Close dialog"
+                onClick={() => !generating && setShowGenerateModal(false)}
+                disabled={generating}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="custom-topic-input">Topic or Language Point</Label>
+                <Input
+                  id="custom-topic-input"
+                  autoFocus
+                  placeholder="e.g., Job Interview Phrasal Verbs, Past Continuous vs Simple..."
+                  value={customTopic}
+                  onChange={(e) => setCustomTopic(e.target.value)}
+                  disabled={generating}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !generating) {
+                      e.preventDefault()
+                      generateLessonOnDemand()
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label className="text-xs text-muted-foreground">Popular Topic Suggestions:</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {TOPIC_SUGGESTIONS.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => setCustomTopic(s)}
+                      disabled={generating}
+                      className="text-xs px-2.5 py-1 rounded-full bg-secondary hover:bg-primary/20 text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      + {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="custom-level-select">CEFR Target Level</Label>
+                <Select value={customLevel} onValueChange={setCustomLevel} disabled={generating}>
+                  <SelectTrigger id="custom-level-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CEFR_LEVELS.map((lvl) => (
+                      <SelectItem key={lvl} value={lvl}>
+                        {lvl} {lvl === userLevel ? "(Your Current Level)" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <Button
+                  variant="outline"
+                  onClick={() => setShowGenerateModal(false)}
+                  disabled={generating}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={() => generateLessonOnDemand()}
+                  disabled={generating}
+                  className="gap-2"
+                >
+                  {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                  {generating ? "Crafting Lesson..." : "Generate Lesson"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
       <Tabs defaultValue="library">
-        <TabsList>
-          <TabsTrigger value="library" className="gap-1"><BookOpen className="h-4 w-4" /> Library</TabsTrigger>
-          <TabsTrigger value="generated" className="gap-1"><Sparkles className="h-4 w-4" /> Generated ({generatedLessons.length})</TabsTrigger>
+        <TabsList className="grid grid-cols-3 w-full max-w-md">
+          <TabsTrigger value="library" className="gap-1.5">
+            <BookOpen className="h-4 w-4" /> Library
+          </TabsTrigger>
+          <TabsTrigger value="generated" className="gap-1.5">
+            <Sparkles className="h-4 w-4" /> Generated ({generatedLessons.length})
+          </TabsTrigger>
+          <TabsTrigger value="path" className="gap-1.5">
+            <Route className="h-4 w-4" /> Learning Path
+          </TabsTrigger>
         </TabsList>
 
+        {/* Library Lessons Tab */}
         <TabsContent value="library" className="mt-4">
           <div className="grid gap-4 md:grid-cols-2">
             {libraryLessons.map((lesson) => (
-              <Card key={lesson.id} className="cursor-pointer hover:border-primary/50 transition-colors" onClick={() => openLibraryLesson(lesson)}>
+              <Card
+                key={lesson.id}
+                role="button"
+                tabIndex={0}
+                aria-label={`Lesson: ${lesson.title}, Level ${lesson.level}, ${lesson.completed ? "Completed" : "Not completed"}`}
+                className="cursor-pointer hover:border-primary/50 focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none transition-colors relative"
+                onClick={() => openLibraryLesson(lesson)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault()
+                    openLibraryLesson(lesson)
+                  }
+                }}
+              >
                 <CardHeader>
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-lg">{lesson.title}</CardTitle>
+                  <div className="flex items-center justify-between gap-2">
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      {lesson.title}
+                      {lesson.completed && (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      )}
+                    </CardTitle>
                     <Badge variant="secondary">{lesson.level}</Badge>
                   </div>
                   <CardDescription>{lesson.topic}</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <p className="text-sm text-muted-foreground line-clamp-2">{lesson.explanation}</p>
-                  <p className="text-xs text-muted-foreground mt-2">{lesson.exercise_count} exercises</p>
+                  <div className="flex items-center justify-between mt-3 text-xs text-muted-foreground">
+                    <span>{lesson.exercise_count} exercises</span>
+                    {lesson.completed ? (
+                      <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400 border-emerald-500/30 gap-1 text-[11px]">
+                        <Check className="h-3 w-3" /> Completed
+                      </Badge>
+                    ) : (
+                      <span className="text-primary/80 font-medium">Practice Now →</span>
+                    )}
+                  </div>
                 </CardContent>
               </Card>
             ))}
           </div>
         </TabsContent>
 
+        {/* AI Generated Lessons Tab */}
         <TabsContent value="generated" className="mt-4">
           {generatedLessons.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">
-              <Sparkles className="h-12 w-12 mx-auto mb-4 opacity-50" />
-              <p>No personalized lessons yet. Generate one based on your mistakes!</p>
-            </div>
+            <Card className="text-center py-12">
+              <CardContent className="space-y-4">
+                <Sparkles className="h-12 w-12 mx-auto text-primary opacity-60" />
+                <div>
+                  <h3 className="text-lg font-semibold">No Generated Lessons Yet</h3>
+                  <p className="text-sm text-muted-foreground mt-1 max-w-md mx-auto">
+                    Generate an interactive lesson on any topic you want to master, or let EnglishForge build one based on your speaking mistakes.
+                  </p>
+                </div>
+                <Button onClick={() => setShowGenerateModal(true)} className="gap-2">
+                  <Plus className="h-4 w-4" />
+                  Generate First Lesson
+                </Button>
+              </CardContent>
+            </Card>
           ) : (
             <div className="grid gap-4 md:grid-cols-2">
               {generatedLessons.map((lesson) => (
-                <Card key={lesson.id} className={`cursor-pointer hover:border-primary/50 transition-colors ${lesson.completed ? "opacity-70" : ""}`} onClick={() => { setActiveLesson(lesson); setExerciseAnswers({}); setExerciseResults({}) }}>
+                <Card
+                  key={lesson.id}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Generated Lesson: ${lesson.title}, Level ${lesson.level || "General"}, ${lesson.completed ? "Completed" : "Not completed"}`}
+                  className={`cursor-pointer hover:border-primary/50 focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none transition-colors ${lesson.completed ? "opacity-80" : ""}`}
+                  onClick={() => {
+                    setActiveLesson(lesson)
+                    setExerciseAnswers({})
+                    setExerciseResults({})
+                    setExerciseErrors({})
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault()
+                      setActiveLesson(lesson)
+                      setExerciseAnswers({})
+                      setExerciseResults({})
+                      setExerciseErrors({})
+                    }
+                  }}
+                >
                   <CardHeader>
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                       <CardTitle className="text-lg flex items-center gap-2">
                         {lesson.title}
-                        {lesson.completed && <Check className="h-4 w-4 text-green-400" />}
+                        {lesson.completed && <Check className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0" />}
                       </CardTitle>
                       {lesson.level && <Badge variant="secondary">{lesson.level}</Badge>}
                     </div>
-                    <CardDescription>{lesson.based_on_errors || "Personalized"}</CardDescription>
+                    <CardDescription>{lesson.based_on_errors || "Personalized Topic"}</CardDescription>
                   </CardHeader>
                   <CardContent>
                     <p className="text-sm text-muted-foreground line-clamp-2">{lesson.explanation}</p>
-                    <p className="text-xs text-muted-foreground mt-2">{lesson.exercises?.length || 0} exercises</p>
+                    <div className="flex items-center justify-between mt-3 text-xs text-muted-foreground">
+                      <span>{lesson.exercises?.length || 0} exercises</span>
+                      {lesson.completed ? (
+                        <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400 border-emerald-500/30 gap-1 text-[11px]">
+                          <Check className="h-3 w-3" /> Completed
+                        </Badge>
+                      ) : (
+                        <span className="text-primary/80 font-medium">Open Lesson →</span>
+                      )}
+                    </div>
                   </CardContent>
                 </Card>
               ))}
             </div>
+          )}
+        </TabsContent>
+
+        {/* Learning Path Curriculum Tab */}
+        <TabsContent value="path" className="mt-4">
+          {learningPath ? (
+            <Card>
+              <CardHeader>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div>
+                    <CardTitle className="text-xl flex items-center gap-2">
+                      <Route className="h-5 w-5 text-primary" />
+                      Active Curriculum: {learningPath.current_level} → {learningPath.target_level}
+                    </CardTitle>
+                    <CardDescription className="mt-1">
+                      {learningPath.lessons_completed} of {learningPath.lessons_required} lessons completed
+                    </CardDescription>
+                  </div>
+                  <Link href="/learning-path">
+                    <Button variant="outline" size="sm" className="gap-1.5">
+                      Open Full Learning Path
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </Button>
+                  </Link>
+                </div>
+                {/* Visual progress bar */}
+                <div
+                  role="progressbar"
+                  aria-valuenow={Math.round((learningPath.lessons_completed / (learningPath.lessons_required || 1)) * 100)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Learning path progress: ${learningPath.lessons_completed} of ${learningPath.lessons_required} lessons completed`}
+                  className="w-full bg-secondary rounded-full h-2 mt-4 overflow-hidden"
+                >
+                  <div
+                    className="bg-primary h-full transition-all duration-300 rounded-full"
+                    style={{
+                      width: `${Math.round((learningPath.lessons_completed / (learningPath.lessons_required || 1)) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-3 pt-2">
+                {learningPath.path_lessons && learningPath.path_lessons.length > 0 ? (
+                  (() => {
+                    const firstIncompleteIdx = learningPath.path_lessons.findIndex((l) => !l.completed)
+                    return learningPath.path_lessons.map((pl, idx) => {
+                      const isCompleted = pl.completed
+                      const isCurrent = !isCompleted && (idx === firstIncompleteIdx || firstIncompleteIdx === -1)
+                      const isLocked = !isCompleted && !isCurrent
+
+                      return (
+                        <div
+                          key={pl.id}
+                          className={`flex items-center justify-between p-3 rounded-lg border transition-colors ${
+                            isCompleted
+                              ? "bg-secondary/40 border-border/50"
+                              : isCurrent
+                              ? "bg-primary/5 border-primary/40 shadow-sm"
+                              : "bg-background/50 border-border/30 opacity-60"
+                          }`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div
+                              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold ${
+                                isCompleted
+                                  ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                                  : isCurrent
+                                  ? "bg-primary text-primary-foreground"
+                                  : "bg-muted text-muted-foreground"
+                              }`}
+                            >
+                              {isCompleted ? (
+                                <Check className="h-3.5 w-3.5" />
+                              ) : isLocked ? (
+                                <Lock className="h-3 w-3" />
+                              ) : (
+                                pl.order
+                              )}
+                            </div>
+                            <div>
+                              <p className="text-sm font-medium">{pl.topic}</p>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <Badge variant="outline" className="text-[10px] px-1.5 py-0 capitalize">
+                                  {pl.lesson_type}
+                                </Badge>
+                                <span className="text-xs text-muted-foreground line-clamp-1">{pl.description}</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {isCompleted ? (
+                              <Badge variant="secondary" className="text-xs">Done</Badge>
+                            ) : isCurrent ? (
+                              <Link href="/learning-path">
+                                <Button size="sm" className="h-8 text-xs gap-1">
+                                  Resume <ChevronRight className="h-3 w-3" />
+                                </Button>
+                              </Link>
+                            ) : (
+                              <Badge variant="outline" className="text-xs text-muted-foreground">Locked</Badge>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })
+                  })()
+                ) : (
+                  <p className="text-sm text-muted-foreground text-center py-4">No curriculum lessons loaded.</p>
+                )}
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="text-center py-12">
+              <CardContent className="space-y-4">
+                <Route className="h-12 w-12 mx-auto text-primary opacity-60" />
+                <div>
+                  <h3 className="text-lg font-semibold">No Active Learning Path</h3>
+                  <p className="text-sm text-muted-foreground mt-1 max-w-md mx-auto">
+                    Take the diagnostic assessment or generate a tailored CEFR path to unlock a sequential curriculum.
+                  </p>
+                </div>
+                <div className="flex justify-center gap-3">
+                  <Link href="/assessment">
+                    <Button variant="outline">Take Assessment</Button>
+                  </Link>
+                  <Link href="/learning-path">
+                    <Button>Go to Learning Path</Button>
+                  </Link>
+                </div>
+              </CardContent>
+            </Card>
           )}
         </TabsContent>
       </Tabs>

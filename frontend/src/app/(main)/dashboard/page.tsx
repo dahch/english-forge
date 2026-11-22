@@ -20,6 +20,7 @@ import {
   MapPin,
   Sparkles,
   AlertCircle,
+  ArrowRight,
 } from "lucide-react"
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts"
 
@@ -172,19 +173,38 @@ export default function DashboardPage() {
       )}
 
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-        {statCards.map((card) => (
-          <Card key={card.label}>
-            <CardContent className="p-4 flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10">
-                <card.icon className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold">{card.value}</p>
-                <p className="text-xs text-muted-foreground">{card.label}</p>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
+        {statCards.map((card) => {
+          const isDue = card.label === "Due for Review"
+          const hasDue = isDue && (stats?.due_for_review ?? 0) > 0
+          return (
+            <Card
+              key={card.label}
+              className={hasDue ? "border-primary/40 bg-primary/5 shadow-sm transition-all hover:border-primary" : ""}
+            >
+              <CardContent className="p-4 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-3">
+                  <div className={`p-2 rounded-lg ${hasDue ? "bg-primary text-primary-foreground" : "bg-primary/10 text-primary"}`}>
+                    <card.icon className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <p className="text-2xl font-bold">{card.value}</p>
+                    <p className="text-xs text-muted-foreground">{card.label}</p>
+                  </div>
+                </div>
+                {hasDue && (
+                  <Button
+                    size="sm"
+                    className="shrink-0 text-xs h-8 px-2.5 font-medium shadow-sm gap-1"
+                    onClick={() => router.push("/vocab?mode=review")}
+                  >
+                    Review Now
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          )
+        })}
       </div>
 
       {weekly.length > 0 && (

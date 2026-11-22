@@ -99,7 +99,100 @@
 - **Date**: 2026-09-06
 - **Status**: Accepted
 - **Context**: LLMs routinely return JSON wrapped in markdown fences, preceded/followed by prose, with smart quotes or trailing commas, double-encoded strings, or a non-dict top-level shape. Every LLM-backed feature (conversation corrections, assessment messages, assessment analysis, lesson generation, learning path generation) previously assumed well-formed JSON and would crash or persist broken data.
-- **Decision**: Centralized parsing in `parse_llm_json()` (`backend/app/llm/router.py`) with a layered fallback: strip code fences (`_strip_code_fences`) → try `json.loads` → repair smart quotes/trailing commas (`_repair_json`) → extract balanced `{...}` blocks respecting string literals (`_extract_balanced_objects`) → regex extraction of the conversational `reply`/`corrections`/`new_vocab` shape. `parse_llm_json` always returns a dict — a top-level JSON array is wrapped as `{"items": [...]}`. A strict variant, `parse_lesson_json()`, raises `ValueError` when no lesson-shaped object is found so lesson generation fails loudly instead of persisting an empty lesson. On top of parsing, the multi-step flows (assessment message, assessment analysis, learning path generation, lesson generation) retry the entire LLM call up to 3 times, logging the raw response between attempts, and surface HTTP 503 only after all attempts fail. Learning path generation additionally validates the parsed shape (lessons list, allowed `lesson_type` values) per attempt and retries on unusable output.
-- **Consequences**:
+- **Decision**: Centralized parsing in `parse_llm_json()` (`backend/app/llm/router.py`) with a layered fallback: strip code fences (`_strip_code_fences`) → try `json.loads` → repair smart quotes/trailing commas (`_repair_json`) → extract balanced `{...}` blocks respecting string literals (`_extract_balanced_objects`) → regex extraction of the conversational `reply`/`corrections`/`new_vocab` shape. `parse_llm_json` always returns a dict — a top-level JSON array is wrapped as `{"items": [...]}`. A strict variant, `parse_lesson_json()`, raises `ValueError` when no lesson-shaped object is found so lesson generation fails loudly instead of persisting an empty lesson. On top of parsing, the multi-step flows (assessment message, assessment analysis, learning path generation, lesson generation, path-lesson content generation) retry the entire LLM call up to 3 times, logging the raw response between attempts; the content-generating flows (lesson generation, learning path generation, path-lesson content generation) surface HTTP 503 only after all attempts fail. The conversation turn never fails the request: a total LLM outage degrades to a fixed recovery line so the conversation stays alive and the student's next message retries with full history. The LLM router additionally treats HTTP 200 with empty `content` as a provider failure: `reasoning_content` (the model's raw chain-of-thought) is deliberately **never** used as a reply — leaking it is worse than retrying — so the router retries the same provider once with a quadrupled token budget when `finish_reason="length"` (reasoning models can burn the whole budget thinking; any other empty content fails the provider immediately, since more tokens won't help), and only then fails over to the next provider. The assessment analysis goes one step further — after all failed attempts it completes with a deterministic fallback built from the measured evidence instead of erroring (the /complete request must never fail on an LLM outage; "Re-analyze Results" retries the LLM later). Learning path generation additionally validates the parsed shape (lessons list, allowed `lesson_type` values) per attempt and retries on unusable output.
+- **Consequences**: 
   - Pros: Resilient to real-world LLM output across providers; no silent persistence of broken JSON; failures observable via raw-response logs; single parsing entry point keeps behavior consistent.
   - Cons: The conversational regex fallback can mask genuinely malformed responses (they degrade to plain text); retries add latency and cost on persistent failures; callers must choose correctly between the tolerant (`parse_llm_json`) and strict (`parse_lesson_json`) entry points.
+
+## ADR-011: SQLite-Only Persistence with WAL Mode
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The stack originally planned a PostgreSQL container alongside the backend. For a self-hosted personal app, the separate database service was pure operational overhead (another container to back up, monitor and upgrade), while the real workload — a handful of users issuing short transactions — is well within SQLite's reach under WAL. Concurrent requests (e.g. a message POST racing TTS-job polling) still needed explicit tuning to avoid "database is locked" errors.
+- **Decision**: Standardized on SQLite as the only supported database. `DATABASE_URL` defaults to `sqlite+aiosqlite:///./data/englishforge.db`; the file lives on the `backend_data` volume (`/app/data`) in Docker. At connection time the engine sets `PRAGMA journal_mode=WAL`, `busy_timeout=30000`, `synchronous=NORMAL` and `foreign_keys=ON` (without the last one, the `ondelete` CASCADE/SET NULL rules in `models.py` never fire). `backend/app/database.py` fails fast with a clear error if `DATABASE_URL` points anywhere other than SQLite (asyncpg was removed from requirements). The PostgreSQL service was dropped from Docker Compose; deployments upgrading from the removed stack must migrate their data to SQLite manually.
+- **Consequences**:
+  - Pros: One less container to operate; backups are a file copy; the startup schema sync (ADR-006/007) targets a single engine; WAL gives concurrent readers with a single writer — sufficient for the target workload.
+  - Cons: Single-writer semantics — heavy parallel write bursts serialize through busy_timeout; no server-side users/extensions; running more than one backend instance against the same file is out of scope by design; legacy PostgreSQL deployments need a manual data migration.
+
+## ADR-012: Assessment Phase State Machine as a Service with Evidence Integrity
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The v2 multi-skill assessment (mic_check → conversation → listening → speaking) grew to ~700 lines of phase-transition logic inside the HTTP router, mixing transport concerns with state transitions, item banking, pronunciation scoring and TTS caching — hard to test in isolation. At the same time, the pronunciation flow had no defense against duplicate or stale submissions (double-taps, retries against an already-advanced item), and nothing structurally prevented the client from influencing scores.
+- **Decision**: Extracted the entire phase state machine into `backend/app/services/assessment_flow.py`: `handle_message()` dispatches on `assessments.phase` to per-phase handlers (`_handle_mic_check`, `_handle_conversation`, `_handle_listening`, `_handle_speaking`), with helpers for state reloading (`populate_existing` eager loading), item-bank bookkeeping, TTS caching and the completion analysis. The router keeps only HTTP concerns (request validation, auth, recording upload, cooldown guards). Evidence integrity is enforced in the service: pronunciation metrics are **always recomputed server-side** from (item text, transcript, STT word timestamps) — the client merely echoes the words returned by `/recordings`; submissions whose `item_id` no longer matches the current item, or whose item was already answered, are dropped without advancing the section. Legacy (pre-v2) rows default `phase` to `conversation` so they keep behaving as pure chat; new assessments are always created at `mic_check` by `start_assessment`.
+- **Consequences**:
+  - Pros: Phase transitions are exercisable without HTTP (`test_assessment_flow.py` runs the flow against in-memory SQLite); the client can never inject pronunciation scores; duplicate/stale submissions are idempotent; the router shrinks to transport-only.
+  - Cons: An extra indirection layer between router and models; stale-submission dropping trusts the client's `item_id` echo (a client omitting it only degrades its own scoring — the server still recomputes every metric); legacy and new rows have different `phase` defaults, which the startup column sync documents. (The one-answer-per-item invariant is enforced atomically by the partial unique index `uq_assessment_messages_user_item` on `(assessment_id, item_id)` — `item_id` was promoted out of the metrics JSON; `/complete` also rejects an assessment still in `mic_check` so a bare start can't lock in a default level.)
+
+## ADR-013: Pin Pocket TTS Model and STT Language on Every personal-api Call
+- **Date**: 2026-09-06
+- **Status**: Accepted
+- **Context**: The personal-api server defaults to a **Spanish** Pocket TTS model, so english-forge's English tutor audio could silently change voice/model if the server's default drifts. On the STT side, real Moonshine word timestamps (the input to the pronunciation fluency metrics in `pronunciation.py`) are only produced when the transcription language is `en`; Moonshine otherwise defaults to `es` with degraded timestamps. Both new personal-api parameters (`model` on `/v1/speak`, `language` on `/v1/transcribe`) are optional and ignored by older servers.
+- **Decision**: english-forge sends the parameters itself on **every** call: `/v1/speak` always carries `model` (`TTS_MODEL`, default `english_2026-04_24l`) and `/v1/transcribe` always carries `language` (`STT_LANGUAGE`, default `en`). Unknown model ids are ignored by Pocket TTS (hot-swap safe). Contract tests in `backend/tests/test_personal_api_payloads.py` pin the wire format; the external contract is documented in `docs/personal-api-changes.md`.
+- **Consequences**:
+  - Pros: TTS output is stable regardless of personal-api default changes; word timestamps (and therefore fluency scoring) are guaranteed when the personal-api deployment is current; fully backward compatible — stale personal-api servers simply ignore the extra fields.
+  - Cons: The pinned model id must match a Pocket TTS model on the server (unknown ids are silently ignored, so a typo degrades quietly rather than erroring); requires an up-to-date personal-api for the STT language behavior to have any effect.
+
+## ADR-014: Interactive Path Lessons with Lazy Content Generation and Server-Side Grading
+- **Date**: 2026-09-07
+- **Status**: Accepted
+- **Context**: Learning-path lessons were created as stubs (`lesson_type`/`topic`/`description` plus `focus` metadata in `path_lessons.content`) with only a "mark complete" button — completing a path step never actually taught anything. Generating full interactive content for every lesson up-front, at path-generation time, would multiply LLM cost and latency for lessons the learner may never open.
+- **Decision**: Path-lesson content (explanation, examples, 3–5 fill-blank/multiple-choice exercises) is generated **lazily and idempotently** on first open via `POST /api/learning-paths/{path_id}/lessons/{lesson_id}/generate` — up to 3 LLM attempts, shape-validated through `parse_lesson_json` + `normalize_llm_lesson` (ADR-008/010), then merged into the existing `path_lessons.content` JSON so the focus/lesson_type metadata is preserved. When the path was built from an assessment, the prompt includes the learner's measured weaknesses so the content is personalized. Grading happens through `POST .../lessons/{lesson_id}/exercise` (submission by exercise index; case/trim-insensitive comparison) — exercise answers live only in the stored content JSON and are stripped from every response, extending the ADR-003/005 answer-stripping contract to path lessons. Related async-correctness rule: entities reloaded after core UPDATEs use `populate_existing` on the re-select instead of `db.expire()` — expired attribute access lazy-loads synchronously outside the greenlet and raises MissingGreenlet (production 500s).
+- **Consequences**: 
+  - Pros: LLM cost is paid only for lessons actually opened; content is personalized to assessment weaknesses; answers never reach the client; the detail view renders instantly from the stub card while content loads in.
+  - Cons: The first open of a lesson pays LLM latency (shown as a loading skeleton) and surfaces HTTP 503 if generation fails (retry re-opens the lesson); a lesson can still be marked complete from the path-card shortcut without opening it; callers must never use `db.expire()` on rows that are serialized afterwards.
+
+## ADR-015: Resilient Multi-Type Path Lessons and Elimination of Facades
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: Path lessons were generic fill-blank quizzes regardless of whether the type was `conversation`, `listening`, or `vocabulary`. Lazy generation timed out through Next.js proxy (socket hang up) leaving broken skeletons, and the card shortcut encouraged skipping without learning.
+- **Decision**:
+  - Distinguish lesson types with concrete interactive capabilities:
+    - `conversation`: displays dialogue context, target vocabulary/structures, and a button to launch an active conversation session with the AI tutor focused on this exact topic.
+    - `listening`: synthesizes an audio passage with Pocket TTS, prompts comprehension questions, and allows transcript review.
+    - `vocabulary`: provides words with IPA, definitions, audio playback, and a one-click "Add to Vocab / SRS Deck" action.
+    - `grammar`/`reading`: detailed explanations with instant server-graded practice.
+  - Replace the list "Complete" shortcut with "Start Lesson / Open". A lesson can only be marked complete once the student has engaged with its content or submitted exercises.
+  - Mitigate generation timeouts by capping prompts, caching syllabus seeds, and pre-generating curriculum templates.
+
+## ADR-016: Dedicated SRS Flashcard Review Interface (SM-2)
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: The backend implemented the SM-2 algorithm (`/api/vocab/{id}/review`), but the UI only presented a 5-question quiz and a static list. The spaced repetition capability was essentially a dead facade for the end-user.
+- **Decision**: Implement a dedicated Flashcard Review mode in `/vocab`: cards display front (word), audio pronunciation button, "Show Answer" reveal with definition, IPA and contextual examples, and 4 grading buttons (Again [0], Hard [2], Good [4], Easy [5]) hooked directly to SM-2 calculations.
+
+## ADR-017: Proactive Tutor Roleplay Greetings & Universal Audio STT in Conversation
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: When starting a scenario, the tutor never initiated the conversation, forcing the user to speak first without prompt or context. Furthermore, microphone input in conversation was bound exclusively to browser `WebSpeechSTT`, failing on Firefox, Safari, and Linux setups, despite the homelab already having Moonshine/faster-whisper STT.
+- **Decision**:
+  - On session creation for a scenario, automatically generate or select the tutor's opening line and synthesize its TTS audio so the student is greeted immediately.
+  - Enable the microphone button to use `MediaRecorder` + backend STT (`/api/sessions/{id}/recordings` or unified audio endpoint) with automatic fallback to Web Speech API when supported.
+  - Provide a UI modal for creating custom scenarios.
+
+## ADR-018: Flexible Lesson Hub & Unblocked Curriculum Generation
+- **Date**: 2026-09-14
+- **Status**: Accepted
+- **Context**: `/api/lessons/generate` rejected users without prior conversation mistakes (HTTP 400). The static library had only 5 files with no CEFR filter or completion tracking.
+- **Decision**:
+  - Unblock lesson generation: allow users to request lessons by topic (e.g. "Past Simple vs Present Perfect", "Job Interviewing") or target CEFR level, falling back to conversation errors if available.
+  - Track completed state for library lessons so users see their cumulative progress.
+
+## ADR-019: CEFR Level Lifecycle, Proxy Timeout Resilience & Settings Preferences Feedback
+- **Date**: 2026-09-16
+- **Status**: Accepted
+- **Context**: 
+  1. Finishing an assessment triggers a detailed LLM analysis with reasoning models that can take 35–45 seconds. Next.js `rewrites` proxies backend requests with a hardcoded default `proxyTimeout` of 30,000 ms (30s). When the timeout was reached, Next.js aborted the connection with `ECONNRESET / socket hang up`, causing the browser to receive an error. Because Starlette catches the disconnect as an exception, `get_db()` rolled back the session, discarding the analysis. On manual retry via "Finish & See Results", the whole 40s LLM analysis was repeated and timed out again.
+  2. In `/settings`, the TTS Voice input used `settings.tts_voice || "alba"`. When a user cleared the input with backspace, it immediately snapped back to "alba", preventing typing any voice name that did not begin with 'a'. Furthermore, saving Preferences had zero visual feedback.
+  3. The initial default level was inconsistently set to "B1" on `User`, but expected to be "A1" when neither assessment nor manual setting was configured. Updating `default_cefr` in settings did not update `current_user.current_level` or propagate to Dashboard and Conversation. When an assessment completed, it updated `current_user.current_level` but did not synchronize the `default_cefr` setting. Lastly, changing the default level in settings when an assessment was already completed lacked confirmation and did not regenerate the learning path.
+- **Decision**:
+  1. Configure `experimental: { proxyTimeout: 300_000 }` (5 minutes) in `frontend/next.config.ts`.
+  2. In `backend/app/routers/assessment.py`, explicitly call `await db.commit()` once `assessment.completed_at` is set, ensuring completed analyses are never rolled back on client disconnects.
+  3. In `frontend/src/app/(main)/assessment/page.tsx`, if `api.assessment.complete()` encounters an error, perform an immediate transparent query to `api.assessment.current()`. If the server completed the analysis, seamlessly transition to the Results screen.
+  4. In `frontend/src/app/(main)/settings/page.tsx`, bind TTS Voice to `settings.tts_voice ?? ""` and add a visual `settingsSaved` state ("Saved!" on button for 2s).
+  5. Change the unassessed/unconfigured system baseline level from "B1" to "A1" in `models.py` and `main.py`.
+  6. In `analyze_assessment`, upsert `Setting(key="default_cefr", value=assessment.estimated_level)` alongside `current_user.current_level`.
+  7. In `update_settings`, update `current_user.current_level` when `default_cefr` changes, and if `regenerate_path=True` (or when user has completed assessment / active path), regenerate the active learning path for the new level.
+  8. In Settings UI, show a confirmation dialog before applying a level change if the user has completed assessment or has an active path.
+- **Consequences**:
+  - Pros: Eliminates proxy timeout failures on long LLM runs; robust recovery if network blips occur; consistent CEFR level across User, Settings, Dashboard, Conversation, and Learning Paths; safe confirmation gate before path regeneration.
+  - Cons: Regenerating a learning path replaces the previous active path's pending lessons (completed lesson metrics are preserved in daily progress).
+

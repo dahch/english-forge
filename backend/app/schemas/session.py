@@ -46,19 +46,6 @@ class SessionCreate(BaseModel):
     cefr_level: str = Field(default="B1", pattern="^[A-C][1-2]$")
 
 
-class SessionResponse(BaseModel):
-    id: str
-    scenario_id: Optional[str] = None
-    started_at: datetime
-    ended_at: Optional[datetime] = None
-    cefr_level: str
-    provider_used: Optional[str] = None
-    scenario_name: Optional[str] = None
-    message_count: int = 0
-
-    model_config = {"from_attributes": True}
-
-
 class MessageCreate(BaseModel):
     text: str = Field(..., min_length=1)
 
@@ -81,6 +68,20 @@ class MessageResponse(BaseModel):
     audio_url: Optional[str] = None
     created_at: datetime
     corrections: list[CorrectionResponse] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+class SessionResponse(BaseModel):
+    id: str
+    scenario_id: Optional[str] = None
+    started_at: datetime
+    ended_at: Optional[datetime] = None
+    cefr_level: str
+    provider_used: Optional[str] = None
+    scenario_name: Optional[str] = None
+    message_count: int = 0
+    initial_message: Optional[MessageResponse] = None
 
     model_config = {"from_attributes": True}
 

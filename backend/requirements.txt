@@ -12,3 +12,8 @@ cryptography==44.0.0
 anthropic==0.42.0
 aiosqlite==0.20.0
 websockets==14.1
+# Pronunciation scoring: phoneme error rate via espeak-ng (installed via apt
+# in the Dockerfile). Gracefully degrades when unavailable.
+phonemizer==3.3.0
+# In-process STT fallback for when personal-api/Moonshine is unreachable.
+faster-whisper==1.0.3

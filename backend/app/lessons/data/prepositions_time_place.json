@@ -1,0 +1,45 @@
+{
+  "title": "Prepositions of Time and Place",
+  "topic": "grammar",
+  "level": "A2",
+  "explanation": "Prepositions show the relationship between words. For time: AT for specific times (at 3pm, at night), ON for days/dates (on Monday, on July 4th), IN for longer periods (in January, in 2024, in the morning). For place: AT for specific points (at the door), ON for surfaces (on the table), IN for enclosed spaces (in the room).",
+  "examples": [
+    "I wake up at 7am every day.",
+    "The meeting is on Friday.",
+    "We go on vacation in August.",
+    "She's waiting at the bus stop.",
+    "The book is on the shelf."
+  ],
+  "exercises": [
+    {
+      "question": "The party is ___ Saturday.",
+      "type": "fill_blank",
+      "answer": "on",
+      "explanation": "Days of the week use 'on'."
+    },
+    {
+      "question": "I was born ___ 1995.",
+      "type": "fill_blank",
+      "answer": "in",
+      "explanation": "Years use 'in'."
+    },
+    {
+      "question": "The class starts ___ 9am.",
+      "type": "fill_blank",
+      "answer": "at",
+      "explanation": "Specific times use 'at'."
+    },
+    {
+      "question": "She's waiting ___ the airport.",
+      "type": "fill_blank",
+      "answer": "at",
+      "explanation": "Specific locations/points use 'at'."
+    },
+    {
+      "question": "The keys are ___ the table.",
+      "type": "fill_blank",
+      "answer": "on",
+      "explanation": "Surfaces use 'on'."
+    }
+  ]
+}

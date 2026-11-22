@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
+import random
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.models import User, VocabItem
+from app.models.models import ProgressDaily, User, VocabItem
 from app.schemas.vocab import (
     QuizQuestion,
     QuizResult,
@@ -28,11 +32,11 @@ async def list_vocab(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import date
-
     query = select(VocabItem).where(VocabItem.user_id == current_user.id)
     if filter == "due":
-        query = query.where(VocabItem.next_review_at <= date.today())
+        query = query.where(
+            or_(VocabItem.next_review_at <= date.today(), VocabItem.next_review_at.is_(None))
+        )
     elif filter == "new":
         query = query.where(VocabItem.interval_days == 0)
     query = query.order_by(VocabItem.created_at.desc())
@@ -114,8 +118,6 @@ async def review_vocab(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import datetime, timezone
-
     result = await db.execute(
         select(VocabItem).where(VocabItem.id == vocab_id, VocabItem.user_id == current_user.id)
     )
@@ -128,9 +130,6 @@ async def review_vocab(
     item.interval_days = new_interval
     item.next_review_at = next_review_date(new_interval)
     item.last_reviewed_at = datetime.now(timezone.utc)
-
-    from app.models.models import ProgressDaily
-    from datetime import date
 
     today = date.today()
     prog_result = await db.execute(
@@ -161,15 +160,13 @@ async def get_due_cards(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from datetime import date
-
     result = await db.execute(
         select(VocabItem)
         .where(
             VocabItem.user_id == current_user.id,
-            VocabItem.next_review_at <= date.today(),
+            or_(VocabItem.next_review_at <= date.today(), VocabItem.next_review_at.is_(None)),
         )
-        .order_by(VocabItem.next_review_at)
+        .order_by(VocabItem.next_review_at.asc().nulls_first())
         .limit(limit)
     )
     items = result.scalars().all()
@@ -182,8 +179,6 @@ async def generate_quiz(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    import random
-
     result = await db.execute(
         select(VocabItem)
         .where(VocabItem.user_id == current_user.id)
@@ -212,7 +207,7 @@ async def generate_quiz(
             ))
         else:
             if item.example:
-                blanked = item.example.replace(item.word, "______", 1)
+                blanked = re.sub(rf"\b{re.escape(item.word)}\b", "______", item.example, flags=re.IGNORECASE, count=1)
                 questions.append(QuizQuestion(
                     vocab_item_id=item.id,
                     question_type="fill_blank",

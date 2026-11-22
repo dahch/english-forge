@@ -27,6 +27,10 @@ class Settings(BaseSettings):
 
     PERSONAL_API_URL: str = "http://personal-api:8000"
     TTS_DEFAULT_VOICE: str = "alba"
+    # Pocket TTS model id sent on every /v1/speak call. The personal-api
+    # server defaults to a Spanish model; english-forge always pins the
+    # English one. Unknown ids are ignored by Pocket TTS (hot-swap safe).
+    TTS_MODEL: str = "english_2026-04_24l"
     TTS_JOB_POLL_INTERVAL_MS: int = 500
     TTS_JOB_TIMEOUT_SECONDS: int = 30
 
@@ -37,6 +41,10 @@ class Settings(BaseSettings):
 
     STT_MODE: str = "web_speech"
     WHISPER_MODEL: str = "small"
+    # Language hint sent on every personal-api /v1/transcribe call. The app is
+    # an English tutor, so "en" — which is also what unlocks real Moonshine
+    # word timestamps (the basis of the pronunciation fluency metrics).
+    STT_LANGUAGE: str = "en"
 
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
