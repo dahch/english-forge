@@ -45,22 +45,35 @@ class STTPersonalAPI(STTProvider):
         result = await self.transcribe_detailed(audio_bytes, content_type)
         return result.get("text") or None
 
-    async def transcribe_detailed(self, audio_bytes: bytes, content_type: str = "audio/wav") -> dict:
+    async def transcribe_detailed(
+        self,
+        audio_bytes: bytes,
+        content_type: str = "audio/wav",
+        provider: str | None = None,
+    ) -> dict:
         """Transcribe returning {"text", "words"}.
 
-        `words` is the Moonshine word-timestamp list ([{word, start, end}], in
-        seconds) exposed by personal-api after the pronunciation-scoring
-        upgrade. Empty list when the server predates that change — callers
-        must treat it as optional.
+        `words` is the word-timestamp list ([{word, start, end}], in seconds)
+        exposed by personal-api for the pronunciation-scoring upgrade. Empty
+        list when the server predates that change — callers must treat it as
+        optional.
+
+        `provider` selects the engine in personal-api ('moonshine' |
+        'cartesia'). `None` omits the field so the server uses its own default
+        (moonshine), identical to the pre-provider request.
         """
         if not audio_bytes:
             return {"text": "", "words": []}
+
+        form = {"language": self._language}
+        if provider:
+            form["provider"] = provider
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{self._base_url}/v1/transcribe",
                 files={"audio": ("audio.wav", audio_bytes, content_type)},
-                data={"language": self._language},
+                data=form,
             )
             resp.raise_for_status()
             data = resp.json()

@@ -31,7 +31,7 @@ from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.srs.sm2 import next_review_date
-from app.utils import get_tutor_profile_dict, resolve_tts_voice
+from app.utils import get_tutor_profile_dict, resolve_tts_provider, resolve_tts_voice
 
 router = APIRouter(prefix="/api/sessions", tags=["messages"])
 
@@ -173,7 +173,8 @@ async def send_message(
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
-        audio_bytes = await tts.synthesize(reply, voice=voice)
+        provider = await resolve_tts_provider(db, current_user.id, profile_dict)
+        audio_bytes = await tts.synthesize(reply, voice=voice, provider=provider)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"

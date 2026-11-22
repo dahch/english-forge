@@ -41,17 +41,34 @@ class TTSPersonalAPI(TTSProvider):
         self._poll_interval = settings.TTS_JOB_POLL_INTERVAL_MS / 1000.0
         self._timeout = settings.TTS_JOB_TIMEOUT_SECONDS
 
-    async def synthesize(self, text: str, voice: str | None = None) -> bytes | None:
+    async def synthesize(
+        self, text: str, voice: str | None = None, provider: str | None = None
+    ) -> bytes | None:
+        """Synthesize `text`, optionally through a specific provider.
+
+        `provider=None` omits the field entirely so personal-api keeps its own
+        default (pockettts) — identical to the pre-provider request. `model` is
+        only meaningful for Pocket TTS, so it is only sent there; forwarding a
+        Pocket model id to Cartesia would be a 400.
+        """
         if not text.strip():
             return None
 
-        voice = voice or self._default_voice
+        payload: dict = {"text": text}
+        if provider:
+            payload["provider"] = provider
+
+        is_pockettts = provider in (None, "pockettts")
+        if is_pockettts:
+            payload["voice"] = voice or self._default_voice
+            payload["model"] = self._model
+        elif voice:
+            # Cartesia voice ids are provider-specific: a Pocket name like
+            # "alba" would be rejected, so only forward what the caller set.
+            payload["voice"] = voice
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{self._base_url}/v1/speak",
-                json={"text": text, "voice": voice, "model": self._model},
-            )
+            resp = await client.post(f"{self._base_url}/v1/speak", json=payload)
             resp.raise_for_status()
             data = resp.json()
 

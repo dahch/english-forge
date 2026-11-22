@@ -200,6 +200,10 @@ async def update_settings(
         updates["stt_mode"] = body.stt_mode
     if body.tts_voice is not None:
         updates["tts_voice"] = body.tts_voice
+    if body.stt_provider is not None:
+        updates["stt_provider"] = body.stt_provider
+    if body.tts_provider is not None:
+        updates["tts_provider"] = body.tts_provider
     if body.default_cefr is not None:
         updates["default_cefr"] = body.default_cefr
     if body.task_routing is not None:

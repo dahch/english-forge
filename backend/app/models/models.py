@@ -60,6 +60,10 @@ class TutorProfile(Base):
     gender: Mapped[str | None] = mapped_column(String(50), nullable=True)
     personality: Mapped[str] = mapped_column(String(100), nullable=False, default="friendly")
     voice: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # TTS engine for the tutor's voice. NULL means "inherit the general
+    # preference" (see resolve_tts_provider), so existing rows keep working.
+    # Values: 'pockettts' | 'cartesia'.
+    tts_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 

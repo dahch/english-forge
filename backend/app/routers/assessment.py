@@ -32,6 +32,7 @@ from app.services.assessment_flow import (
 )
 from app.services.pronunciation import score_pronunciation_async
 from app.services.stt import transcribe_audio
+from app.utils import resolve_stt_provider
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +286,8 @@ async def upload_recording(
         raise HTTPException(status_code=400, detail="Empty recording")
 
     content_type = file.content_type or "audio/webm"
-    stt = await transcribe_audio(audio, content_type)
+    stt_provider = await resolve_stt_provider(db, current_user.id)
+    stt = await transcribe_audio(audio, content_type, provider=stt_provider)
 
     expected = expected_text_for(assessment.phase, assessment.section_step)
     metrics = None
