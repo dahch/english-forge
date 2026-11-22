@@ -232,6 +232,7 @@ from app.routers.ws import router as ws_router
 from app.routers.tutor_profile import router as tutor_profile_router
 from app.routers.assessment import router as assessment_router
 from app.routers.learning_paths import router as learning_paths_router
+from app.routers.voices import router as voices_router
 
 app.include_router(auth_router)
 app.include_router(sessions_router)
@@ -245,6 +246,7 @@ app.include_router(ws_router)
 app.include_router(tutor_profile_router)
 app.include_router(assessment_router)
 app.include_router(learning_paths_router)
+app.include_router(voices_router)
 
 
 @app.exception_handler(Exception)

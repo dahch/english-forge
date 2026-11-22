@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -8,8 +8,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import type { ProviderConfig, TutorProfile, User } from "@/lib/types"
-import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2 } from "lucide-react"
+import type { ProviderConfig, TtsVoice, TutorProfile, User } from "@/lib/types"
+import { Settings, Plus, Trash2, Key, Server, Save, AlertCircle, UserCircle, Database, CheckCircle2, RefreshCw } from "lucide-react"
 
 const PERSONALITY_PRESETS = [
   "friendly",
@@ -50,6 +50,17 @@ export default function SettingsPage() {
   const [showAddProvider, setShowAddProvider] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [voices, setVoices] = useState<TtsVoice[]>([])
+  const [voicesLoading, setVoicesLoading] = useState(false)
+  const [voicesError, setVoicesError] = useState<string | null>(null)
+  // El perfil del tutor puede tener su propio motor, así que su catálogo es
+  // independiente del de Preferences.
+  const [tutorVoices, setTutorVoices] = useState<TtsVoice[]>([])
+  const [tutorVoicesLoading, setTutorVoicesLoading] = useState(false)
+  const [tutorVoicesError, setTutorVoicesError] = useState<string | null>(null)
+  // Motor general vigente, para resolver el fallback "inherit" del perfil del
+  // tutor sin depender del orden en que resuelvan las dos peticiones.
+  const generalTtsProviderRef = useRef("pockettts")
   const [newProvider, setNewProvider] = useState({
     provider_name: "",
     api_key: "",
@@ -60,6 +71,45 @@ export default function SettingsPage() {
     task_routing: "conversation,correction,lesson",
   })
 
+  // A single select drives both stt_mode and stt_provider, because "where the
+  // voice is transcribed" and "which engine" are one decision for the user.
+  const sttSettingValue =
+    (settings.stt_mode || "web_speech") === "personal_api"
+      ? `personal_api:${settings.stt_provider || "moonshine"}`
+      : settings.stt_mode || "web_speech"
+
+  const loadVoices = async (provider: string) => {
+    setVoicesLoading(true)
+    setVoicesError(null)
+    try {
+      const data = await api.voices.list(provider)
+      setVoices(data.voices || [])
+      if (!data.voices?.length) {
+        setVoicesError("No voices returned")
+      }
+    } catch (err: unknown) {
+      setVoices([])
+      setVoicesError(err instanceof Error ? err.message : "Could not load voices")
+    } finally {
+      setVoicesLoading(false)
+    }
+  }
+
+  const loadTutorVoices = async (provider: string) => {
+    setTutorVoicesLoading(true)
+    setTutorVoicesError(null)
+    try {
+      const data = await api.voices.list(provider)
+      setTutorVoices(data.voices || [])
+      if (!data.voices?.length) setTutorVoicesError("No voices returned")
+    } catch (err: unknown) {
+      setTutorVoices([])
+      setTutorVoicesError(err instanceof Error ? err.message : "Could not load voices")
+    } finally {
+      setTutorVoicesLoading(false)
+    }
+  }
+
   useEffect(() => {
     api.settings.getProviders().then(setProviders).catch(console.error)
     api.settings.get().then((data) => {
@@ -69,6 +119,9 @@ export default function SettingsPage() {
       if (map.default_cefr) {
         setSavedCefr(map.default_cefr)
       }
+      // El catálogo de voces depende del motor guardado.
+      loadVoices(map.tts_provider || "pockettts")
+      generalTtsProviderRef.current = map.tts_provider || "pockettts"
     }).catch(console.error)
     api.auth.me().then((u) => {
       setCurrentUser(u)
@@ -94,6 +147,9 @@ export default function SettingsPage() {
       setCustomPersonality(
         !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
       )
+      // El perfil sin motor propio hereda el general; las voces deben seguir
+      // al motor efectivo, no al del perfil.
+      loadTutorVoices(p.tts_provider || generalTtsProviderRef.current)
     }).catch(console.error)
   }, [])
 
@@ -382,20 +438,44 @@ export default function SettingsPage() {
             </div>
             <div className="space-y-1">
               <Label>TTS Voice</Label>
-              <Input
+              <Select
                 value={tutorForm.voice || ""}
-                onChange={(e) => setTutorForm({ ...tutorForm, voice: e.target.value })}
-                placeholder="e.g. alba"
-              />
+                onValueChange={(v2) =>
+                  setTutorForm({ ...tutorForm, voice: v2 === "__default__" ? "" : v2 })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Default voice for the engine" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__default__">Default voice for the engine</SelectItem>
+                  {tutorVoicesLoading ? (
+                    <SelectItem value="__loading__" disabled>Loading voices…</SelectItem>
+                  ) : tutorVoicesError ? (
+                    <SelectItem value="__error__" disabled>{tutorVoicesError}</SelectItem>
+                  ) : (
+                    tutorVoices.map((v2) => (
+                      <SelectItem key={v2.id} value={v2.id}>
+                        {v2.name}
+                        {v2.accent ? ` — ${v2.accent}` : ""}
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
               <p className="text-xs text-muted-foreground">Voice ID used when the tutor speaks.</p>
             </div>
             <div className="space-y-1">
               <Label>Tutor Voice Engine</Label>
               <Select
                 value={tutorForm.tts_provider || "inherit"}
-                onValueChange={(v) =>
-                  setTutorForm({ ...tutorForm, tts_provider: v === "inherit" ? null : v })
-                }
+                onValueChange={(v) => {
+                  const engine = v === "inherit" ? null : v
+                  // Un id de voz no es portable entre motores: al cambiar de
+                  // motor se limpia la selección y se recarga su catálogo.
+                  setTutorForm({ ...tutorForm, tts_provider: engine, voice: "" })
+                  loadTutorVoices(engine || generalTtsProviderRef.current)
+                }}
               >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -472,42 +552,55 @@ export default function SettingsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
+          {/* Un solo concepto para STT: "dónde se reconoce la voz" incluye el
+              motor. Antes había dos selects solapados (stt_mode y
+              stt_provider) que parecían lo mismo. */}
           <div className="space-y-1">
-            <Label>STT Mode</Label>
+            <Label>Speech Recognition</Label>
             <Select
-              value={settings.stt_mode || "web_speech"}
-              onValueChange={(v) => setSettings({ ...settings, stt_mode: v })}
+              value={sttSettingValue}
+              onValueChange={(v) => {
+                if (v === "web_speech") {
+                  setSettings({ ...settings, stt_mode: "web_speech" })
+                  return
+                }
+                // Elegir un motor implica transcripción en servidor.
+                const [mode, engine] = v.split(":")
+                setSettings({ ...settings, stt_mode: mode, stt_provider: engine })
+              }}
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="web_speech">Web Speech API (Browser native, lowest latency)</SelectItem>
-                <SelectItem value="personal_api">Personal API / Moonshine (Highest accuracy & fluency)</SelectItem>
-                <SelectItem value="whisper_server">faster-whisper (Server-side transcription)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1">
-            <Label>Speech Recognition Engine</Label>
-            <Select
-              value={settings.stt_provider || "moonshine"}
-              onValueChange={(v) => setSettings({ ...settings, stt_provider: v })}
-            >
-              <SelectTrigger><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="moonshine">Moonshine (local, self-hosted)</SelectItem>
-                <SelectItem value="cartesia">Cartesia (cloud, needs API key)</SelectItem>
+                <SelectItem value="web_speech">
+                  Browser (Web Speech API) — lowest latency, no server call
+                </SelectItem>
+                <SelectItem value="personal_api:moonshine">
+                  Server — Moonshine (local, highest accuracy & fluency)
+                </SelectItem>
+                <SelectItem value="personal_api:cartesia">
+                  Server — Cartesia (cloud, needs API key)
+                </SelectItem>
+                <SelectItem value="whisper_server">
+                  Server — faster-whisper (local, fallback engine)
+                </SelectItem>
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground">
-              Used when voice is transcribed on the server (session practice, pronunciation checks).
-              Both return word timestamps, so fluency scoring keeps working either way.
+              Where your voice is transcribed. All server engines return word timestamps,
+              so pronunciation and fluency scoring work the same in every mode.
             </p>
           </div>
+
           <div className="space-y-1">
             <Label>TTS Voice Engine</Label>
             <Select
               value={settings.tts_provider || "pockettts"}
-              onValueChange={(v) => setSettings({ ...settings, tts_provider: v })}
+              onValueChange={(v) => {
+                // La lista de voces es por proveedor: recargarla y limpiar la
+                // selección evita mandar un id de Pocket a Cartesia (o al revés).
+                setSettings((prev) => ({ ...prev, tts_provider: v, tts_voice: "" }))
+                loadVoices(v)
+              }}
             >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -519,15 +612,49 @@ export default function SettingsPage() {
               Default engine for the tutor&apos;s voice. The tutor profile can override it.
             </p>
           </div>
+
           <div className="space-y-1">
             <Label>TTS Voice</Label>
-            <Input
-              value={settings.tts_voice ?? ""}
-              onChange={(e) => setSettings({ ...settings, tts_voice: e.target.value })}
-              placeholder="alba"
-            />
+            <div className="flex gap-2">
+              <Select
+                value={settings.tts_voice || ""}
+                onValueChange={(v) =>
+                  setSettings({ ...settings, tts_voice: v === "__default__" ? "" : v })
+                }
+              >
+                <SelectTrigger className="flex-1">
+                  <SelectValue placeholder="Default voice for the engine" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__default__">Default voice for the engine</SelectItem>
+                  {voicesLoading ? (
+                    <SelectItem value="__loading__" disabled>Loading voices…</SelectItem>
+                  ) : voicesError ? (
+                    <SelectItem value="__error__" disabled>{voicesError}</SelectItem>
+                  ) : (
+                    voices.map((v) => (
+                      <SelectItem key={v.id} value={v.id}>
+                        {v.name}
+                        {v.accent ? ` — ${v.accent}` : ""}
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => loadVoices(settings.tts_provider || "pockettts")}
+                disabled={voicesLoading}
+                aria-label="Reload voices"
+              >
+                <RefreshCw className={`h-4 w-4 ${voicesLoading ? "animate-spin" : ""}`} />
+              </Button>
+            </div>
             <p className="text-xs text-muted-foreground">
-              Pocket TTS: verify against GET /v1/voices. Cartesia: use a Cartesia voice ID (leave empty for the server default).
+              {settings.tts_provider === "cartesia"
+                ? "Voices come from your Cartesia account. Changing the engine reloads the list."
+                : "Built-in and custom voices available in your Pocket TTS server."}
             </p>
           </div>
           <div className="space-y-1">

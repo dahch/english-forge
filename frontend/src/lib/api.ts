@@ -22,6 +22,7 @@ import type {
   User,
   VocabItem,
 } from "./types"
+import type { TtsVoice } from "./types"
 
 export type { LessonExercise, ExerciseCheckResult, LibraryLesson, LessonGenerateRequest }
 
@@ -380,5 +381,13 @@ export const api = {
         body: JSON.stringify(data),
       }),
     clearData: () => request<{ message: string }>("/api/settings/clear-data", { method: "DELETE" }),
+  },
+  voices: {
+    // Voice catalog for a TTS provider. `provider=cartesia` needs the API key
+    // configured in personal-api; failures surface as an error string.
+    list: (provider: string) =>
+      request<{ provider: string; voices: TtsVoice[]; has_more: boolean }>(
+        `/api/voices?provider=${encodeURIComponent(provider)}`
+      ),
   },
 }
