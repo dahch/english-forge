@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import anthropic
@@ -24,6 +25,25 @@ class AnthropicProvider(ChatProvider):
     @property
     def model_name(self) -> str:
         return self._model
+
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str,
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+    ) -> AsyncIterator[str]:
+        async with self._client.messages.stream(
+            model=self._model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system_prompt,
+            messages=messages,
+        ) as stream:
+            async for text in stream.text_stream:
+                if text:
+                    yield text
 
     async def complete(
         self,

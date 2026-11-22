@@ -9,8 +9,11 @@ import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { AudioButton } from "@/components/assessment/audio-button"
-import { api } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
+import { api, ApiError } from "@/lib/api"
 import { startRecording, type RecorderHandle } from "@/lib/recorder"
+import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
+import { cn } from "@/lib/utils"
 import type { Assessment, AssessmentMessage, DimensionScores } from "@/lib/types"
 import { Mic, MicOff, Send, Sparkles, AlertCircle, Loader2, CheckCircle2, RefreshCw, Ear } from "lucide-react"
 
@@ -20,9 +23,91 @@ const MIN_ASSESSMENT_EXCHANGES = 6
 
 const PHASE_LABELS: Record<string, string> = {
   mic_check: "Mic check",
-  conversation: `Conversation (min ${MIN_ASSESSMENT_EXCHANGES}, max ${MAX_ASSESSMENT_QUESTIONS})`,
-  listening: "Listening — audio only",
-  speaking: "Pronunciation — read aloud",
+  conversation: "Interview",
+  listening: "Listening",
+  speaking: "Pronunciation",
+}
+
+const PHASE_ORDER = ["mic_check", "conversation", "listening", "speaking"] as const
+const PHASE_TITLES: Record<string, string> = {
+  mic_check: "Mic check",
+  conversation: "Interview",
+  listening: "Listening",
+  speaking: "Speaking",
+}
+
+function progressText(
+  phase: string,
+  questionsAsked: number,
+  sectionStep: number,
+  sectionTotal: number,
+): string {
+  switch (phase) {
+    case "mic_check":
+      return "Read the sentence aloud so we can check your microphone."
+    case "conversation":
+      return `Question ${Math.max(1, Math.min(questionsAsked, MAX_ASSESSMENT_QUESTIONS))} of ${MAX_ASSESSMENT_QUESTIONS}`
+    case "listening":
+      return `Audio item ${Math.min(sectionStep + 1, sectionTotal || 1)} of ${sectionTotal || 1} — replay as often as you need`
+    case "speaking":
+      return `Read-aloud item ${Math.min(sectionStep + 1, sectionTotal || 1)} of ${sectionTotal || 1}`
+    default:
+      return ""
+  }
+}
+
+// Explicit section stepper: previously the only signal was a badge, so users
+// could not tell whether they were on item 2 or 5, or how much was left.
+function PhaseStepper({
+  phase,
+  questionsAsked,
+  sectionStep,
+  sectionTotal,
+}: {
+  phase: string
+  questionsAsked: number
+  sectionStep: number
+  sectionTotal: number
+}) {
+  const foundIndex = PHASE_ORDER.indexOf(phase as (typeof PHASE_ORDER)[number])
+  const currentIndex = foundIndex === -1 ? 0 : foundIndex
+
+  return (
+    <div className="border-b px-4 pb-2 pt-2">
+      <ol className="flex items-center gap-1.5 overflow-x-auto text-[11px]">
+        {PHASE_ORDER.map((step, index) => {
+          const state = index < currentIndex ? "done" : index === currentIndex ? "current" : "upcoming"
+          return (
+            <li
+              key={step}
+              aria-current={state === "current" ? "step" : undefined}
+              className="flex items-center gap-1.5"
+            >
+              {index > 0 && <span className="h-px w-3 bg-border" aria-hidden="true" />}
+              <span
+                className={cn(
+                  "inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5",
+                  state === "done" && "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+                  state === "current" && "border-primary bg-primary text-primary-foreground",
+                  state === "upcoming" && "border-border text-muted-foreground",
+                )}
+              >
+                {state === "done" ? (
+                  <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                ) : (
+                  <span className="tabular-nums opacity-70">{index + 1}</span>
+                )}
+                {PHASE_TITLES[step]}
+              </span>
+            </li>
+          )
+        })}
+      </ol>
+      <p className="mt-1.5 text-xs text-muted-foreground" aria-live="polite">
+        {progressText(phase, questionsAsked, sectionStep, sectionTotal)}
+      </p>
+    </div>
+  )
 }
 
 const DIMENSION_LABELS: Record<string, string> = {
@@ -105,6 +190,7 @@ function MessageBubble({
 
 export default function AssessmentPage() {
   const router = useRouter()
+  const { toast } = useToast()
   const [assessment, setAssessment] = useState<Assessment | null>(null)
   const [messages, setMessages] = useState<AssessmentMessage[]>([])
   const [inputText, setInputText] = useState("")
@@ -113,6 +199,15 @@ export default function AssessmentPage() {
   const [completed, setCompleted] = useState(false)
   const [generatingPath, setGeneratingPath] = useState(false)
   const [reanalyzing, setReanalyzing] = useState(false)
+  // "Start over" confirmation: abandoning is destructive to the current
+  // attempt (not to previous results), so it always asks first.
+  const [showRestartConfirm, setShowRestartConfirm] = useState(false)
+  const [restarting, setRestarting] = useState(false)
+  // Analysis is a separate 35-45s operation; "loading" alone only disabled the
+  // button with no explanation of what was happening.
+  const [completing, setCompleting] = useState(false)
+  const loadingSeconds = useElapsed(loading)
+  const completingSeconds = useElapsed(completing)
 
   // Voice recording state (MediaRecorder → /recordings → editable transcript)
   const [isRecording, setIsRecording] = useState(false)
@@ -146,17 +241,37 @@ export default function AssessmentPage() {
   }, [messages])
 
   useEffect(() => {
+    if (!showRestartConfirm) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !restarting) setShowRestartConfirm(false)
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [showRestartConfirm, restarting])
+
+  useEffect(() => {
+    let cancelled = false
     async function resume() {
       try {
         const a = await api.assessment.current()
+        if (cancelled) return
         setAssessment(a)
         setMessages(a.messages)
         if (a.completed_at) setCompleted(true)
-      } catch {
-        // No assessment found, user will start manually
+      } catch (err: unknown) {
+        if (cancelled) return
+        // 404 = no assessment yet (expected). Anything else is a real failure
+        // and used to be swallowed, leaving the user on a blank "Start" screen.
+        if (err instanceof ApiError && err.status === 404) return
+        setError(
+          err instanceof Error ? err.message : "Could not load your assessment. Try again.",
+        )
       }
     }
     resume()
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const applyResponse = (a: Assessment) => {
@@ -165,7 +280,7 @@ export default function AssessmentPage() {
     return a
   }
 
-  const start = async () => {
+  const start = async (): Promise<boolean> => {
     setLoading(true)
     setError("")
     try {
@@ -175,34 +290,65 @@ export default function AssessmentPage() {
       pendingWordsRef.current = null
       lastSourceRef.current = "text"
       setHasVoiceTranscript(false)
+      return true
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to start assessment")
+      const message = err instanceof Error ? err.message : "Failed to start assessment"
+      setError(message)
+      toast({ title: "Could not start the assessment", description: message, variant: "error" })
+      return false
     } finally {
       setLoading(false)
     }
   }
 
   const completeAssessment = async (id: string) => {
+    // The analysis can take 35-45s with reasoning models. "completing" drives
+    // the staged banner (what is running + elapsed time); errors are toasted,
+    // not just left as a line the user might miss.
+    if (completing) return
     setLoading(true)
+    setCompleting(true)
+    setError("")
     try {
-      applyResponse(await api.assessment.complete(id))
+      const result = await api.assessment.complete(id)
+      applyResponse(result)
       setCompleted(true)
-      setError("")
+      toast({
+        title: "Assessment complete",
+        description: result.estimated_level
+          ? `Estimated level: ${result.estimated_level}`
+          : undefined,
+        variant: "success",
+      })
     } catch (err: unknown) {
       try {
         const current = await api.assessment.current()
         if (current.completed_at) {
+          // The server finished even though the response was lost.
           applyResponse(current)
           setCompleted(true)
           setError("")
+          toast({
+            title: "Results recovered",
+            description: "The analysis finished on the server. Your results are ready.",
+            variant: "success",
+          })
           return
         }
       } catch {
-        // Fall back to original error
+        // Fall through to the original error.
       }
-      setError(err instanceof Error ? err.message : "Failed to complete assessment")
+      const message =
+        err instanceof Error ? err.message : "Failed to complete assessment"
+      setError(message)
+      toast({
+        title: "Could not analyze the assessment",
+        description: message,
+        variant: "error",
+      })
     } finally {
       setLoading(false)
+      setCompleting(false)
     }
   }
 
@@ -348,6 +494,33 @@ export default function AssessmentPage() {
     }
   }
 
+  // Abandon the in-progress attempt (backend frees the "one in-progress
+  // assessment" invariant) and immediately start a clean one.
+  const restartAssessment = async () => {
+    if (!assessment || restarting) return
+    setRestarting(true)
+    setError("")
+    try {
+      await api.assessment.abandon(assessment.id)
+      setShowRestartConfirm(false)
+      setAssessment(null)
+      setMessages([])
+      setCompleted(false)
+      const started = await start()
+      if (started) {
+        toast({
+          title: "Assessment restarted",
+          description: "Starting again with the microphone check.",
+          variant: "success",
+        })
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to restart the assessment")
+    } finally {
+      setRestarting(false)
+    }
+  }
+
   const assistantCount = messages.filter((m) => m.role === "assistant" && m.kind === "chat").length
   const lastAnsweredIndex = (() => {
     // Index of the last user message — listening item texts before it can be revealed.
@@ -361,6 +534,7 @@ export default function AssessmentPage() {
     const dims: [string, number][] = Object.entries(
       (assessment.dimension_scores ?? {}) as DimensionScores
     ).filter(([, v]) => typeof v === "number") as [string, number][]
+    const bands = assessment.dimension_bands ?? {}
     return (
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         <div className="text-center space-y-2">
@@ -390,7 +564,10 @@ export default function AssessmentPage() {
                 <div key={dim}>
                   <div className="flex justify-between text-sm mb-1">
                     <span>{DIMENSION_LABELS[dim] ?? dim}</span>
-                    <span className="text-muted-foreground">{Math.round(score)}/100</span>
+                    <span className="text-muted-foreground">
+                      {Math.round(score)}/100
+                      {typeof bands[dim] === "string" ? ` · ${bands[dim]}` : ""}
+                    </span>
                   </div>
                   <Progress value={score} />
                 </div>
@@ -499,20 +676,41 @@ export default function AssessmentPage() {
             <Badge variant="outline">{Math.min(assistantCount, MAX_ASSESSMENT_QUESTIONS)} / {MAX_ASSESSMENT_QUESTIONS}</Badge>
           )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => completeAssessment(assessment.id)}
-          disabled={loading}
-          title={
-            phase === "conversation" && assistantCount < MIN_ASSESSMENT_EXCHANGES
-              ? `At least ${MIN_ASSESSMENT_EXCHANGES} exchanges are recommended for a reliable level — finishing now lowers the confidence.`
-              : undefined
-          }
-        >
-          Finish & See Results
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setShowRestartConfirm(true)}
+            disabled={loading || restarting}
+            title="Discard this attempt and start again from the mic check"
+          >
+            <RefreshCw className="h-4 w-4 mr-1" />
+            Start over
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => completeAssessment(assessment.id)}
+            disabled={loading || phase === "mic_check"}
+            title={
+              phase === "mic_check"
+                ? "Answer the mic check first — the analysis needs at least one recorded answer."
+                : phase === "conversation" && assistantCount < MIN_ASSESSMENT_EXCHANGES
+                  ? `At least ${MIN_ASSESSMENT_EXCHANGES} exchanges are recommended for a reliable level — finishing now lowers the confidence.`
+                  : undefined
+            }
+          >
+            Finish & See Results
+          </Button>
+        </div>
       </div>
+
+      <PhaseStepper
+        phase={phase}
+        questionsAsked={assessment.questions_asked ?? assistantCount}
+        sectionStep={assessment.section_step ?? 0}
+        sectionTotal={assessment.section_total ?? 0}
+      />
 
       {error && (
         <div className="flex items-center gap-2 p-3 rounded-md bg-destructive/10 text-destructive text-sm mx-4 mt-2">
@@ -522,8 +720,27 @@ export default function AssessmentPage() {
         </div>
       )}
 
+      {completing && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mx-4 mt-2 rounded-md border border-primary/30 bg-primary/5 p-3 text-sm"
+        >
+          <div className="flex items-center gap-2">
+            <Loader2 className="h-4 w-4 animate-spin text-primary" />
+            <span className="font-medium">
+              Analyzing your results… {formatElapsed(completingSeconds)}
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Grammar · vocabulary · fluency · listening · pronunciation. This can take
+            up to a minute — keep this tab open; results are saved server-side.
+          </p>
+        </div>
+      )}
+
       <ScrollArea className="flex-1 p-4">
-        <div className="max-w-2xl mx-auto space-y-4">
+        <div className="max-w-2xl mx-auto space-y-4" role="log" aria-live="polite" aria-relevant="additions">
           {messages.map((msg, i) => (
             <MessageBubble
               key={msg.id}
@@ -533,14 +750,26 @@ export default function AssessmentPage() {
               assessmentId={assessment.id}
             />
           ))}
-          {(loading || transcribing) && (
+          {(loading || transcribing) && !completing && (
             <div className="flex justify-start">
               <div className="bg-secondary rounded-2xl px-4 py-2">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                <div className="flex items-center gap-2">
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {transcribing
+                      ? "Transcribing your answer…"
+                      : `Tutor is thinking… ${formatElapsed(loadingSeconds)}`}
+                  </span>
                 </div>
+                {!transcribing && loadingSeconds >= 20 && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Reasoning models can take up to a minute — keep this tab open.
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -624,6 +853,45 @@ export default function AssessmentPage() {
           </div>
         </div>
       </div>
+
+      {showRestartConfirm && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="restart-assessment-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          onClick={() => {
+            if (!restarting) setShowRestartConfirm(false)
+          }}
+        >
+          <Card className="w-full max-w-md" onClick={(event) => event.stopPropagation()}>
+            <CardHeader>
+              <CardTitle id="restart-assessment-title">Start this assessment over?</CardTitle>
+              <CardDescription>
+                The current attempt is discarded and a new one begins with the mic
+                check. Previous completed results are kept.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setShowRestartConfirm(false)}
+                disabled={restarting}
+              >
+                Cancel
+              </Button>
+              <Button onClick={restartAssessment} disabled={restarting}>
+                {restarting ? (
+                  <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                ) : (
+                  <RefreshCw className="h-4 w-4 mr-1" />
+                )}
+                {restarting ? "Restarting..." : "Discard & restart"}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   )
 }

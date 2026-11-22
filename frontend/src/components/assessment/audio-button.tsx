@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { Loader2, Pause, Volume2 } from "lucide-react"
+import { Loader2, Pause, Volume2, VolumeX } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { fetchBlob } from "@/lib/api"
 
@@ -19,7 +19,7 @@ export function AudioButton({
   messageId: string
   disabled?: boolean
 }) {
-  const [state, setState] = useState<"idle" | "loading" | "playing">("idle")
+  const [state, setState] = useState<"idle" | "loading" | "playing" | "error">("idle")
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const blobRef = useRef<string | null>(null)
 
@@ -54,9 +54,10 @@ export function AudioButton({
       await audio.play()
       setState("playing")
     } catch {
-      // Synthesis failed — surface a neutral idle state; the UI shows the
-      // item text as fallback in that case.
-      setState("idle")
+      // Synthesis/playback failed. Showing a silent idle button made the
+      // listening section look broken; mark it so the user knows to retry or
+      // read the fallback text.
+      setState("error")
       if (blobRef.current) {
         URL.revokeObjectURL(blobRef.current)
         blobRef.current = null
@@ -71,12 +72,21 @@ export function AudioButton({
       onClick={toggle}
       disabled={disabled || state === "loading"}
       className="h-7 px-2"
-      aria-label={state === "playing" ? "Pause audio" : "Play audio"}
+      aria-label={state === "playing" ? "Pause audio" : state === "error" ? "Retry audio" : "Play audio"}
+      title={
+        state === "error"
+          ? "Audio unavailable — press to retry, or read the text"
+          : state === "playing"
+            ? "Pause audio"
+            : "Play audio"
+      }
     >
       {state === "loading" ? (
         <Loader2 className="h-4 w-4 animate-spin" />
       ) : state === "playing" ? (
         <Pause className="h-4 w-4" />
+      ) : state === "error" ? (
+        <VolumeX className="h-4 w-4 text-destructive" />
       ) : (
         <Volume2 className="h-4 w-4" />
       )}

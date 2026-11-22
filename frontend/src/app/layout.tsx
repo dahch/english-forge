@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next"
 import { Inter } from "next/font/google"
 import { ServiceWorkerRegistrar } from "@/components/service-worker-registrar"
+import { OfflineBanner } from "@/components/feedback/offline-banner"
+import { ToastProvider } from "@/components/feedback/toast"
 import "./globals.css"
 
 const inter = Inter({ subsets: ["latin"] })
@@ -30,7 +32,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className="dark">
       <body className={`${inter.className} bg-background text-foreground antialiased`}>
-        {children}
+        <ToastProvider>
+          <OfflineBanner />
+          {children}
+        </ToastProvider>
         <ServiceWorkerRegistrar />
       </body>
     </html>

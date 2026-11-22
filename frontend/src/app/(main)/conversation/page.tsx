@@ -10,10 +10,21 @@ import { Badge } from "@/components/ui/badge"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, setActiveSessionId, getActiveSessionId } from "@/lib/api"
+import { api, fetchBlob, setActiveSessionId, getActiveSessionId } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
 import { startRecording, RecorderError, type RecorderHandle } from "@/lib/recorder"
 import { WebSpeechSTT } from "@/lib/stt/web-speech"
-import type { Scenario, Message, Session, SessionSummary, CEFRLevel, User } from "@/lib/types"
+import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
+import { formatServerDateTime } from "@/lib/datetime"
+import type {
+  Scenario,
+  Message,
+  Session,
+  SessionSummary,
+  ConversationTurn,
+  CEFRLevel,
+  User,
+} from "@/lib/types"
 import { CEFR_LEVELS } from "@/lib/types"
 import {
   Mic,
@@ -39,6 +50,18 @@ function makeTempMessageId() {
   return `temp-${Date.now()}`
 }
 
+// Unsent text is the most painful thing to lose on a 401 redirect, a refresh or
+// a tab switch: keep a per-session draft in sessionStorage (scoped to the tab,
+// wiped when the browser closes).
+function draftKey(sessionId: string): string {
+  return `ef_draft_${sessionId}`
+}
+
+function readDraft(sessionId: string): string {
+  if (typeof window === "undefined") return ""
+  return sessionStorage.getItem(draftKey(sessionId)) ?? ""
+}
+
 function formatTimer(seconds: number): string {
   const mins = Math.floor(seconds / 60)
   const secs = Math.floor(seconds % 60)
@@ -48,6 +71,7 @@ function formatTimer(seconds: number): string {
 const MAX_RECORD_SECONDS = 30
 
 export default function ConversationPage() {
+  const { toast } = useToast()
   const [user, setUser] = useState<User | null>(null)
   const [scenarios, setScenarios] = useState<Scenario[]>([])
   const [selectedScenario, setSelectedScenario] = useState<string>("")
@@ -79,9 +103,14 @@ export default function ConversationPage() {
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [isListeningFallback, setIsListeningFallback] = useState(false)
 
+  // Elapsed time for the tutor's turn: the HTTP call can take 60s+ with
+  // reasoning models, and bare dots look frozen.
+  const thinkingSeconds = useElapsed(loading)
+
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sttRef = useRef<WebSpeechSTT | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioObjectUrlRef = useRef<string | null>(null)
   const recorderHandleRef = useRef<RecorderHandle | null>(null)
   const cancelRecordingRef = useRef<boolean>(false)
   const levelBarRef = useRef<HTMLDivElement>(null)
@@ -116,6 +145,10 @@ export default function ConversationPage() {
         audioRef.current.src = ""
         audioRef.current = null
       }
+      if (audioObjectUrlRef.current) {
+        URL.revokeObjectURL(audioObjectUrlRef.current)
+        audioObjectUrlRef.current = null
+      }
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel()
         utteranceRef.current = null
@@ -139,21 +172,30 @@ export default function ConversationPage() {
     setPlayingAudioId(null)
   }
 
-  const playServerAudio = (msgId: string, url: string) => {
+  // Tutor audio is fetched with the session cookie and played from a blob URL;
+  // the API never ships base64 audio inside message JSON.
+  const playMessageAudio = async (msgId: string, messageId: string) => {
     stopAudio()
-    const audio = new Audio(url)
-    audio.onended = () => setPlayingAudioId(null)
-    audio.onerror = () => {
+    if (!session) return
+    try {
+      const blob = await fetchBlob(
+        `/api/sessions/${session.id}/messages/${messageId}/audio`,
+      )
+      const url = URL.createObjectURL(blob)
+      audioObjectUrlRef.current = url
+      const audio = new Audio(url)
+      audio.onended = () => setPlayingAudioId(null)
+      audio.onerror = () => {
+        setPlayingAudioId(null)
+        setError("Could not play the tutor audio.")
+      }
+      audioRef.current = audio
+      setPlayingAudioId(msgId)
+      await audio.play()
+    } catch {
       setPlayingAudioId(null)
-      setError("Could not play server audio.")
+      setError("Tutor audio isn't available for this message — browser speech still works.")
     }
-    audioRef.current = audio
-    setPlayingAudioId(msgId)
-    audio.play().catch((err: unknown) => {
-      setPlayingAudioId(null)
-      if (err instanceof DOMException && err.name === "NotAllowedError") return
-      setError("Could not play server audio.")
-    })
   }
 
   // Play browser TTS with utteranceRef to prevent Chrome GC mid-sentence [REV-005]
@@ -183,8 +225,8 @@ export default function ConversationPage() {
       stopAudio()
       return
     }
-    if (msg.audio_url) {
-      playServerAudio(msg.id, msg.audio_url)
+    if (msg.has_audio) {
+      void playMessageAudio(msg.id, msg.id)
     } else {
       playBrowserTTS(msg.id, msg.text)
     }
@@ -203,6 +245,7 @@ export default function ConversationPage() {
       setCefrLevel((s.cefr_level as CEFRLevel) || "A1")
       setSummary(null)
       setActiveSessionId(s.id)
+      setInputText(readDraft(s.id))
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to load session")
       setActiveSessionId(null)
@@ -251,6 +294,17 @@ export default function ConversationPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
+  // Persist the draft shortly after typing stops (no state updates here).
+  useEffect(() => {
+    if (!session?.id) return
+    const key = draftKey(session.id)
+    const timer = setTimeout(() => {
+      if (inputText.trim()) sessionStorage.setItem(key, inputText)
+      else sessionStorage.removeItem(key)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [inputText, session?.id])
+
   const startSession = async () => {
     setError("")
     setLoading(true)
@@ -260,6 +314,7 @@ export default function ConversationPage() {
       setSession(s)
       setActiveSessionId(s.id)
       setSummary(null)
+      setInputText(readDraft(s.id))
       setRecentSessions((prev) => [s, ...prev])
 
       // Immediately populate initial proactive greeting if present in response [REV-009],
@@ -275,8 +330,8 @@ export default function ConversationPage() {
       // Auto-play greeting audio if available (or trigger TTS if appropriate)
       const greetingMsg = msgs.find((m) => m.role === "assistant")
       if (greetingMsg) {
-        if (greetingMsg.audio_url) {
-          playServerAudio(greetingMsg.id, greetingMsg.audio_url)
+        if (greetingMsg.has_audio) {
+          void playMessageAudio(greetingMsg.id, greetingMsg.id)
         } else if (typeof window !== "undefined" && "speechSynthesis" in window) {
           playBrowserTTS(greetingMsg.id, greetingMsg.text)
         }
@@ -307,13 +362,32 @@ export default function ConversationPage() {
     }
   }
 
+  const applyTurn = (
+    turn: ConversationTurn,
+    tempUserId: string,
+    tempAssistantId: string,
+    sessionId: string,
+  ) => {
+    sessionStorage.removeItem(draftKey(sessionId))
+    setMessages((prev) => {
+      const withoutTemps = prev.filter(
+        (m) => m.id !== tempUserId && m.id !== tempAssistantId,
+      )
+      return [...withoutTemps, turn.user_message, turn.assistant_message]
+    })
+    if (turn.assistant_message.has_audio) {
+      void playMessageAudio(turn.assistant_message.id, turn.assistant_message.id)
+    }
+  }
+
   const sendMessage = async () => {
     if (!session || !inputText.trim() || loading || isTranscribing) return
     const text = inputText.trim()
-    const tempId = makeTempMessageId()
+    const tempUserId = makeTempMessageId()
+    const tempAssistantId = `stream-${Date.now()}`
 
     const userMsg: Message = {
-      id: tempId,
+      id: tempUserId,
       session_id: session.id,
       role: "user",
       text,
@@ -321,24 +395,96 @@ export default function ConversationPage() {
       created_at: new Date().toISOString(),
       corrections: [],
     }
-    setMessages((prev) => [...prev, userMsg])
+    const draftMsg: Message = {
+      id: tempAssistantId,
+      session_id: session.id,
+      role: "assistant",
+      text: "",
+      audio_url: null,
+      has_audio: false,
+      created_at: new Date().toISOString(),
+      corrections: [],
+    }
+    setMessages((prev) => [...prev, userMsg, draftMsg])
     setInputText("")
     setLoading(true)
     setError("")
 
+    let sawDelta = false
+    let finalTurn: ConversationTurn | null = null
+
     try {
-      const turn = await api.messages.send(session.id, text)
-      setMessages((prev) => {
-        const withoutTemp = prev.filter((m) => m.id !== tempId)
-        return [...withoutTemp, turn.user_message, turn.assistant_message]
+      await api.messages.stream(session.id, text, (event, payload) => {
+        if (event === "assistant_started") {
+          sawDelta = true
+        } else if (event === "assistant_delta") {
+          sawDelta = true
+          const chunk = (payload as { text?: string }).text ?? ""
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === tempAssistantId ? { ...m, text: m.text + chunk } : m,
+            ),
+          )
+        } else if (event === "assistant_response") {
+          finalTurn = payload as ConversationTurn
+        } else if (event === "error") {
+          throw new Error(
+            (payload as { detail?: string }).detail ?? "Streaming failed",
+          )
+        }
       })
-      if (turn.audio_url) {
-        playServerAudio(turn.assistant_message.id, turn.audio_url)
+
+      if (!finalTurn) {
+        throw new Error("The stream ended before the reply was saved.")
       }
+      applyTurn(finalTurn, tempUserId, tempAssistantId, session.id)
     } catch (err: unknown) {
-      setMessages((prev) => prev.filter((m) => m.id !== tempId))
-      setInputText(text)
-      setError(err instanceof Error ? err.message : "Failed to send message")
+      const message = err instanceof Error ? err.message : "Failed to send message"
+
+      if (!sawDelta) {
+        // Nothing reached the screen: retry through the non-streaming endpoint.
+        setMessages((prev) => prev.filter((m) => m.id !== tempAssistantId))
+        try {
+          const turn = await api.messages.send(session.id, text)
+          applyTurn(turn, tempUserId, tempAssistantId, session.id)
+          return
+        } catch {
+          setMessages((prev) =>
+            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          )
+          setInputText(text)
+        }
+      } else {
+        // The reply was partially shown. Reload what the server actually saved
+        // (it persists before finishing) instead of trusting the partial text.
+        try {
+          const fresh = await api.sessions.messages(session.id)
+          const persisted = fresh.some(
+            (m) => m.role === "user" && m.text === text,
+          )
+          if (persisted) {
+            setMessages(fresh)
+            sessionStorage.removeItem(draftKey(session.id))
+          } else {
+            setMessages((prev) =>
+              prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+            )
+            setInputText(text)
+          }
+        } catch {
+          setMessages((prev) =>
+            prev.filter((m) => m.id !== tempUserId && m.id !== tempAssistantId),
+          )
+          setInputText(text)
+        }
+      }
+
+      setError(message)
+      toast({
+        title: "Message not sent",
+        description: `${message} Your text was restored so you can retry.`,
+        variant: "error",
+      })
     } finally {
       setLoading(false)
     }
@@ -514,6 +660,7 @@ export default function ConversationPage() {
     stopAudio()
     setSession(null)
     setMessages([])
+    setInputText("")
     setSummary(null)
     setActiveSessionId(null)
     setShowBriefing(false)
@@ -629,7 +776,7 @@ export default function ConversationPage() {
                     <div>
                       <p className="text-sm font-medium">{s.scenario_name || "Free Talk"}</p>
                       <p className="text-xs text-muted-foreground">
-                        {new Date(s.started_at).toLocaleString()} · {s.message_count} messages · {s.cefr_level}
+                        {formatServerDateTime(s.started_at)} · {s.message_count} messages · {s.cefr_level}
                       </p>
                     </div>
                     {s.ended_at ? (
@@ -915,15 +1062,30 @@ export default function ConversationPage() {
         </div>
       )}
 
+      {session.ended_at && (
+        <div className="mx-4 mt-2 flex flex-wrap items-center gap-2 rounded-md border bg-secondary/60 p-3 text-sm">
+          <Info className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="flex-1">
+            This session has ended. Corrections and vocabulary are saved — start a new
+            session to keep practicing.
+          </span>
+          <Button variant="outline" size="sm" onClick={newSession}>
+            New session
+          </Button>
+        </div>
+      )}
+
       <ScrollArea className="flex-1 p-4">
-        <div className="max-w-2xl mx-auto space-y-4">
+        <div className="max-w-2xl mx-auto space-y-4" role="log" aria-live="polite" aria-relevant="additions">
           {messages.length === 0 && (
             <div className="text-center py-12 text-muted-foreground">
               <Mic className="h-12 w-12 mx-auto mb-4 opacity-50" />
               <p>Start the conversation! Type or speak in English.</p>
             </div>
           )}
-          {messages.map((msg) => (
+          {messages
+            .filter((msg) => !(msg.role === "assistant" && msg.text === ""))
+            .map((msg) => (
             <div key={msg.id} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-[80%] space-y-1`}>
                 <div
@@ -933,7 +1095,14 @@ export default function ConversationPage() {
                       : "bg-secondary"
                   }`}
                 >
-                  <p className="text-sm">{msg.text}</p>
+                  <p className="text-sm">
+                    {msg.text}
+                    {msg.id.startsWith("stream-") && loading && (
+                      <span className="ml-0.5 animate-pulse" aria-hidden="true">
+                        ▍
+                      </span>
+                    )}
+                  </p>
                 </div>
                 {msg.corrections.length > 0 && (
                   <div>
@@ -969,7 +1138,7 @@ export default function ConversationPage() {
                   <button
                     onClick={() => toggleAudioPlayback(msg)}
                     className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                    title={msg.audio_url ? "Play server audio" : "Listen (browser speech)"}
+                    title={msg.has_audio ? "Play tutor audio" : "Listen (browser speech)"}
                   >
                     {playingAudioId === msg.id ? (
                       <>
@@ -979,7 +1148,7 @@ export default function ConversationPage() {
                     ) : (
                       <>
                         <Volume2 className="h-3 w-3" />
-                        <span>{msg.audio_url ? "Play audio" : "Listen"}</span>
+                        <span>{msg.has_audio ? "Play audio" : "Listen"}</span>
                       </>
                     )}
                   </button>
@@ -987,14 +1156,28 @@ export default function ConversationPage() {
               </div>
             </div>
           ))}
-          {loading && (
+          {loading &&
+            !messages.some((m) => m.id.startsWith("stream-") && m.text.length > 0) && (
             <div className="flex justify-start">
               <div className="bg-secondary rounded-2xl px-4 py-2">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                <div className="flex items-center gap-2">
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                    <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    {isTranscribing
+                      ? "Transcribing your voice…"
+                      : `Tutor is thinking… ${formatElapsed(thinkingSeconds)}`}
+                  </span>
                 </div>
+                {!isTranscribing && thinkingSeconds >= 20 && (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Still working — reasoning models can take up to a minute. Your
+                    message is safe.
+                  </p>
+                )}
               </div>
             </div>
           )}

@@ -68,6 +68,35 @@ async def bump_daily_minutes(db: AsyncSession, user_id: str, minutes: int) -> No
 
 
 
+async def bump_daily_words(db: AsyncSession, user_id: str, delta: int = 1) -> None:
+    """Increment today's new-word counter atomically.
+
+    The weekly dashboard chart reads `progress_daily.new_words`; nothing used to
+    write it, so every week reported zero new words.
+    """
+    if delta == 0:
+        return
+
+    today = date.today()
+    result = await db.execute(
+        update(ProgressDaily)
+        .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+        .values(new_words=ProgressDaily.new_words + delta)
+    )
+    if result.rowcount:
+        return
+
+    try:
+        async with db.begin_nested():
+            db.add(ProgressDaily(user_id=user_id, date=today, new_words=delta))
+    except IntegrityError:
+        await db.execute(
+            update(ProgressDaily)
+            .where(ProgressDaily.user_id == user_id, ProgressDaily.date == today)
+            .values(new_words=ProgressDaily.new_words + delta)
+        )
+
+
 async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:
     """Load the user's tutor profile as a plain dict, or None if not configured."""
     result = await db.execute(select(TutorProfile).where(TutorProfile.user_id == user_id))

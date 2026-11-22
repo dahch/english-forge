@@ -10,8 +10,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.config import get_settings
-from app.database import engine
-from app.models.models import Base
+from app.database import async_session_factory, engine
+from app.integrations.crypto import decrypt_value, encryption_mode
+from app.models.models import Base, ProviderConfig
+from app.security import validate_security_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,12 +23,25 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Security first: never touch the database (or serve a request) with a
+    # missing/weak signing secret or a malformed encryption key.
+    validate_security_settings(settings)
+    logger.info("Security settings validated (API-key encryption: %s)", encryption_mode(settings))
+    if encryption_mode(settings) == "derived":
+        logger.warning(
+            "SETTINGS_ENCRYPTION_KEY is not set: provider keys are encrypted with a key "
+            "derived from JWT_SECRET_KEY. Rotating JWT_SECRET_KEY will make them unreadable."
+        )
+
     _validate_column_migration_metadata()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(lambda sync_conn: _ensure_new_columns_sync(sync_conn))
         await conn.run_sync(lambda sync_conn: _ensure_indexes_sync(sync_conn))
+        await conn.run_sync(lambda sync_conn: _ensure_alembic_baseline_sync(sync_conn))
     logger.info("Database tables created/verified")
+
+    await _warn_undecryptable_provider_keys()
 
     if settings.APP_PIN:
         logger.info("APP_PIN protection is enabled")
@@ -34,6 +49,43 @@ async def lifespan(app: FastAPI):
     yield
 
     await engine.dispose()
+
+
+async def _warn_undecryptable_provider_keys() -> None:
+    """Surface a key/secret mismatch before users hit provider failures.
+
+    A rotated encryption key (or a JWT secret rotation under the legacy derived
+    scheme) makes every stored provider key undecryptable. Requests then fail
+    with a generic "no providers configured", which is impossible to diagnose.
+    """
+    try:
+        async with async_session_factory() as db:
+            rows = (
+                await db.execute(
+                    sa.select(
+                        ProviderConfig.provider_name, ProviderConfig.api_key_enc
+                    )
+                )
+            ).all()
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
+        logger.warning("Could not verify stored provider keys: %s", exc)
+        return
+
+    broken: list[str] = []
+    for name, encrypted in rows:
+        if not encrypted:
+            continue
+        try:
+            decrypt_value(encrypted)
+        except Exception:  # noqa: BLE001 - any decrypt error means broken key
+            broken.append(name)
+    if broken:
+        logger.error(
+            "Provider API keys that cannot be decrypted with the current key: %s. "
+            "Restore the previous SETTINGS_ENCRYPTION_KEY/JWT_SECRET_KEY or re-add "
+            "those providers in Settings.",
+            ", ".join(sorted(set(broken))),
+        )
 
 
 app = FastAPI(
@@ -60,6 +112,9 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     "users": [
         ("current_level", "VARCHAR(2) NOT NULL DEFAULT 'A1'"),
         ("assessment_completed", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        # Access tokens embed this value; bumping it revokes every session
+        # without a denylist (ADR-022).
+        ("token_version", "INTEGER NOT NULL DEFAULT 0"),
     ],
     "progress_daily": [
         ("lessons_completed", "INTEGER NOT NULL DEFAULT 0"),
@@ -70,6 +125,10 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
         ("phase", "VARCHAR(20) NOT NULL DEFAULT 'conversation'"),
         ("section_step", "INTEGER NOT NULL DEFAULT 0"),
         ("dimension_scores", "TEXT"),
+        ("dimension_bands", "TEXT"),
+        # Abandoning frees the in-progress unique index without faking a result
+        # (see DELETE /api/assessment/{id}).
+        ("abandoned_at", "DATETIME"),
     ],
     "assessment_messages": [
         ("kind", "VARCHAR(20) NOT NULL DEFAULT 'chat'"),
@@ -87,6 +146,43 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     # both — the microsecond default just removes the random-UUID tiebreak
     # for same-second inserts.
 }
+
+
+# Revision stamped on databases that predate Alembic. The baseline migration is
+# a no-op because create_all already owns creation; stamping makes future
+# revisions applicable to both fresh and existing databases.
+BASELINE_REVISION = "0001_baseline"
+
+
+def _ensure_alembic_baseline_sync(sync_conn) -> None:
+    inspector = sa.inspect(sync_conn)
+    if inspector.has_table("alembic_version"):
+        return
+    if not inspector.has_table("users"):
+        return
+    try:
+        with sync_conn.begin_nested():
+            sync_conn.execute(
+                text(
+                    "CREATE TABLE alembic_version ("
+                    "version_num VARCHAR(32) NOT NULL, "
+                    "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+                )
+            )
+            sync_conn.execute(
+                text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+                {"revision": BASELINE_REVISION},
+            )
+        logger.info("Stamped Alembic baseline %s", BASELINE_REVISION)
+    except sa.exc.OperationalError:
+        if sa.inspect(sync_conn).has_table("alembic_version"):
+            logger.info("Alembic baseline already stamped by a concurrent startup")
+        else:
+            logger.warning(
+                "Could not stamp the Alembic baseline; future migrations will "
+                "need a manual 'alembic stamp %s'",
+                BASELINE_REVISION,
+            )
 
 
 def _column_exists(sync_conn, table: str, column_name: str) -> bool:
@@ -130,6 +226,25 @@ def _index_exists(sync_conn, table_name: str, index_name: str) -> bool:
     return any(r[1] == index_name for r in rows)
 
 
+def _existing_index_sql(sync_conn, index_name: str) -> str | None:
+    row = sync_conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = :name"),
+        {"name": index_name},
+    ).first()
+    return row[0] if row else None
+
+
+def _normalize_sql(sql: str) -> str:
+    """Compare index definitions ignoring formatting and IF NOT EXISTS.
+
+    SQLite stores the CREATE statement without `IF NOT EXISTS`, so comparing
+    the raw text would report a difference on every startup and needlessly
+    drop/recreate the index (a write lock on every boot).
+    """
+    normalized = " ".join(sql.lower().split())
+    return normalized.replace("if not exists ", "")
+
+
 # Partial unique indexes enforcing invariants that plain column adds can't
 # express. IF NOT EXISTS makes repeated startups idempotent. Each entry is
 # (index_name, table_name, create_sql) so failures can be verified, not just
@@ -141,7 +256,7 @@ _INDEXES_TO_ADD: list[tuple[str, str, str]] = [
         "uq_assessments_user_in_progress",
         "assessments",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_assessments_user_in_progress "
-        "ON assessments (user_id) WHERE completed_at IS NULL",
+        "ON assessments (user_id) WHERE completed_at IS NULL AND abandoned_at IS NULL",
     ),
     # Only one active learning path per user — makes the deactivate+insert in
     # POST /api/learning-paths/generate atomic (see _generate_path_for_user).
@@ -162,11 +277,45 @@ _INDEXES_TO_ADD: list[tuple[str, str, str]] = [
         "ON assessment_messages (assessment_id, item_id) "
         "WHERE role = 'user' AND item_id IS NOT NULL",
     ),
+    # One vocabulary row per word per user, case-insensitively. The LLM and the
+    # manual form used to race on SELECT-then-INSERT and create duplicates.
+    (
+        "uq_vocab_items_user_word",
+        "vocab_items",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_vocab_items_user_word "
+        "ON vocab_items (user_id, lower(word))",
+    ),
+    # The seeded predefined scenarios must exist once, not once per concurrent
+    # first request (ADR-023): global rows only.
+    (
+        "uq_scenarios_global_name",
+        "scenarios",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_scenarios_global_name "
+        "ON scenarios (lower(name)) WHERE user_id IS NULL AND is_custom = 0",
+    ),
 ]
 
 
 def _ensure_indexes_sync(sync_conn) -> None:
+    inspector = sa.inspect(sync_conn)
     for index_name, table_name, index_sql in _INDEXES_TO_ADD:
+        if not inspector.has_table(table_name):
+            continue
+        # IF NOT EXISTS would silently keep an outdated predicate (e.g. the old
+        # assessment index without `abandoned_at`). Replace it when the stored
+        # definition differs from the one this build expects.
+        existing_sql = _existing_index_sql(sync_conn, index_name)
+        if existing_sql and _normalize_sql(existing_sql) != _normalize_sql(index_sql):
+            try:
+                with sync_conn.begin_nested():
+                    sync_conn.execute(text(f"DROP INDEX IF EXISTS {index_name}"))
+                logger.info(f"Replacing index {index_name}: definition changed")
+            except sa.exc.OperationalError:
+                logger.warning(
+                    f"Could not drop outdated index {index_name}; keeping the previous "
+                    f"definition. Expected: {index_sql}"
+                )
+                continue
         try:
             with sync_conn.begin_nested():
                 sync_conn.execute(text(index_sql))
@@ -227,6 +376,7 @@ from app.routers.ws import router as ws_router
 from app.routers.tutor_profile import router as tutor_profile_router
 from app.routers.assessment import router as assessment_router
 from app.routers.learning_paths import router as learning_paths_router
+from app.routers.export import router as export_router
 
 app.include_router(auth_router)
 app.include_router(sessions_router)
@@ -240,6 +390,7 @@ app.include_router(ws_router)
 app.include_router(tutor_profile_router)
 app.include_router(assessment_router)
 app.include_router(learning_paths_router)
+app.include_router(export_router)
 
 
 @app.exception_handler(Exception)

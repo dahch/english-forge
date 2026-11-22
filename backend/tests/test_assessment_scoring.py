@@ -4,6 +4,10 @@ from app.services.assessment_scoring import (
     band_from_score,
     compute_confidence,
     final_level,
+    final_level_from_bands,
+    listening_band,
+    pronunciation_band,
+    shift_band,
     strengths_weaknesses,
 )
 from app.services.assessment_bank import LISTENING_ITEMS, SPEAKING_ITEMS
@@ -97,6 +101,67 @@ class TestStrengthsWeaknesses:
         )
         assert strengths == ["grammar", "vocabulary"]
         assert weaknesses == ["listening", "pronunciation"]
+
+
+class TestDifficultyWeightedBands:
+    def test_easy_items_only_do_not_imply_c1(self):
+        # The old raw-accuracy mapping gave 100 (C2) for one correct A2 item.
+        assert listening_band([("A2", True)]) == "A2"
+
+    def test_all_correct_uses_hardest_item(self):
+        evidence = [
+            ("A2", True),
+            ("B1", True),
+            ("B1", True),
+            ("B2", True),
+            ("C1", True),
+            ("C1", True),
+        ]
+        assert listening_band(evidence) == "C1"
+
+    def test_poor_accuracy_demotes_the_hardest_hit(self):
+        evidence = [
+            ("A2", False),
+            ("B1", False),
+            ("B1", False),
+            ("B2", False),
+            ("C1", True),
+        ]
+        assert listening_band(evidence) == "B1"
+
+    def test_no_correct_answers_is_a1(self):
+        assert listening_band([("C1", False)]) == "A1"
+
+    def test_pronunciation_is_bounded_by_sentence_difficulty(self):
+        assert pronunciation_band([("B1", 92)]) == "B1"
+
+    def test_pronunciation_demotes_when_accuracy_is_low(self):
+        assert pronunciation_band([("B1", 60)]) == "A1"
+
+    def test_perfect_reader_credited_with_hardest_sentence(self):
+        assert pronunciation_band([("A2", 95), ("B1", 90), ("C1", 88)]) == "C1"
+
+    def test_shift_band_clamps(self):
+        assert shift_band("A1", 3) == "A1"
+        assert shift_band("C2", 1) == "C1"
+
+    def test_final_level_from_bands_is_conservative_median(self):
+        assert (
+            final_level_from_bands(
+                {
+                    "grammar": "B2",
+                    "vocabulary": "B1",
+                    "fluency": "B1",
+                    "listening": "C1",
+                    "pronunciation": "C1",
+                }
+            )
+            == "B2"
+        )
+
+    def test_final_level_from_bands_ignores_unmeasured(self):
+        assert final_level_from_bands({"grammar": "B1", "listening": None}) == "B1"
+        assert final_level_from_bands({}) is None
 
 
 class TestItemBanks:

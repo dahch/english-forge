@@ -29,6 +29,8 @@ Thumbs.db
 # Data (repo root only — backend lesson JSONs live in app/lessons/data/)
 *.db
 /data/
+backend/data/
+data/media/
 # Agent skill assets are local-only, not app code
 .agents/**/data/
 

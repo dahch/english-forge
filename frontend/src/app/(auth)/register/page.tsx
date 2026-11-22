@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
-import { api, setToken } from "@/lib/api"
+import { api, setAuthenticated } from "@/lib/api"
 import { Sparkles } from "lucide-react"
 
 export default function RegisterPage() {
@@ -23,9 +23,9 @@ export default function RegisterPage() {
     setLoading(true)
     try {
       await api.auth.register(email, password, displayName)
-      const res = await api.auth.login(email, password)
-      setToken(res.access_token)
-      router.push("/conversation")
+      await api.auth.login(email, password)
+      setAuthenticated(true)
+      router.replace("/conversation")
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Registration failed")
     } finally {

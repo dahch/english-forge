@@ -154,14 +154,14 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 │  - STT: Web Speech API /    │
 │    whisper-wasm en cliente  │
 └──────────────┬──────────────┘
-               │ REST + WebSocket (JWT)
+               │ REST + SSE (cookie session) · WS (direct clients)
 ┌──────────────▼──────────────┐
 │   Backend (FastAPI, Python) │
 │  - Orquestación LLM (BYOK)  │
 │  - Motor de corrección      │
 │  - SRS engine               │
 │  - Progreso / analítica     │
-│  - JWT auth, multi-user     │
+│  - Cookie auth + sessions   │
 │  - Proxy hacia Pocket (TTS) │
 │  - (Opcional) STT server-side│
 │    con faster-whisper       │
@@ -177,7 +177,7 @@ Aplicación **personal, self-hosted y gratuita** para practicar y aprender ingl�
 ```
 
 - **Despliegue**: Docker Compose de un solo stack (`frontend`, `backend` — no hay servicio `db`; SQLite vive en el volumen `backend_data` montado en `/app/data`), pensado para correr en el mismo homelab que Pocket. En despliegues Coolify, el `env_file:.env` puede ser opcional ya que Coolify provee la configuración ambiental.
-- **Multi-usuario**: JWT auth con registro y login. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. Soporta modo single-user o multi-user según necesidad — la arquitectura está preparada para ambos.
+- **Multi-usuario**: sesiones por cookie `HttpOnly` (access 15 min + refresh rotatorio 30 días con detección de reuso y revocación por `token_version`), CSRF por double-submit y Bearer para scripts. El PIN/password local es opcional para proteger acceso desde fuera de la LAN. Soporta modo single-user o multi-user según necesidad — la arquitectura está preparada para ambos. El navegador usa SSE para respuestas incrementales; el WebSocket queda para clientes directos (el proxy de Next no actualiza sockets).
 - **PWA**: instalar en el móvil como app (icono, offline shell) sin pasar por app stores.
 
 ---
@@ -217,7 +217,8 @@ providers:
 
 > Nota: no tengo certeza de qué API expande exactamente "ClinePass" en tu caso — lo modelo como **otro endpoint OpenAI-compatible configurable por URL/clave/modelo**, igual que "custom". Si en realidad es un proxy/router (tipo OpenRouter), encaja igual en este patrón sin cambios.
 
-- Las claves se guardan **solo en el backend**, vía la pantalla de ajustes cifrada en la base de datos local (nunca se exponen al frontend). El `LLMRouter` lee los proveedores exclusivamente de `provider_configs` — las variables `*_API_KEY` de `.env` no se consumen actualmente (TBD).
+- Las claves se guardan **solo en el backend**, cifradas en `provider_configs` (nunca se exponen al frontend; la API solo devuelve `has_api_key`). El `LLMRouter` prioriza `provider_configs` y, si el usuario no tiene ninguno activo, cae a las variables `*_API_KEY` del servidor (fallback global; dejar vacías en instancias compartidas).
+- La UI permite **editar** un proveedor existente (dejar la clave en blanco conserva la guardada) y **probar la conexión** (una completion mínima con timeout de 20 s y límite de 8/min por usuario) tanto antes de guardar como sobre uno ya guardado; el resultado indica latencia o un error saneado, nunca la clave.
 - Selector en la UI: qué proveedor/modelo usar por defecto para (a) conversación, (b) corrección, (c) generación de lecciones — pueden ser distintos (ej. modelo barato para corrección estructurada, modelo mejor para roleplay).
 - Fallback automático: si el proveedor primario falla (rate limit, error), reintentar con el siguiente configurado.
 - Tracking de uso: contador local de tokens/llamadas por proveedor (sin coste real porque BYOK, pero útil para saber consumo).
@@ -289,13 +290,13 @@ The data model has evolved beyond the initial simplified SQL. The following is t
 
 ```sql
 -- users table (extended columns added via startup migration)
-users(id, email, hashed_password, display_name, current_level, assessment_completed, created_at)
+users(id, email, hashed_password, display_name, current_level, assessment_completed, token_version, created_at)
 
 -- sessions table
 sessions(id, user_id, scenario_id, started_at, ended_at, cefr_level, provider_used)
 
 -- messages table
-messages(id, session_id, role, text, audio_url, created_at)
+messages(id, session_id, role, text, audio_url /* media:<key> | legacy data URI */, created_at)
 
 -- corrections table
 corrections(id, message_id, error_type, original_fragment, correction, explanation)
@@ -316,7 +317,7 @@ settings(id, user_id, key, value, UNIQUE (key, user_id))
 tutor_profiles(id, user_id, name, age, gender, personality, voice, created_at, updated_at)
 
 -- assessments table (no created_at — ordering uses started_at + id)
-assessments(id, user_id, started_at, completed_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, phase, section_step, dimension_scores)
+assessments(id, user_id, started_at, completed_at, abandoned_at, estimated_level, confidence, strengths, weaknesses, recommendations, summary, phase, section_step, dimension_scores, dimension_bands)
 
 -- assessment_messages table
 assessment_messages(id, assessment_id, role, text, kind, audio_url, metrics, item_id, created_at)
@@ -335,9 +336,16 @@ path_lessons(id, path_id, lesson_type, topic, description, content, order, compl
 
 -- provider_configs table
 provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, protocol, is_active, priority, task_routing, created_at, updated_at)
+
+-- refresh_tokens table (only the SHA-256 is stored; rotation revokes the old row)
+refresh_tokens(id, user_id, token_hash, created_at, expires_at, revoked_at, replaced_by_id, user_agent, ip_address)
 ```
 
-> **Nota sobre columnas adicionales**: `current_level` y `assessment_completed` en `users`, y `lessons_completed` en `progress_daily`, son columnas que pueden no estar presentes en bases de datos existentes. El backend incluye un mecanismo de **sincronización al inicio** (`_COLUMNS_TO_ADD` en `backend/app/main.py`) que se ejecuta en cada arranque y añade columnas faltantes con sus valores por defecto mediante `ALTER TABLE`. Esto es seguro porque cada columna solo se añade si está ausente (comprobada por el inspector). Además, se crean índices parciales únicos al inicio (`uq_assessments_user_in_progress` y `uq_learning_paths_user_active`) para garantizar invariantes como "solo un assessment en progreso por usuario" y "solo una learning path activa por usuario".
+> **Nota sobre columnas adicionales**: `current_level`, `assessment_completed` y `token_version` en `users`; `lessons_completed` en `progress_daily`; `phase`, `section_step`, `dimension_scores`, `dimension_bands` y `abandoned_at` en `assessments`; `kind`, `audio_url`, `metrics` e `item_id` en `assessment_messages`. El backend las añade al arrancar (`_COLUMNS_TO_ADD`) con `ALTER TABLE` guardado por inspector. El esquema está versionado con **Alembic**: el arranque estampa `0001_baseline` y las revisiones posteriores se aplican con `alembic upgrade head`. Las bases nuevas llevan `CHECK` (roles, fases, niveles CEFR, contadores no negativos) y las existentes conservan el DDL antiguo.
+>
+> **Índices e invariantes**: `uq_assessments_user_in_progress` (solo un assessment en progreso, ignorando abandonados), `uq_learning_paths_user_active`, `uq_assessment_messages_user_item`, `uq_vocab_items_user_word` (una fila por usuario y palabra, sin distinguir mayúsculas) y `uq_scenarios_global_name` (un escenario global por nombre). Los duplicados preexistentes impiden crear el índice y se avisa en el arranque.
+>
+> **Audio**: el TTS nuevo se guarda como fichero en `MEDIA_DIR` y la BD solo guarda `media:<clave>`; `MessageResponse` expone `has_audio` y el audio se sirve por endpoints autenticados. Las filas antiguas con data URI siguen reproduciéndose.
 
 > **Nota**: `learning_paths.lessons_required` se ajusta (cap) al número real de lecciones devueltas por el LLM, para que el path siempre pueda avanzar aunque el LLM devuelva menos lecciones de las solicitadas.
 
@@ -357,7 +365,8 @@ provider_configs(id, user_id, provider_name, api_key_enc, base_url, model, proto
 8. **Assessment multisección (v2)**: el assessment ya no es solo chat — es un flujo de fases controlado por el servidor (`assessments.phase`, máquina de estados en `app/services/assessment_flow.py`): `mic_check` (calibración de micrófono con una frase fija) → `conversation` (entrevista conversacional, mínimo 6 intercambios y máximo 10) → `listening` (ítems de comprensión **solo en audio**, texto oculto, con stop adaptativo tras 2 fallos seguidos) → `speaking` (frases para leer en voz alta puntuadas determinísticamente). El LLM **no puede** terminar la entrevista antes del mínimo (`MIN_ASSESSMENT_EXCHANGES`); solo el cierre explícito del usuario (`wants_to_finish()` o el botón *Finish & See Results*) o el tope de 10 la cortan. El `is_complete` transitorio de `AssessmentResponse` ahora significa "todas las secciones terminadas — llamar a `POST /api/assessment/{id}/complete`".
 9. **Puntuación determinista**: el nivel final y la confianza **ya no los decide el LLM**. `listening` se puntúa por aciertos en los ítems (grading LLM por ítem con fallback por keywords), `pronunciation` con métricas objetivas por grabación (WER de palabras + PER fonémico vía phonemizer/espeak-ng + fluidez desde word timestamps de Moonshine; compuesto 60/25/15), y `grammar`/`vocabulary`/`fluency` con rúbrica LLM 0-100 sobre la transcripción. La agregación (`app/services/assessment_scoring.py`) mapea cada dimensión a banda CEFR (0-20 A1 … 86-100 C2), toma la mediana conservadora como nivel final y calcula la confianza a partir de cobertura de dimensiones, volumen de evidencia y dispersión. Strengths/weaknesses son etiquetas derivadas de dimensiones medidas — el LLM solo escribe resumen y recomendaciones, y nunca puede afirmar dimensiones sin evidencia.
 10. **Re-análisis**: `POST /api/assessment/{id}/reanalyze` re-ejecuta el análisis sobre la misma conversación ya completada (actualiza nivel estimado, fortalezas, debilidades, recomendaciones y resumen). Lleva una guarda anti-abuso por proceso de 30 s por assessment (HTTP 429 si se repite antes de que expire). Si el LLM falla o devuelve una forma inesperada, el análisis se completa con un fallback determinista construido desde la evidencia medida (nivel + scores de listening/pronunciation; grammar/vocabulary/fluency quedan sin medir) en lugar de fallar la petición — «Re-analyze Results» reintenta el LLM más tarde.
-11. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación — descartando además los timestamps que no se corresponden con el transcript, de modo que la fluidez no se puede fabricar — y descarta envíos duplicados/desactualizados de forma atómica vía el índice único parcial sobre `(assessment_id, item_id)` (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
+11. **Streaming incremental**: `POST /api/sessions/{id}/messages/stream` responde `text/event-stream` con `start`, `assistant_started` (proveedor/modelo), `assistant_delta` (texto), `assistant_response` (turno persistido, correcciones y vocabulario) y `error`; se envían comentarios keepalive mientras el modelo razona. El texto se pide en plano (`build_streaming_system_prompt`) y una segunda llamada no-streaming extrae correcciones/vocabulario. El servicio `stream_turn` es compartido por SSE y WebSocket; si el stream falla antes del primer token el cliente reintenta por REST, y si falla después recarga el historial persistido. El WebSocket directo también emite `assistant_started`/`assistant_delta`.
+12. **Audio del assessment**: los mensajes del tutor se sintetizan on-demand (`GET /api/assessment/{id}/messages/{message_id}/audio`, TTS pocket-tts con caché en `audio_url` — la data URI nunca se serializa en respuestas). Las grabaciones del alumno (`POST /api/assessment/{id}/recordings`) se transcriben por Moonshine vía personal-api (semáforo global de 1 job por saturación de CPU) con fallback a faster-whisper in-process; el audio nunca se persiste — solo transcript + word timestamps. El cliente hace eco de los word timestamps (`words`) y del ítem respondido (`item_id`) en `POST /{id}/message`; el servidor **siempre recalcula** las métricas de pronunciación — descartando además los timestamps que no se corresponden con el transcript, de modo que la fluidez no se puede fabricar — y descarta envíos duplicados/desactualizados de forma atómica vía el índice único parcial sobre `(assessment_id, item_id)` (el cliente jamás inyecta puntuaciones). Los cambios requeridos en personal-api están especificados en `docs/personal-api-changes.md`.
 
 ### Ejemplo de contrato JSON que debe devolver el LLM (usado igual en todos los proveedores vía prompt + parsing tolerante):
 
@@ -468,6 +477,18 @@ english-forge/
 - Protección estricta contra revelado anticipado: stripping inicial de respuestas y explicaciones en lecciones estáticas y generadas con evaluación server-side (`/exercise`).
 - Learning paths con progresión automática y lecciones interactivas cuyo contenido se genera bajo demanda (lazy) con corrección server-side.
 - Evaluación de ejercicios con respuestas nunca expuestas al frontend (ADR-003/005/014).
+
+**Phase 6 — Endurecimiento (auditoría)** ✅
+- Secretos fail-fast (JWT/Fernet), rate limiting de login/registro, política de contraseñas y email normalizado.
+- Turnos fuera de la transacción de escritura, lock por sesión, fin de sesión idempotente y abandono/reclamo de assessments.
+- Feedback de UI: toasts, estados con etapas/tiempo, stepper del assessment, boundaries de error, banner offline y etiquetado honesto de fallbacks LLM.
+- Cookies `HttpOnly` + refresh rotatorio con detección de reuso y CSRF; borradores por sesión y `?next=`.
+- Datos: Alembic baseline, `CHECK`/índices únicos, JSON defensivo, contadores reales, audio en ficheros y bandas CEFR ponderadas por dificultad.
+
+**Phase 7 — Refinamiento de producto** ✅
+- Edición y test de conectividad de proveedores en Settings.
+- Paginación con "cargar más" en vocabulario y lecciones generadas.
+- Streaming real de respuestas por SSE (y deltas por WebSocket para clientes directos) con fallback REST y revisión en segunda llamada.
 
 **Phase 5 (opcional, futura)**
 - Avatar animado simple (placeholder ya preparado en Fase 2).

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Annotated
 import random
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -22,6 +24,7 @@ from app.schemas.vocab import (
     VocabItemUpdate,
 )
 from app.srs.sm2 import sm2_update, next_review_date
+from app.utils import bump_daily_words
 
 router = APIRouter(prefix="/api/vocab", tags=["vocab"])
 
@@ -31,6 +34,10 @@ async def list_vocab(
     filter: str = Query("all", pattern="^(all|due|new)$"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    # Annotated defaults are real ints, so direct handler calls in tests/scripts
+    # keep working (a Query(...) default would leak into them).
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
     query = select(VocabItem).where(VocabItem.user_id == current_user.id)
     if filter == "due":
@@ -39,7 +46,7 @@ async def list_vocab(
         )
     elif filter == "new":
         query = query.where(VocabItem.interval_days == 0)
-    query = query.order_by(VocabItem.created_at.desc())
+    query = query.order_by(VocabItem.created_at.desc()).offset(offset).limit(limit)
 
     result = await db.execute(query)
     items = result.scalars().all()
@@ -63,7 +70,13 @@ async def create_vocab(
         next_review_at=next_review_date(0),
     )
     db.add(item)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Unique index on (user_id, lower(word)): report it instead of a 500.
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="This word is already in your vocabulary")
+    await bump_daily_words(db, current_user.id, 1)
     await db.refresh(item)
     return VocabItemResponse.model_validate(item)
 

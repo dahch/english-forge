@@ -7,13 +7,19 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth_cookies import ACCESS_COOKIE_NAME
+from app.concurrency import session_turn_lock
+from app.config import get_settings
 from app.database import async_session_factory
 from app.models.models import Message, Session, User
 from app.security import decode_access_token
+from app.services.conversation_stream import stream_turn
+from app.services.media_store import store_audio
+from app.services.session_metrics import finalize_session
 from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.models.models import Correction, Scenario
-from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
+from app.utils import get_tutor_profile_dict, resolve_tts_voice
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.integrations.stt_personal_api import STTPersonalAPI
 from app.integrations.stt_whisper_server import STTWhisperServer
@@ -32,11 +38,40 @@ async def _get_user_from_token(token: str) -> User | None:
         return None
     async with async_session_factory() as db:
         result = await db.execute(select(User).where(User.id == user_id))
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        if user is None:
+            return None
+        # Same revocation rule as the HTTP dependency.
+        if int(payload.get("ver", 0)) != int(user.token_version or 0):
+            return None
+        return user
+
+
+MAX_WS_MESSAGE_BYTES = 1_000_000
+
+
+def _origin_allowed(websocket: WebSocket) -> bool:
+    """Reject cross-site socket upgrades when the browser sends an Origin.
+
+    WebSockets are not covered by CORS: without this, any site could open a
+    socket with the user's cookies. Non-browser clients (no Origin) still need
+    a valid token, so they are allowed.
+    """
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    return origin in get_settings().cors_origins_list
 
 
 @router.websocket("/api/ws/session/{session_id}")
 async def websocket_session(websocket: WebSocket, session_id: str, token: str = ""):
+    if not _origin_allowed(websocket):
+        await websocket.close(code=4403, reason="Origin not allowed")
+        return
+
+    # Cookie first (the browser never exposes an HttpOnly token to JS); the
+    # query param stays for non-browser clients and older integrations.
+    token = token or websocket.cookies.get(ACCESS_COOKIE_NAME) or ""
     user = await _get_user_from_token(token)
     if not user:
         await websocket.close(code=4001, reason="Unauthorized")
@@ -56,6 +91,9 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_json({"type": "error", "message": "Message too large"})
+                continue
             try:
                 data = json.loads(raw)
                 if not isinstance(data, dict):
@@ -81,8 +119,21 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                     if not curr_session:
                         await websocket.send_json({"type": "error", "message": "Session not found"})
                         break
-                    response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
-                await websocket.send_json({"type": "assistant_response", **response})
+                    if curr_session.ended_at is not None:
+                        await websocket.send_json({"type": "error", "message": "Session has ended"})
+                        break
+
+                    async def emit(event: str, payload: dict) -> None:
+                        await websocket.send_json({"type": event, **payload})
+
+                    try:
+                        await stream_turn(turn_db, user, curr_session, text, emit)
+                    except Exception:
+                        logger.exception("Streaming turn failed for session %s", session_id)
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "The tutor could not answer. Please try again.",
+                        })
 
             elif msg_type == "user_audio":
                 import base64
@@ -129,9 +180,14 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                         if not curr_session:
                             await websocket.send_json({"type": "error", "message": "Session not found"})
                             break
-                        response = await _process_turn(turn_db, session_id, user.id, text, curr_session)
-                        await turn_db.commit()
-                    await websocket.send_json({"type": "assistant_response", **response})
+                        if curr_session.ended_at is not None:
+                            await websocket.send_json({"type": "error", "message": "Session has ended"})
+                            break
+
+                        async def emit(event: str, payload: dict) -> None:
+                            await websocket.send_json({"type": event, **payload})
+
+                        await stream_turn(turn_db, user, curr_session, text, emit)
                 except Exception as e:
                     logger.error(f"Turn processing error in session {session_id}: {e}")
                     await websocket.send_json({"type": "error", "message": "Failed to process turn. Please try again."})
@@ -144,14 +200,7 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
                     )
                     session_obj = res.scalar_one_or_none()
                     if session_obj:
-                        session_obj.ended_at = datetime.now(timezone.utc)
-                        duration = 0.0
-                        if session_obj.started_at:
-                            ended = session_obj.ended_at if session_obj.ended_at.tzinfo else session_obj.ended_at.replace(tzinfo=timezone.utc)
-                            started = session_obj.started_at if session_obj.started_at.tzinfo else session_obj.started_at.replace(tzinfo=timezone.utc)
-                            duration = (ended - started).total_seconds() / 60.0
-                        if duration > 0:
-                            await bump_daily_minutes(turn_db, user.id, int(round(duration)))
+                        await finalize_session(turn_db, session_obj)
                         await turn_db.commit()
                 await websocket.send_json({"type": "session_ended"})
                 break
@@ -170,6 +219,19 @@ async def websocket_session(websocket: WebSocket, session_id: str, token: str = 
 
 
 async def _process_turn(
+    db: AsyncSession,
+    session_id: str,
+    user_id: str,
+    text: str,
+    session: Session,
+) -> dict:
+    # Serialize turns per session, same as the REST path: the read→LLM→write
+    # sequence must not interleave with another tab's turn.
+    async with session_turn_lock(session_id):
+        return await _process_turn_locked(db, session_id, user_id, text, session)
+
+
+async def _process_turn_locked(
     db: AsyncSession,
     session_id: str,
     user_id: str,
@@ -295,9 +357,7 @@ async def _process_turn(
         voice = await resolve_tts_voice(db, user_id, profile_dict)
         audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
         if audio_bytes:
-            import base64
-            audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
-            assistant_msg.audio_url = audio_url
+            assistant_msg.audio_url = store_audio(audio_bytes)
     except Exception:
         pass
 
@@ -308,9 +368,11 @@ async def _process_turn(
             "id": assistant_msg.id,
             "role": "assistant",
             "text": assistant_msg.text,
-            "audio_url": audio_url,
+            "audio_url": None,
+            "has_audio": bool(assistant_msg.audio_url),
         },
         "corrections": correction_list,
         "new_vocab": new_vocab_list,
-        "audio_url": audio_url,
+        "audio_url": None,
+        "has_audio": bool(assistant_msg.audio_url),
     }

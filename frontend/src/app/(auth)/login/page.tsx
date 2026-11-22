@@ -1,29 +1,42 @@
 "use client"
 
-import { useState } from "react"
-import { useRouter } from "next/navigation"
+import { Suspense, useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
-import { api, setToken } from "@/lib/api"
+import { api, setAuthenticated } from "@/lib/api"
 import { Sparkles } from "lucide-react"
 
-export default function LoginPage() {
+// Only same-origin absolute paths: reject "//evil.example" open redirects.
+function sanitizeNextPath(requested: string | null): string {
+  if (requested && requested.startsWith("/") && !requested.startsWith("//")) {
+    return requested
+  }
+  return "/conversation"
+}
+
+function LoginForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState("")
   const [loading, setLoading] = useState(false)
+  // Return-to-page support: an expired session sends the user here with
+  // ?next=/current/path so signing in resumes what they were doing.
+  const nextPath = sanitizeNextPath(searchParams.get("next"))
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError("")
     setLoading(true)
     try {
-      const res = await api.auth.login(email, password)
-      setToken(res.access_token)
-      router.push("/conversation")
+      await api.auth.login(email, password)
+      // The session is now in HttpOnly cookies; this flag only drives the shell.
+      setAuthenticated(true)
+      router.replace(nextPath)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Login failed")
     } finally {
@@ -83,5 +96,19 @@ export default function LoginPage() {
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center text-muted-foreground">
+          Loading…
+        </div>
+      }
+    >
+      <LoginForm />
+    </Suspense>
   )
 }

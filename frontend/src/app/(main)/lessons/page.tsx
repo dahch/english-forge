@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,6 +11,8 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Label } from "@/components/ui/label"
 import { api, type LibraryLesson } from "@/lib/api"
+import { useToast } from "@/components/feedback/toast"
+import { formatElapsed, useElapsed } from "@/lib/use-elapsed"
 import type { GeneratedLesson, LearningPath } from "@/lib/types"
 import {
   GraduationCap,
@@ -26,6 +28,7 @@ import {
   ExternalLink,
   ChevronRight,
   Plus,
+  RefreshCw,
   X,
 } from "lucide-react"
 
@@ -41,6 +44,7 @@ const TOPIC_SUGGESTIONS = [
 ]
 
 export default function LessonsPage() {
+  const { toast } = useToast()
   const [libraryLessons, setLibraryLessons] = useState<LibraryLesson[]>([])
   const [generatedLessons, setGeneratedLessons] = useState<GeneratedLesson[]>([])
   const [learningPath, setLearningPath] = useState<LearningPath | null>(null)
@@ -57,6 +61,11 @@ export default function LessonsPage() {
   const [generating, setGenerating] = useState(false)
   const [completing, setCompleting] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [generatedHasMore, setGeneratedHasMore] = useState(false)
+  const [loadingMoreGenerated, setLoadingMoreGenerated] = useState(false)
+  const generatedOffsetRef = useRef(0)
+  const generatingSeconds = useElapsed(generating)
+  const GENERATED_PAGE_SIZE = 30
 
   useEffect(() => {
     loadAll()
@@ -78,13 +87,17 @@ export default function LessonsPage() {
     try {
       const [libRes, genRes, pathRes, meRes] = await Promise.allSettled([
         api.lessons.library(),
-        api.lessons.generated(),
+        api.lessons.generated(GENERATED_PAGE_SIZE, 0),
         api.learningPath.current(),
         api.auth.me(),
       ])
 
       if (libRes.status === "fulfilled") setLibraryLessons(libRes.value)
-      if (genRes.status === "fulfilled") setGeneratedLessons(genRes.value)
+      if (genRes.status === "fulfilled") {
+        setGeneratedLessons(genRes.value)
+        generatedOffsetRef.current = genRes.value.length
+        setGeneratedHasMore(genRes.value.length === GENERATED_PAGE_SIZE)
+      }
       if (pathRes.status === "fulfilled") setLearningPath(pathRes.value)
       if (meRes.status === "fulfilled") {
         const lvl = meRes.value.current_level || "B1"
@@ -95,6 +108,30 @@ export default function LessonsPage() {
       setLoadError(err instanceof Error ? err.message : "Failed to load lessons")
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadMoreGenerated = async () => {
+    setLoadingMoreGenerated(true)
+    try {
+      const page = await api.lessons.generated(
+        GENERATED_PAGE_SIZE,
+        generatedOffsetRef.current,
+      )
+      setGeneratedLessons((prev) => {
+        const seen = new Set(prev.map((lesson) => lesson.id))
+        return [...prev, ...page.filter((lesson) => !seen.has(lesson.id))]
+      })
+      generatedOffsetRef.current += page.length
+      setGeneratedHasMore(page.length === GENERATED_PAGE_SIZE)
+    } catch (err: unknown) {
+      toast({
+        title: "Could not load more lessons",
+        description: err instanceof Error ? err.message : "Try again.",
+        variant: "error",
+      })
+    } finally {
+      setLoadingMoreGenerated(false)
     }
   }
 
@@ -130,15 +167,29 @@ export default function LessonsPage() {
         topic: topic.trim() || undefined,
         level,
       })
-      setGeneratedLessons((prev) => [lesson, ...prev])
+      setGeneratedLessons((prev) => [lesson, ...prev.filter((item) => item.id !== lesson.id)])
+      // The new row shifts server-side pagination by one.
+      generatedOffsetRef.current += 1
       setActiveLesson(lesson)
       setExerciseAnswers({})
       setExerciseResults({})
       setExerciseErrors({})
       setShowGenerateModal(false)
       setCustomTopic("")
+      if (lesson.source === "fallback") {
+        toast({
+          title: "Base lesson generated",
+          description:
+            "The model didn't answer in time, so a default lesson for this level was saved. Try Regenerate for a personalized one.",
+          variant: "info",
+        })
+      } else {
+        toast({ title: "Lesson ready", description: lesson.title, variant: "success" })
+      }
     } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : "Lesson generation failed")
+      const message = err instanceof Error ? err.message : "Lesson generation failed"
+      setLoadError(message)
+      toast({ title: "Could not generate the lesson", description: message, variant: "error" })
     } finally {
       setGenerating(false)
     }
@@ -153,8 +204,11 @@ export default function LessonsPage() {
         prev.map((l) => (l.id === lesson.id ? { ...l, completed: true, completed_at: new Date().toISOString() } : l))
       )
       setActiveLesson((prev) => (prev && prev.id === lesson.id ? { ...prev, completed: true } : prev))
+      toast({ title: "Lesson completed", variant: "success" })
     } catch (err: unknown) {
-      setLoadError(err instanceof Error ? err.message : "Failed to mark complete")
+      const message = err instanceof Error ? err.message : "Failed to mark complete"
+      setLoadError(message)
+      toast({ title: "Could not mark the lesson complete", description: message, variant: "error" })
     } finally {
       setCompleting(null)
     }
@@ -203,19 +257,41 @@ export default function LessonsPage() {
           </Button>
 
           {isGen ? (
-            <Button
-              size="sm"
-              variant={activeLesson.completed ? "outline" : "default"}
-              onClick={() => completeGeneratedLesson(activeLesson)}
-              disabled={completing === activeLesson.id || activeLesson.completed}
-            >
-              {completing === activeLesson.id ? (
-                <Loader2 className="h-4 w-4 animate-spin mr-1" />
-              ) : (
-                <Check className={`h-4 w-4 mr-1 ${activeLesson.completed ? "text-emerald-600 dark:text-emerald-400" : ""}`} />
+            <div className="flex items-center gap-2">
+              {activeLesson.source === "fallback" && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() =>
+                    generateLessonOnDemand(
+                      activeLesson.topic ?? undefined,
+                      activeLesson.level ?? undefined,
+                    )
+                  }
+                  disabled={generating}
+                >
+                  {generating ? (
+                    <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                  ) : (
+                    <RefreshCw className="h-4 w-4 mr-1" />
+                  )}
+                  {generating ? `Regenerating… ${formatElapsed(generatingSeconds)}` : "Regenerate"}
+                </Button>
               )}
-              {activeLesson.completed ? "Completed" : "Mark Complete"}
-            </Button>
+              <Button
+                size="sm"
+                variant={activeLesson.completed ? "outline" : "default"}
+                onClick={() => completeGeneratedLesson(activeLesson)}
+                disabled={completing === activeLesson.id || activeLesson.completed}
+              >
+                {completing === activeLesson.id ? (
+                  <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                ) : (
+                  <Check className={`h-4 w-4 mr-1 ${activeLesson.completed ? "text-emerald-600 dark:text-emerald-400" : ""}`} />
+                )}
+                {activeLesson.completed ? "Completed" : "Mark Complete"}
+              </Button>
+            </div>
           ) : (
             <Button
               size="sm"
@@ -237,6 +313,15 @@ export default function LessonsPage() {
           <div className="flex items-center gap-2 mb-2">
             <h1 className="text-2xl font-bold">{activeLesson.title}</h1>
             {"level" in activeLesson && activeLesson.level && <Badge>{activeLesson.level}</Badge>}
+            {isGen && activeLesson.source === "fallback" && (
+              <Badge
+                variant="outline"
+                className="gap-1 border-amber-500/40 text-amber-600 dark:text-amber-400"
+              >
+                <AlertCircle className="h-3 w-3" />
+                Base lesson
+              </Badge>
+            )}
             {activeLesson.completed && (
               <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400 border-emerald-500/30 gap-1">
                 <Check className="h-3 w-3" /> Done
@@ -244,6 +329,12 @@ export default function LessonsPage() {
             )}
           </div>
           <p className="text-muted-foreground">{activeLesson.explanation}</p>
+          {isGen && activeLesson.source === "fallback" && (
+            <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+              The model didn&apos;t answer, so this is the default lesson for this
+              level — not personalized. Use Regenerate to try again.
+            </p>
+          )}
         </div>
 
         {activeLesson.examples && activeLesson.examples.length > 0 && (
@@ -489,7 +580,9 @@ export default function LessonsPage() {
                   className="gap-2"
                 >
                   {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-                  {generating ? "Crafting Lesson..." : "Generate Lesson"}
+                  {generating
+                    ? `Crafting lesson… ${formatElapsed(generatingSeconds)}`
+                    : "Generate Lesson"}
                 </Button>
               </div>
             </CardContent>
@@ -577,7 +670,8 @@ export default function LessonsPage() {
               </CardContent>
             </Card>
           ) : (
-            <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-4">
+              <div className="grid gap-4 md:grid-cols-2">
               {generatedLessons.map((lesson) => (
                 <Card
                   key={lesson.id}
@@ -626,6 +720,23 @@ export default function LessonsPage() {
                   </CardContent>
                 </Card>
               ))}
+              </div>
+
+              {generatedHasMore && (
+                <div className="text-center">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void loadMoreGenerated()}
+                    disabled={loadingMoreGenerated}
+                  >
+                    {loadingMoreGenerated && (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    )}
+                    {loadingMoreGenerated ? "Loading…" : "Load more lessons"}
+                  </Button>
+                </div>
+              )}
             </div>
           )}
         </TabsContent>

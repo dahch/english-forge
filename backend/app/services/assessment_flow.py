@@ -44,11 +44,16 @@ from app.services.assessment_bank import (
     SpeakingItem,
 )
 from app.services.assessment_scoring import (
+    band_from_score,
     compute_confidence,
     final_level,
+    final_level_from_bands,
+    listening_band,
     mean_or_none,
+    pronunciation_band,
     strengths_weaknesses,
 )
+from app.services.media_store import read_audio, store_audio
 from app.services.pronunciation import normalize_text, score_pronunciation_async
 from app.utils import get_tutor_profile_dict, resolve_tts_voice
 
@@ -564,12 +569,9 @@ async def ensure_message_audio(
 ) -> bytes | None:
     """Lazily synthesize TTS for an assistant message, caching the data URI
     on the row. Returns the raw bytes, or None when TTS is unavailable."""
-    if msg.audio_url and msg.audio_url.startswith("data:"):
-        header, _, payload = msg.audio_url.partition(",")
-        try:
-            return base64.b64decode(payload)
-        except Exception:
-            pass
+    cached = read_audio(msg.audio_url)
+    if cached:
+        return cached
     voice = await resolve_tts_voice(db, current_user.id)
     try:
         audio = await TTSPersonalAPI().synthesize(msg.text, voice=voice)
@@ -577,7 +579,7 @@ async def ensure_message_audio(
         logger.error(f"Assessment TTS synthesis failed for message {msg.id}: {e}")
         return None
     if audio:
-        msg.audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio).decode()}"
+        msg.audio_url = store_audio(audio)
         await db.flush()
     return audio
 
@@ -595,21 +597,21 @@ def _fallback_analysis(
     of failing the /complete request. "Re-analyze Results" retries the LLM."""
     measured: list[str] = []
     if listening_dim is not None:
-        measured.append(f"comprensión auditiva {listening_dim:.0f}/100 ({n_listening} preguntas)")
+        measured.append(f"listening {listening_dim:.0f}/100 ({n_listening} questions)")
     if pronunciation_dim is not None:
-        measured.append(f"pronunciación {pronunciation_dim:.0f}/100 ({n_speaking} grabaciones)")
-    evidence = " y ".join(measured) if measured else "no hubo evidencia objetiva suficiente"
+        measured.append(f"pronunciation {pronunciation_dim:.0f}/100 ({n_speaking} recordings)")
+    evidence = " and ".join(measured) if measured else "no objective evidence was collected"
     return {
         "grammar": None,
         "vocabulary": None,
         "fluency": None,
         "recommendations": [
-            "Vuelve a intentar el análisis más tarde desde «Re-analyze Results»."
+            "Try the detailed analysis again later from “Re-analyze Results”."
         ],
         "summary": (
-            "No se pudo generar el análisis detallado en este momento, pero tu nivel se calculó "
-            f"con la evidencia medida: {evidence}. "
-            "Puedes pulsar «Re-analyze Results» para repetir el análisis más tarde."
+            "The detailed analysis could not be generated right now, but your level was "
+            f"calculated from the measured evidence: {evidence}. "
+            "Press “Re-analyze Results” to try again later."
         ),
     }
 
@@ -652,17 +654,39 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
             out.append(payload)
         return out
 
+    listening_payloads = _user_metrics(KIND_LISTENING)
     listening_correct: list[float] = [
-        100.0 if p.get("correct") == 1 else 0.0 for p in _user_metrics(KIND_LISTENING)
+        100.0 if p.get("correct") == 1 else 0.0 for p in listening_payloads
     ]
     listening_dim = mean_or_none(listening_correct)
 
     pron_scores: list[float] = []
-    for payload in _user_metrics(KIND_SPEAKING):
+    speaking_payloads = _user_metrics(KIND_SPEAKING)
+    for payload in speaking_payloads:
         score = clamp_score(payload.get("composite"))
         if score is not None:
             pron_scores.append(score)
     pronunciation_dim = mean_or_none(pron_scores)
+
+    # Band estimation weighted by item difficulty. The 0-100 accuracy above is
+    # kept for display/confidence, but it must not decide the level on its own
+    # (answering only easy items used to score C2).
+    listening_bands = {item.id: item.band for item in LISTENING_ITEMS}
+    speaking_bands = {item.id: item.band for item in SPEAKING_ITEMS}
+    listening_band_value = listening_band(
+        [
+            (listening_bands.get(str(p.get("item_id") or "")), p.get("correct") == 1)
+            for p in listening_payloads
+            if listening_bands.get(str(p.get("item_id") or ""))
+        ]
+    )
+    pronunciation_band_value = pronunciation_band(
+        [
+            (speaking_bands.get(str(p.get("item_id") or "")), clamp_score(p.get("composite")))
+            for p in speaking_payloads
+            if speaking_bands.get(str(p.get("item_id") or ""))
+        ]
+    )
 
     # --- LLM: conversation dims + qualitative fields ---
     conversation_text = "\n".join(f"{m.role.upper()}: {m.text}" for m in messages)
@@ -742,7 +766,14 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
         "listening": listening_dim,
         "pronunciation": pronunciation_dim,
     }
-    level = final_level(dimension_scores)
+    dimension_bands: dict[str, str | None] = {
+        "grammar": band_from_score(dimension_scores["grammar"]) if dimension_scores["grammar"] is not None else None,
+        "vocabulary": band_from_score(dimension_scores["vocabulary"]) if dimension_scores["vocabulary"] is not None else None,
+        "fluency": band_from_score(dimension_scores["fluency"]) if dimension_scores["fluency"] is not None else None,
+        "listening": listening_band_value,
+        "pronunciation": pronunciation_band_value,
+    }
+    level = final_level_from_bands(dimension_bands) or final_level(dimension_scores)
     if level is None:
         # No dimension could be scored (LLM failed the rubric and no audio
         # evidence) — fall back to the user's preferred CEFR level so we don't
@@ -775,6 +806,7 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
     assessment.estimated_level = level
     assessment.confidence = confidence
     assessment.dimension_scores = json.dumps(dimension_scores, ensure_ascii=False)
+    assessment.dimension_bands = json.dumps(dimension_bands, ensure_ascii=False)
     assessment.strengths = json.dumps(strengths, ensure_ascii=False)
     assessment.weaknesses = json.dumps(weaknesses, ensure_ascii=False)
     assessment.recommendations = _coerce_json_list(parsed.get("recommendations"))
@@ -800,8 +832,8 @@ async def analyze_assessment(db: AsyncSession, current_user: User, assessment: A
         f"Assessment {assessment.id} analysis persisted for user {current_user.id}: "
         f"level={assessment.estimated_level}, confidence={assessment.confidence}, "
         f"dimension_scores={assessment.dimension_scores}, "
-        f"strengths={len(json.loads(assessment.strengths or '[]'))}, "
-        f"weaknesses={len(json.loads(assessment.weaknesses or '[]'))}"
+        f"dimension_bands={assessment.dimension_bands}, "
+        f"strengths={len(strengths)}, weaknesses={len(weaknesses)}"
     )
 
 
