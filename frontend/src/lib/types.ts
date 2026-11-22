@@ -20,6 +20,18 @@ export interface TutorProfile {
   tts_provider: string | null
 }
 
+// Normalized voice entry — same shape for every TTS provider, so the picker
+// does not branch per engine.
+export interface TtsVoice {
+  id: string
+  name: string
+  gender: string | null
+  language: string | null
+  accent: string | null
+  description: string | null
+  is_owner: boolean
+}
+
 export interface TokenResponse {
   access_token: string
   token_type: string

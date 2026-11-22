@@ -259,6 +259,19 @@ class TestTTSProviderPayload:
         assert "voice" not in kwargs["json"]
 
     @pytest.mark.asyncio
+    async def test_cartesia_ignores_pocket_builtin_voice(self, monkeypatch):
+        """Regresión: `tts_voice` es un campo único compartido por ambos motores.
+        Si el usuario tenía "alba" (Pocket) y cambia a Cartesia, ese nombre no
+        debe viajar como voice id de Cartesia (daría 400)."""
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello", voice="alba", provider="cartesia")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert "voice" not in kwargs["json"]
+
+    @pytest.mark.asyncio
     async def test_cartesia_forwards_explicit_voice(self, monkeypatch):
         calls = []
         monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))

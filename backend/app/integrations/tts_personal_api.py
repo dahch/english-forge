@@ -10,6 +10,14 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Built-in Pocket TTS voices. `tts_voice` is stored once per user and shared by
+# both engines, so these names must never be forwarded to Cartesia (which
+# expects UUIDs). Mirrors Config.BUILTIN_VOICES in pocket-tts.
+_POCKETTTS_ONLY_VOICES = {
+    "alba", "marius", "javert", "jean", "fantine",
+    "cosette", "eponine", "azelma",
+}
+
 
 class TTSProvider(ABC):
     @abstractmethod
@@ -62,9 +70,12 @@ class TTSPersonalAPI(TTSProvider):
         if is_pockettts:
             payload["voice"] = voice or self._default_voice
             payload["model"] = self._model
-        elif voice:
-            # Cartesia voice ids are provider-specific: a Pocket name like
-            # "alba" would be rejected, so only forward what the caller set.
+        elif voice and voice not in _POCKETTTS_ONLY_VOICES:
+            # Cartesia voice ids are UUIDs. `tts_voice` is a single saved
+            # field shared by both engines, so a user who had a Pocket voice
+            # ("alba") and then switches to Cartesia would otherwise send
+            # "alba" as a Cartesia id and get a 400. Fall back to Cartesia's
+            # own default instead of failing the whole synthesis.
             payload["voice"] = voice
 
         async with httpx.AsyncClient(timeout=30.0) as client:
