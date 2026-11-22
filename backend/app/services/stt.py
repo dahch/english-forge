@@ -25,20 +25,32 @@ logger = logging.getLogger(__name__)
 _STT_SEMAPHORE = asyncio.Semaphore(1)
 
 
-async def transcribe_audio(audio_bytes: bytes, content_type: str = "audio/webm") -> dict:
+async def transcribe_audio(
+    audio_bytes: bytes,
+    content_type: str = "audio/webm",
+    provider: str | None = None,
+) -> dict:
     """Transcribe a clip, returning {"text": str, "words": list[dict]}.
 
-    `words` carries Moonshine word timestamps ([{word, start, end}]) when the
-    personal-api returns them; empty when not available. Never raises — an
-    empty result means both providers failed.
+    `words` carries word timestamps ([{word, start, end}]) when the provider
+    returns them; empty when not available. Never raises — an empty result
+    means every provider failed.
+
+    `provider` selects the engine in personal-api ('moonshine' | 'cartesia').
+    `None` omits the field so the server keeps its default (moonshine),
+    identical to the pre-provider behaviour. The in-process faster-whisper
+    fallback is provider-agnostic: it only runs when personal-api itself
+    fails, so a Cartesia outage degrades exactly like a Moonshine one.
     """
     if not audio_bytes:
         return {"text": "", "words": []}
 
     async with _STT_SEMAPHORE:
-        # Primary: personal-api (Moonshine + RQ).
+        # Primary: personal-api (Moonshine or Cartesia, behind RQ).
         try:
-            result = await STTPersonalAPI().transcribe_detailed(audio_bytes, content_type)
+            result = await STTPersonalAPI().transcribe_detailed(
+                audio_bytes, content_type, provider=provider
+            )
             if result.get("text", "").strip():
                 return result
             logger.warning("personal-api STT returned empty text, trying fallback")

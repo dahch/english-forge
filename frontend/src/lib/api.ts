@@ -368,6 +368,8 @@ export const api = {
     update: (data: {
       stt_mode?: string
       tts_voice?: string
+      stt_provider?: string
+      tts_provider?: string
       default_cefr?: string
       task_routing?: Record<string, string>
       regenerate_path?: boolean

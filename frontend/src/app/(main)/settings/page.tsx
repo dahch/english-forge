@@ -41,6 +41,7 @@ export default function SettingsPage() {
     gender: "",
     personality: "",
     voice: "",
+    tts_provider: null,
   })
   const [tutorSaved, setTutorSaved] = useState(false)
   const [customPersonality, setCustomPersonality] = useState(false)
@@ -88,6 +89,7 @@ export default function SettingsPage() {
         gender: p.gender || "",
         personality: p.personality || "",
         voice: p.voice || "",
+        tts_provider: p.tts_provider || null,
       })
       setCustomPersonality(
         !!p.personality && !PERSONALITY_PRESETS.includes(p.personality.toLowerCase())
@@ -387,6 +389,26 @@ export default function SettingsPage() {
               />
               <p className="text-xs text-muted-foreground">Voice ID used when the tutor speaks.</p>
             </div>
+            <div className="space-y-1">
+              <Label>Tutor Voice Engine</Label>
+              <Select
+                value={tutorForm.tts_provider || "inherit"}
+                onValueChange={(v) =>
+                  setTutorForm({ ...tutorForm, tts_provider: v === "inherit" ? null : v })
+                }
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">Same as general preference</SelectItem>
+                  <SelectItem value="pockettts">Pocket TTS (local, self-hosted)</SelectItem>
+                  <SelectItem value="cartesia">Cartesia (cloud, needs API key)</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Which engine speaks this tutor&apos;s voice. Applies to conversations, lessons and assessment.
+                The voice ID above must exist in the chosen engine.
+              </p>
+            </div>
           </div>
           <div className="space-y-1">
             <Label>Personality</Label>
@@ -465,6 +487,39 @@ export default function SettingsPage() {
             </Select>
           </div>
           <div className="space-y-1">
+            <Label>Speech Recognition Engine</Label>
+            <Select
+              value={settings.stt_provider || "moonshine"}
+              onValueChange={(v) => setSettings({ ...settings, stt_provider: v })}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="moonshine">Moonshine (local, self-hosted)</SelectItem>
+                <SelectItem value="cartesia">Cartesia (cloud, needs API key)</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Used when voice is transcribed on the server (session practice, pronunciation checks).
+              Both return word timestamps, so fluency scoring keeps working either way.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Label>TTS Voice Engine</Label>
+            <Select
+              value={settings.tts_provider || "pockettts"}
+              onValueChange={(v) => setSettings({ ...settings, tts_provider: v })}
+            >
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="pockettts">Pocket TTS (local, self-hosted)</SelectItem>
+                <SelectItem value="cartesia">Cartesia (cloud, needs API key)</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Default engine for the tutor&apos;s voice. The tutor profile can override it.
+            </p>
+          </div>
+          <div className="space-y-1">
             <Label>TTS Voice</Label>
             <Input
               value={settings.tts_voice ?? ""}
@@ -472,7 +527,7 @@ export default function SettingsPage() {
               placeholder="alba"
             />
             <p className="text-xs text-muted-foreground">
-              Verify available voices against GET /v1/voices on Pocket TTS before changing.
+              Pocket TTS: verify against GET /v1/voices. Cartesia: use a Cartesia voice ID (leave empty for the server default).
             </p>
           </div>
           <div className="space-y-1">

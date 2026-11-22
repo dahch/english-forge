@@ -50,7 +50,7 @@ from app.services.assessment_scoring import (
     strengths_weaknesses,
 )
 from app.services.pronunciation import normalize_text, score_pronunciation_async
-from app.utils import get_tutor_profile_dict, resolve_tts_voice
+from app.utils import get_tutor_profile_dict, resolve_tts_provider, resolve_tts_voice
 
 logger = logging.getLogger(__name__)
 
@@ -571,8 +571,9 @@ async def ensure_message_audio(
         except Exception:
             pass
     voice = await resolve_tts_voice(db, current_user.id)
+    provider = await resolve_tts_provider(db, current_user.id)
     try:
-        audio = await TTSPersonalAPI().synthesize(msg.text, voice=voice)
+        audio = await TTSPersonalAPI().synthesize(msg.text, voice=voice, provider=provider)
     except Exception as e:
         logger.error(f"Assessment TTS synthesis failed for message {msg.id}: {e}")
         return None

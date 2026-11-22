@@ -181,3 +181,126 @@ class TestSTTPayload:
         monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
         result = await STTPersonalAPI().transcribe_detailed(b"audio-bytes")
         assert result == {"text": "", "words": []}
+
+
+# --- provider selection ------------------------------------------------------
+#
+# `provider=None` must produce the exact pre-provider request (field omitted),
+# so existing behaviour is preserved. When set, the field goes over the wire
+# and provider-specific fields are not mixed (a Pocket model id or the "alba"
+# voice would be rejected by Cartesia).
+
+
+def _fake_client(calls, result_payload=None, audio_bytes=None):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append(("POST", url, kwargs))
+            return FakeResponse({"job_id": "job-x"})
+
+        async def get(self, url):
+            calls.append(("GET", url, {}))
+            payload = result_payload or {"text": "", "words": []}
+            if audio_bytes is not None:
+                payload = {
+                    "status": "finished",
+                    "result": {"audio_base64": base64.b64encode(audio_bytes).decode()},
+                }
+            else:
+                payload = {"status": "finished", "result": payload}
+            return FakeResponse(payload)
+
+    return FakeClient
+
+
+class TestTTSProviderPayload:
+    @pytest.mark.asyncio
+    async def test_no_provider_omits_field_and_keeps_defaults(self, monkeypatch):
+        """Sin provider, el payload es el de siempre (model + voice por defecto)."""
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert "provider" not in kwargs["json"]
+        assert kwargs["json"]["model"] == get_settings().TTS_MODEL
+        assert kwargs["json"]["voice"] == get_settings().TTS_DEFAULT_VOICE
+
+    @pytest.mark.asyncio
+    async def test_cartesia_sends_provider_without_pocket_model(self, monkeypatch):
+        """Un model id de Pocket TTS enviado a Cartesia sería 400: no se manda."""
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello", provider="cartesia")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert kwargs["json"]["provider"] == "cartesia"
+        assert "model" not in kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_cartesia_does_not_forward_pocket_default_voice(self, monkeypatch):
+        """'alba' solo existe en Pocket TTS: no debe viajar a Cartesia."""
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello", provider="cartesia")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert "voice" not in kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_cartesia_forwards_explicit_voice(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello", voice="cartesia-voice-id", provider="cartesia")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert kwargs["json"]["voice"] == "cartesia-voice-id"
+
+    @pytest.mark.asyncio
+    async def test_explicit_pockettts_behaves_like_default(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, audio_bytes=b"mp3"))
+
+        await TTSPersonalAPI().synthesize("hello", provider="pockettts")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert kwargs["json"]["provider"] == "pockettts"
+        assert kwargs["json"]["model"] == get_settings().TTS_MODEL
+
+
+class TestSTTProviderPayload:
+    @pytest.mark.asyncio
+    async def test_no_provider_omits_field(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, {"text": "hi", "words": []}))
+
+        await STTPersonalAPI().transcribe_detailed(b"audio")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert "provider" not in kwargs["data"]
+        assert kwargs["data"]["language"] == get_settings().STT_LANGUAGE
+
+    @pytest.mark.asyncio
+    async def test_cartesia_sends_provider_field(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(httpx, "AsyncClient", _fake_client(calls, {"text": "hi", "words": []}))
+
+        await STTPersonalAPI().transcribe_detailed(b"audio", provider="cartesia")
+
+        _, _, kwargs = [c for c in calls if c[0] == "POST"][0]
+        assert kwargs["data"]["provider"] == "cartesia"
+        assert kwargs["data"]["language"] == get_settings().STT_LANGUAGE
+        # El audio sigue viajando como multipart.
+        assert "files" in kwargs

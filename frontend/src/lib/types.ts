@@ -15,6 +15,9 @@ export interface TutorProfile {
   gender: string | null
   personality: string
   voice: string | null
+  // Engine that speaks this tutor's voice. null/"inherit" falls back to the
+  // general TTS preference.
+  tts_provider: string | null
 }
 
 export interface TokenResponse {

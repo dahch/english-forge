@@ -80,6 +80,7 @@ async def get_tutor_profile_dict(db: AsyncSession, user_id: str) -> dict | None:
         "gender": profile.gender,
         "personality": profile.personality,
         "voice": profile.voice,
+        "tts_provider": profile.tts_provider,
     }
 
 
@@ -103,3 +104,57 @@ async def resolve_tts_voice(db: AsyncSession, user_id: str, profile: dict | None
         return setting.value
 
     return None
+
+
+# Voice provider alternatives. The first entry of each pair is the default and
+# keeps the behaviour that existed before providers were selectable, so an
+# unconfigured user (or a row written by an older version) never changes.
+TTS_PROVIDERS = ("pockettts", "cartesia")
+STT_PROVIDERS = ("moonshine", "cartesia")
+DEFAULT_TTS_PROVIDER = TTS_PROVIDERS[0]
+DEFAULT_STT_PROVIDER = STT_PROVIDERS[0]
+
+
+async def _setting_value(db: AsyncSession, user_id: str, key: str) -> str | None:
+    result = await db.execute(
+        select(Setting).where(Setting.user_id == user_id, Setting.key == key)
+    )
+    setting = result.scalar_one_or_none()
+    return setting.value if setting else None
+
+
+def _normalize_provider(value: str | None, supported: tuple[str, ...]) -> str:
+    """Coerce a stored provider to a supported one, falling back to the default.
+
+    Settings are free-form strings in the DB, so a value from an older version
+    (or a typo written straight into SQLite) must not break synthesis. An
+    unknown value silently means "use the default" rather than raising on a
+    path that users cannot fix from the UI.
+    """
+    return value if value in supported else supported[0]
+
+
+async def resolve_tts_provider(
+    db: AsyncSession, user_id: str, profile: dict | None = None
+) -> str:
+    """Resolve which TTS provider speaks for the tutor.
+
+    Priority mirrors resolve_tts_voice: tutor profile > settings > default.
+    The tutor profile wins because the tutor's own voice is what the user hears
+    during conversations, and the Settings page exposes it next to that voice.
+    """
+    provider = (profile or {}).get("tts_provider")
+    if not provider:
+        provider = await _setting_value(db, user_id, "tts_provider")
+    return _normalize_provider(provider, TTS_PROVIDERS)
+
+
+async def resolve_stt_provider(db: AsyncSession, user_id: str) -> str:
+    """Resolve which STT provider transcribes the user's speech.
+
+    There is no per-tutor STT (recognition is of the learner, not the tutor), so
+    this reads the general preference only.
+    """
+    return _normalize_provider(
+        await _setting_value(db, user_id, "stt_provider"), STT_PROVIDERS
+    )

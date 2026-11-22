@@ -19,7 +19,13 @@ from app.schemas.session import (
 )
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.services.stt import transcribe_audio
-from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
+from app.utils import (
+    bump_daily_minutes,
+    get_tutor_profile_dict,
+    resolve_stt_provider,
+    resolve_tts_provider,
+    resolve_tts_voice,
+)
 from app.llm.router import LLMRouter
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -117,7 +123,8 @@ async def create_session(
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, current_user.id, profile_dict)
-        audio_bytes = await tts.synthesize(greeting, voice=voice)
+        provider = await resolve_tts_provider(db, current_user.id, profile_dict)
+        audio_bytes = await tts.synthesize(greeting, voice=voice, provider=provider)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
@@ -339,7 +346,8 @@ async def upload_recording(
             detail=f"Unsupported media type '{raw_content_type}'. Allowed formats: {', '.join(sorted(ALLOWED_AUDIO_TYPES))}",
         )
 
-    stt = await transcribe_audio(audio_bytes, content_type=content_type)
+    stt_provider = await resolve_stt_provider(db, current_user.id)
+    stt = await transcribe_audio(audio_bytes, content_type=content_type, provider=stt_provider)
     return {
         "transcript": stt.get("text", ""),
         "words": stt.get("words", []),

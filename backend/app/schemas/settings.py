@@ -56,6 +56,10 @@ class SettingResponse(BaseModel):
 class UserSettingsUpdate(BaseModel):
     stt_mode: Optional[str] = None
     tts_voice: Optional[str] = None
+    # Voice engine selections. Optional because they are additive: a client
+    # that never sends them keeps the existing behaviour (provider defaults).
+    stt_provider: Optional[Literal["moonshine", "cartesia"]] = None
+    tts_provider: Optional[Literal["pockettts", "cartesia"]] = None
     default_cefr: Optional[Literal["A1", "A2", "B1", "B2", "C1", "C2"]] = None
     task_routing: Optional[TaskRoutingConfig] = None
     regenerate_path: Optional[bool] = False

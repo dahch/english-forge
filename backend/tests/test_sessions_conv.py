@@ -90,7 +90,7 @@ async def test_create_session_predefined_scenario_greeting(db: AsyncSession, use
 @pytest.mark.asyncio
 async def test_create_session_tts_synthesis_success(monkeypatch, db: AsyncSession, user: User):
     """When TTS succeeds, audio_url is attached to the initial greeting message."""
-    async def mock_synthesize(self, text, voice=None):
+    async def mock_synthesize(self, text, voice=None, provider=None):
         return b"fake-audio-bytes-123"
 
     monkeypatch.setattr(TTSPersonalAPI, "synthesize", mock_synthesize)
@@ -108,7 +108,7 @@ async def test_create_session_tts_synthesis_success(monkeypatch, db: AsyncSessio
 @pytest.mark.asyncio
 async def test_create_session_tts_synthesis_failure_fallback(monkeypatch, db: AsyncSession, user: User):
     """If TTS synthesis fails or times out, session creation still succeeds and audio_url is None."""
-    async def mock_failing_synthesize(self, text, voice=None):
+    async def mock_failing_synthesize(self, text, voice=None, provider=None):
         raise RuntimeError("TTS connection error")
 
     monkeypatch.setattr(TTSPersonalAPI, "synthesize", mock_failing_synthesize)
@@ -174,7 +174,7 @@ async def test_upload_recording_success(monkeypatch, db: AsyncSession, user: Use
     sess = await create_session(body=body, current_user=user, db=db)
 
     # Mock transcribe_audio
-    async def mock_transcribe(audio_bytes: bytes, content_type: str = "audio/webm"):
+    async def mock_transcribe(audio_bytes: bytes, content_type: str = "audio/webm", provider=None):
         assert audio_bytes == b"sample-voice-recording-data"
         assert content_type == "audio/webm"
         return {

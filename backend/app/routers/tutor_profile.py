@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -18,6 +20,10 @@ class TutorProfileUpdate(BaseModel):
     gender: str | None = Field(None, max_length=50)
     personality: str | None = Field(None, max_length=100)
     voice: str | None = Field(None, max_length=100)
+    # Engine that speaks this tutor's voice. Explicit null clears it, meaning
+    # "inherit the general preference" (see resolve_tts_provider); the Settings
+    # page sends null for its "inherit" option.
+    tts_provider: Literal["pockettts", "cartesia"] | None = None
 
 
 class TutorProfileResponse(BaseModel):
@@ -28,6 +34,7 @@ class TutorProfileResponse(BaseModel):
     gender: str | None
     personality: str
     voice: str | None
+    tts_provider: str | None
 
     model_config = {"from_attributes": True}
 
@@ -72,7 +79,7 @@ async def update_profile(
     # untouched inputs, so coerce empty strings to None for those fields.
     # name/personality are NOT NULL columns — ignore explicit nulls AND empty
     # strings for them.
-    nullable_fields = {"age", "gender", "voice"}
+    nullable_fields = {"age", "gender", "voice", "tts_provider"}
     for field in body.model_fields_set:
         value = getattr(body, field)
         if not value and field not in nullable_fields:

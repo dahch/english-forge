@@ -86,6 +86,11 @@ _COLUMNS_TO_ADD: dict[str, list[tuple[str, str]]] = {
     # new rows get microsecond precision. (created_at, id) ordering works for
     # both — the microsecond default just removes the random-UUID tiebreak
     # for same-second inserts.
+    # Selectable voice providers: NULL = inherit the general preference, so
+    # existing rows keep their current engine.
+    "tutor_profiles": [
+        ("tts_provider", "VARCHAR(32)"),
+    ],
 }
 
 

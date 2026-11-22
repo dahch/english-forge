@@ -13,7 +13,12 @@ from app.security import decode_access_token
 from app.llm.router import LLMRouter, parse_llm_json
 from app.llm.prompts import build_system_prompt
 from app.models.models import Correction, Scenario
-from app.utils import bump_daily_minutes, get_tutor_profile_dict, resolve_tts_voice
+from app.utils import (
+    bump_daily_minutes,
+    get_tutor_profile_dict,
+    resolve_tts_provider,
+    resolve_tts_voice,
+)
 from app.integrations.tts_personal_api import TTSPersonalAPI
 from app.integrations.stt_personal_api import STTPersonalAPI
 from app.integrations.stt_whisper_server import STTWhisperServer
@@ -293,7 +298,8 @@ async def _process_turn(
     try:
         tts = TTSPersonalAPI()
         voice = await resolve_tts_voice(db, user_id, profile_dict)
-        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice)
+        provider = await resolve_tts_provider(db, user_id, profile_dict)
+        audio_bytes = await tts.synthesize(parsed.get("reply", ""), voice=voice, provider=provider)
         if audio_bytes:
             import base64
             audio_url = f"data:audio/mpeg;base64,{base64.b64encode(audio_bytes).decode()}"
