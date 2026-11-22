@@ -64,7 +64,7 @@ class TestTTSPayload:
         _, url, kwargs = posts[0]
         assert url.endswith("/v1/speak")
         assert kwargs["json"]["model"] == get_settings().TTS_MODEL
-        assert kwargs["json"]["model"] == "english_2026-04_24l"
+        assert kwargs["json"]["model"] == "english_2026-04"
         assert kwargs["json"]["voice"] == "alba"
         assert kwargs["json"]["text"] == "hello there"
 

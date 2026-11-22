@@ -30,8 +30,15 @@ class Settings(BaseSettings):
     # Pocket TTS model id sent on every /v1/speak call. The personal-api
     # server defaults to a Spanish model; english-forge always pins the
     # English one. Unknown ids are ignored by Pocket TTS (hot-swap safe).
-    TTS_MODEL: str = "english_2026-04_24l"
-    TTS_JOB_POLL_INTERVAL_MS: int = 500
+    #
+    # NOT the `_24l` variant: measured on the homelab CPU (int8), the 24-layer
+    # model runs at RTF 0.52 and peaks ~2.9GB, while english_2026-04 runs at
+    # RTF 0.20 with ~1.0GB. That is ~2.6x faster per request for the same
+    # exercise audio. Only pin `_24l` again if quality (not latency) wins.
+    TTS_MODEL: str = "english_2026-04"
+    # Synthesis runs in ~0.7s now, so polling every 500ms was adding up to half
+    # the perceived latency to every clip.
+    TTS_JOB_POLL_INTERVAL_MS: int = 150
     TTS_JOB_TIMEOUT_SECONDS: int = 30
 
     # Per-request timeout for LLM providers. Reasoning models can take a while
